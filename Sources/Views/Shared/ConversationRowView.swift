@@ -92,18 +92,34 @@ private struct ConversationCardTagChip: View {
     }
 }
 
+/// Source indicator rendered next to the conversation title. Was a
+/// pill-with-text before; the pill shape collided visually with the
+/// tag chips on the same row (user couldn't tell the source from a
+/// tag at a glance). Now a plain glyph in the LLM's accent color —
+/// the tag chips keep their teal capsule shape, so the two are no
+/// longer confusable.
 struct SourceBadge: View {
     let source: String
 
     var body: some View {
-        Text(source)
-            .font(.caption2)
-            .fontWeight(.medium)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
-            .background(color.opacity(0.15))
+        Image(systemName: symbolName)
+            .font(.caption.weight(.semibold))
             .foregroundStyle(color)
-            .clipShape(Capsule())
+            .help(source)
+            .accessibilityLabel(Text(source))
+    }
+
+    private var symbolName: String {
+        switch source.lowercased() {
+        case "chatgpt":
+            "bubble.left.and.bubble.right.fill"
+        case "claude":
+            "text.bubble.fill"
+        case "gemini":
+            "sparkles"
+        default:
+            "doc.text.fill"
+        }
     }
 
     private var color: Color {

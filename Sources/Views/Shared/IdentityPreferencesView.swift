@@ -1,5 +1,20 @@
 import SwiftUI
 
+/// Root of the Settings window. Uses `TabView` so the current Identity
+/// panel sits alongside future panels (data sources, appearance, etc.)
+/// without needing a structural refactor later.
+struct SettingsRootView: View {
+    var body: some View {
+        TabView {
+            IdentityPreferencesView()
+                .tabItem {
+                    Label("Identity", systemImage: "person.crop.circle")
+                }
+        }
+        .frame(minWidth: 520, idealWidth: 560, minHeight: 420)
+    }
+}
+
 struct IdentityPreferencesView: View {
     var body: some View {
         Form {
@@ -11,7 +26,6 @@ struct IdentityPreferencesView: View {
         }
         .formStyle(.grouped)
         .padding(20)
-        .frame(minWidth: 460, idealWidth: 520, minHeight: 360)
     }
 }
 

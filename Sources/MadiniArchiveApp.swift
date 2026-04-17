@@ -41,7 +41,7 @@ struct MadiniArchiveApp: App {
 
         #if os(macOS)
         Settings {
-            IdentityPreferencesView()
+            SettingsRootView()
                 .environment(identityPreferences)
                 .environment(archiveEvents)
         }

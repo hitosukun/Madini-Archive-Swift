@@ -17,27 +17,49 @@ struct MessageBubbleView: View {
     let displayMode: DisplayMode
     let identityContext: MessageIdentityContext?
     @Environment(IdentityPreferencesStore.self) private var identityPreferences
+    #if os(macOS)
+    @Environment(\.openSettings) private var openSettings
+    #endif
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
             if message.isUser {
                 messageColumn
 
-                IdentityAvatarView(
-                    presentation: identityPresentation,
-                    size: Layout.avatarSize
-                )
-                .frame(width: Layout.avatarColumnWidth, alignment: .topTrailing)
+                avatarButton
+                    .frame(width: Layout.avatarColumnWidth, alignment: .topTrailing)
             } else {
-                IdentityAvatarView(
-                    presentation: identityPresentation,
-                    size: Layout.avatarSize
-                )
-                .frame(width: Layout.avatarColumnWidth, alignment: .topLeading)
+                avatarButton
+                    .frame(width: Layout.avatarColumnWidth, alignment: .topLeading)
 
                 messageColumn
             }
         }
+    }
+
+    /// The avatar is a gateway into the Settings window where the user
+    /// edits the user / assistant identity (name + avatar). Wrapped in a
+    /// plain button so it stays visually identical while gaining a
+    /// clickable affordance and an accessibility path.
+    @ViewBuilder
+    private var avatarButton: some View {
+        #if os(macOS)
+        Button {
+            openSettings()
+        } label: {
+            IdentityAvatarView(
+                presentation: identityPresentation,
+                size: Layout.avatarSize
+            )
+        }
+        .buttonStyle(.plain)
+        .help("Edit identity in Settings")
+        #else
+        IdentityAvatarView(
+            presentation: identityPresentation,
+            size: Layout.avatarSize
+        )
+        #endif
     }
 
     private var messageColumn: some View {

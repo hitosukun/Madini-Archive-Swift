@@ -148,6 +148,13 @@ final class IdentityPreferencesStore {
     }
 
     func presentation(for role: MessageRole, context: MessageIdentityContext? = nil) -> MessageIdentityPresentation {
+        // The assistant name is intentionally always the user-configured
+        // agent name ("Madini" by default) regardless of which LLM the
+        // conversation came from. Per-source overrides used to emit
+        // "Claude 3.5 Sonnet" / "Gemini 1.5 Pro" headers in orange/blue;
+        // that confused the visual with the card's source chip, so both
+        // the label and the color are now unified.
+        _ = context
         switch role {
         case .user:
             return MessageIdentityPresentation(
@@ -156,10 +163,6 @@ final class IdentityPreferencesStore {
                 accentColor: .accentColor
             )
         case .assistant:
-            if let context, let assistantPresentation = assistantPresentation(for: context) {
-                return assistantPresentation
-            }
-
             return MessageIdentityPresentation(
                 displayName: preferences.agent.displayName,
                 avatar: preferences.agent.avatar,
@@ -211,95 +214,5 @@ final class IdentityPreferencesStore {
         }
 
         defaults.set(data, forKey: storageKey)
-    }
-
-    private func assistantPresentation(for context: MessageIdentityContext) -> MessageIdentityPresentation? {
-        let normalizedSource = normalize(context.source)
-        let normalizedModel = normalize(context.model)
-
-        if matchesAssistantSource("claude", source: normalizedSource, model: normalizedModel) {
-            return MessageIdentityPresentation(
-                displayName: assistantDisplayName(
-                    sourceName: "Claude",
-                    model: normalizedModel
-                ),
-                avatar: preferences.agent.avatar,
-                accentColor: .orange
-            )
-        }
-
-        if matchesAssistantSource("gemini", source: normalizedSource, model: normalizedModel) {
-            return MessageIdentityPresentation(
-                displayName: assistantDisplayName(
-                    sourceName: "Gemini",
-                    model: normalizedModel
-                ),
-                avatar: preferences.agent.avatar,
-                accentColor: .blue
-            )
-        }
-
-        return nil
-    }
-
-    private func assistantDisplayName(sourceName: String, model: String?) -> String {
-        guard let model else {
-            return sourceName
-        }
-
-        let strippedModel = stripLeadingSourceName(model, sourceName: sourceName)
-        guard !strippedModel.isEmpty else {
-            return sourceName
-        }
-
-        return "\(sourceName) \(strippedModel)"
-    }
-
-    private func stripLeadingSourceName(_ model: String, sourceName: String) -> String {
-        let loweredSource = sourceName.lowercased()
-        let loweredModel = model.lowercased()
-
-        guard loweredModel.hasPrefix(loweredSource) else {
-            return prettifyModelName(model)
-        }
-
-        let trimmed = model.dropFirst(sourceName.count)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "-_ "))
-
-        return prettifyModelName(String(trimmed))
-    }
-
-    private func prettifyModelName(_ model: String) -> String {
-        model
-            .split(separator: "-")
-            .map { component in
-                let value = String(component)
-                if value.first?.isNumber == true {
-                    return value
-                }
-                return value.prefix(1).uppercased() + value.dropFirst()
-            }
-            .joined(separator: " ")
-    }
-
-    private func matchesAssistantSource(_ sourceName: String, source: String?, model: String?) -> Bool {
-        if source == sourceName {
-            return true
-        }
-
-        return model?.contains(sourceName) == true
-    }
-
-    private func normalize(_ value: String?) -> String? {
-        guard let value else {
-            return nil
-        }
-
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            return nil
-        }
-
-        return trimmed.lowercased()
     }
 }
