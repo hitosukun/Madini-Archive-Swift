@@ -99,7 +99,28 @@ struct MessageBubbleView: View {
         guard canRenderMessage else {
             return [.text(message.content)]
         }
-        return ContentBlock.parse(message.content)
+        // SwiftUI re-evaluates `body` on parent updates (selectedPromptID
+        // changes, bookmark toggles, etc). Parsing markdown on every eval for
+        // every visible bubble is measurable on long conversations — cache
+        // the parsed blocks by message id so repeated renders are free.
+        let key = message.id as NSString
+        if let cached = Self.blocksCache.object(forKey: key) {
+            return cached.blocks
+        }
+        let parsed = ContentBlock.parse(message.content)
+        Self.blocksCache.setObject(BlocksBox(parsed), forKey: key)
+        return parsed
+    }
+
+    private static let blocksCache: NSCache<NSString, BlocksBox> = {
+        let cache = NSCache<NSString, BlocksBox>()
+        cache.countLimit = 500
+        return cache
+    }()
+
+    private final class BlocksBox {
+        let blocks: [ContentBlock]
+        init(_ blocks: [ContentBlock]) { self.blocks = blocks }
     }
 
     private var canRenderMessage: Bool {

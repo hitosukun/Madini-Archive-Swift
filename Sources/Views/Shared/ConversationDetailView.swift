@@ -130,9 +130,18 @@ struct ConversationDetailView: View {
         }
     }
 
+    // Pre-compiled once; `String.replacingOccurrences(options: .regularExpression)`
+    // re-parses the pattern on every call, which adds up when building an
+    // outline for a 100-prompt conversation.
+    private static let whitespaceRegex: NSRegularExpression = {
+        // Force-try is safe: the pattern is a compile-time constant.
+        try! NSRegularExpression(pattern: "\\s+")
+    }()
+
     private static func promptLabel(from text: String) -> String {
-        let collapsed = text
-            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+        let range = NSRange(text.startIndex..., in: text)
+        let collapsed = whitespaceRegex
+            .stringByReplacingMatches(in: text, range: range, withTemplate: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         guard !collapsed.isEmpty else {
