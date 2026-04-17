@@ -1,0 +1,24 @@
+.DS_Store
+.build/
+DerivedData/
+*.xcodeproj/
+xcuserdata/
+*.xcworkspace/
+Package.resolved
+
+# --- User data safeguards ---
+# Madini の実データは ~/Library/Application Support/Madini Archive/ に
+# 置かれる設計で、リポジトリには入らない。デバッグ用に誤ってコピー
+# した場合の事故防止として、ここで明示除外する。
+*.db
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+archive.db
+history.json
+themes.json
+custom.css
+
+# --- Local tooling ---
+.claude/
