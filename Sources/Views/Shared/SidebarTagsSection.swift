@@ -66,7 +66,6 @@ struct SidebarTagsSection: View {
         HStack(spacing: 6) {
             TextField("New tag", text: viewModel.pendingTagNameBinding())
                 .textFieldStyle(.roundedBorder)
-                .font(.caption)
                 .onSubmit(viewModel.createPendingTag)
 
             Button {
@@ -121,20 +120,17 @@ private struct SidebarTagRow: View {
     @State private var draftName: String = ""
 
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 8) {
             Button(action: onToggleFilter) {
-                HStack(spacing: 6) {
+                HStack(spacing: 8) {
                     Image(systemName: isFilterActive ? "line.3.horizontal.decrease.circle.fill" : "number")
-                        .font(.caption2)
                         .foregroundStyle(isFilterActive ? Color.accentColor : .secondary)
 
                     if isEditing {
                         TextField("Tag name", text: $draftName, onCommit: commitRename)
                             .textFieldStyle(.roundedBorder)
-                            .font(.caption)
                     } else {
                         Text(tag.name)
-                            .font(.caption)
                             .foregroundStyle(.primary)
                             .lineLimit(1)
                             .onTapGesture(count: 2) { beginEditing() }
@@ -153,7 +149,6 @@ private struct SidebarTagRow: View {
 
             Button(action: onToggleAttach) {
                 Image(systemName: isAttachedToSelection ? "checkmark.circle.fill" : "plus.circle")
-                    .font(.caption.weight(.medium))
                     .foregroundStyle(isAttachedToSelection ? Color.accentColor : .secondary)
             }
             .buttonStyle(.plain)
@@ -162,23 +157,27 @@ private struct SidebarTagRow: View {
                   ? (isAttachedToSelection ? "Detach from selected conversation" : "Attach to selected conversation")
                   : "Select a conversation first")
 
-            if isHovering && !tag.isSystem {
-                Menu {
-                    Button("Rename") { beginEditing() }
-                    Button("Delete", role: .destructive, action: onRequestDelete)
-                } label: {
-                    Image(systemName: "ellipsis")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 2)
-                }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .fixedSize()
+            // Always render the ellipsis menu so hovering does not shift
+            // the row's layout (was causing the +/✓ button to move,
+            // making it hard to click). Opacity-gated to stay invisible
+            // until hover / for system tags.
+            Menu {
+                Button("Rename") { beginEditing() }
+                Button("Delete", role: .destructive, action: onRequestDelete)
+            } label: {
+                Image(systemName: "ellipsis")
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 2)
             }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .opacity(isHovering && !tag.isSystem ? 1 : 0)
+            .allowsHitTesting(isHovering && !tag.isSystem)
         }
+        .font(.body)
         .padding(.horizontal, 6)
-        .padding(.vertical, 3)
+        .padding(.vertical, 4)
         .background(
             RoundedRectangle(cornerRadius: 5, style: .continuous)
                 .fill(isFilterActive ? Color.accentColor.opacity(0.12) : (isHovering ? Color.secondary.opacity(0.08) : Color.clear))

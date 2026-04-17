@@ -44,14 +44,12 @@ private struct SavedFilterRow: View {
     @State private var isHovering = false
 
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 8) {
             Button(action: onSelect) {
-                HStack(spacing: 6) {
+                HStack(spacing: 8) {
                     Image(systemName: iconName)
-                        .font(.caption2)
                         .foregroundStyle(entry.pinned ? Color.accentColor : .secondary)
                     Text(entry.name)
-                        .font(.caption)
                         .lineLimit(1)
                     Spacer(minLength: 0)
                 }
@@ -59,19 +57,21 @@ private struct SavedFilterRow: View {
             }
             .buttonStyle(.plain)
 
-            // Pin toggle: always visible when pinned; hover-only when not.
-            if entry.pinned || isHovering {
-                Button(action: onTogglePin) {
-                    Image(systemName: entry.pinned ? "pin.fill" : "pin")
-                        .font(.caption2)
-                        .foregroundStyle(entry.pinned ? Color.accentColor : .secondary)
-                }
-                .buttonStyle(.plain)
-                .help(entry.pinned ? "Unpin" : "Pin to top")
+            // Pin toggle: always reserves layout space so hovering does
+            // not shift the row's width. Invisible when the row is
+            // neither pinned nor hovered.
+            Button(action: onTogglePin) {
+                Image(systemName: entry.pinned ? "pin.fill" : "pin")
+                    .foregroundStyle(entry.pinned ? Color.accentColor : .secondary)
             }
+            .buttonStyle(.plain)
+            .help(entry.pinned ? "Unpin" : "Pin to top")
+            .opacity(entry.pinned || isHovering ? 1 : 0)
+            .allowsHitTesting(entry.pinned || isHovering)
         }
+        .font(.body)
         .padding(.horizontal, 6)
-        .padding(.vertical, 3)
+        .padding(.vertical, 4)
         .background(
             RoundedRectangle(cornerRadius: 5, style: .continuous)
                 .fill(isHovering ? Color.secondary.opacity(0.08) : Color.clear)

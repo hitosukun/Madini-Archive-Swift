@@ -3,10 +3,13 @@ import SwiftUI
 /// Left-sidebar search field with `#tag` prefix parsing.
 ///
 /// Plain tokens are forwarded to `LibraryViewModel.searchText` (full-text
-/// search). Tokens starting with `#` are split off into
-/// `filter.bookmarkTags` and rendered as chips to the left of the field.
-/// This makes `#madini chatgpt` read as "search for chatgpt within the
-/// #madini tag."
+/// search). Tokens starting with `#` are promoted into
+/// `filter.bookmarkTags` and cleared from the visible draft. The active
+/// tag set is surfaced elsewhere (the highlighted rows in the Tags
+/// section and the chip strip in the middle-pane header), so we do NOT
+/// render chips inside the search field itself — they previously made
+/// the field cramped and pushed the input caret around as tags were
+/// added/removed.
 struct SidebarSearchBar: View {
     @Bindable var viewModel: LibraryViewModel
     @State private var draft: String = ""
@@ -17,22 +20,12 @@ struct SidebarSearchBar: View {
                 .font(.body.weight(.semibold))
                 .foregroundStyle(.secondary)
 
-            // Chips for tags already committed into filter.bookmarkTags.
-            if !viewModel.filter.bookmarkTags.isEmpty {
-                ForEach(viewModel.filter.bookmarkTags, id: \.self) { tag in
-                    TagSearchChip(name: tag) {
-                        viewModel.removeBookmarkTag(tag)
-                    }
-                }
-            }
-
             TextField("Search archive  (use #tag)", text: $draft)
                 .textFieldStyle(.plain)
                 .onChange(of: draft) { _, newValue in
                     commitParsed(newValue)
                 }
                 .onAppear {
-                    // Initial seed: mirror keyword + inline-display of tags.
                     draft = viewModel.filter.keyword
                 }
         }
@@ -94,23 +87,3 @@ struct SidebarSearchBar: View {
     }
 }
 
-private struct TagSearchChip: View {
-    let name: String
-    let onRemove: () -> Void
-
-    var body: some View {
-        HStack(spacing: 2) {
-            Text("#\(name)")
-                .font(.caption.weight(.medium))
-            Button(action: onRemove) {
-                Image(systemName: "xmark")
-                    .font(.caption2.weight(.bold))
-            }
-            .buttonStyle(.plain)
-        }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 2)
-        .background(Capsule().fill(Color.teal.opacity(0.18)))
-        .foregroundStyle(Color.teal)
-    }
-}
