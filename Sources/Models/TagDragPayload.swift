@@ -14,8 +14,12 @@ struct TagDragPayload: Codable, Hashable, Transferable, Sendable {
 }
 
 extension UTType {
-    /// Private UTI for Madini tag drags. Declared as an exported type only
-    /// within this process — no Info.plist entry is needed because drops are
-    /// scoped to in-process targets (sidebar tag row → conversation card).
-    static let madiniTag = UTType(exportedAs: "app.madini.archive.tag")
+    /// Private UTI for Madini tag drags. Declared as `importedAs` rather
+    /// than `exportedAs` so we do not need a matching entry in the app
+    /// bundle's Info.plist — Xcode logs a warning like
+    /// `Type "app.madini.archive.tag" was expected to be declared and
+    /// exported in the Info.plist` when `exportedAs` is used without a
+    /// bundle declaration. Drops are scoped in-process (sidebar tag row
+    /// → conversation card), so either kind works functionally.
+    static let madiniTag = UTType(importedAs: "app.madini.archive.tag")
 }

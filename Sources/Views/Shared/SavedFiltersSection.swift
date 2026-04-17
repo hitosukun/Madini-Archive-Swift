@@ -49,8 +49,9 @@ private struct SavedFilterRow: View {
                 HStack(spacing: 8) {
                     Image(systemName: iconName)
                         .foregroundStyle(entry.pinned ? Color.accentColor : .secondary)
-                    Text(entry.name)
-                        .lineLimit(1)
+
+                    SavedFilterSummaryView(entry: entry)
+
                     Spacer(minLength: 0)
                 }
                 .contentShape(Rectangle())
@@ -85,5 +86,109 @@ private struct SavedFilterRow: View {
 
     private var iconName: String {
         entry.pinned ? "star.fill" : "clock"
+    }
+}
+
+/// Render a saved-filter entry as a composition of its filter criteria
+/// (source icon, model text, #tag chips, …) rather than a single opaque
+/// label. The stored `entry.name` ("Filtered View", "source: chatgpt" etc.)
+/// collided for many distinct filters, which made the history list
+/// unusable — two rows labeled "Filtered View" could select completely
+/// different views.
+///
+/// Display rules:
+/// - Sources with a known icon collapse to just the colored glyph
+///   (no redundant "chatgpt" text), matching the card's SourceBadge.
+/// - Models render as compact text (no per-model icons exist).
+/// - Tags render as `#name` chips in teal.
+/// - Keywords render as `"text"`.
+/// - Dates render with a calendar icon.
+/// - If the filter is empty (purely a user-named saved view), fall
+///   back to `entry.name`.
+private struct SavedFilterSummaryView: View {
+    let entry: SavedFilterEntry
+
+    var body: some View {
+        let filter = entry.filters
+
+        if filter.hasMeaningfulFilters {
+            HStack(spacing: 6) {
+                if !filter.normalizedKeyword.isEmpty {
+                    Text("“\(filter.normalizedKeyword)”")
+                        .lineLimit(1)
+                }
+
+                ForEach(filter.sources.sorted(), id: \.self) { source in
+                    Image(systemName: sourceIcon(source))
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(sourceColor(source))
+                        .help(source)
+                }
+
+                ForEach(filter.models.sorted(), id: \.self) { model in
+                    Text(model)
+                        .font(.callout)
+                        .lineLimit(1)
+                        .foregroundStyle(.primary)
+                }
+
+                ForEach(filter.bookmarkTags, id: \.self) { tag in
+                    Text("#\(tag)")
+                        .font(.callout)
+                        .foregroundStyle(Color.teal)
+                        .lineLimit(1)
+                }
+
+                if let dateFrom = filter.dateFrom, !dateFrom.isEmpty {
+                    Label(dateFrom, systemImage: "calendar")
+                        .labelStyle(.titleAndIcon)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                if let dateTo = filter.dateTo, !dateTo.isEmpty {
+                    Label(dateTo, systemImage: "calendar.badge.clock")
+                        .labelStyle(.titleAndIcon)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                if filter.bookmarkedOnly {
+                    Image(systemName: "bookmark.fill")
+                        .font(.callout)
+                        .foregroundStyle(.yellow)
+                        .help("Bookmarked only")
+                }
+            }
+        } else {
+            Text(entry.name)
+                .lineLimit(1)
+        }
+    }
+
+    private func sourceIcon(_ source: String) -> String {
+        switch source.lowercased() {
+        case "chatgpt":
+            "bubble.left.and.bubble.right.fill"
+        case "claude":
+            "text.bubble.fill"
+        case "gemini":
+            "sparkles"
+        default:
+            "doc.text.fill"
+        }
+    }
+
+    private func sourceColor(_ source: String) -> Color {
+        switch source.lowercased() {
+        case "chatgpt":
+            .green
+        case "claude":
+            .orange
+        case "gemini":
+            .blue
+        default:
+            .gray
+        }
     }
 }
