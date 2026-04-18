@@ -367,6 +367,20 @@ struct MacOSRootView: View {
                 .ignoresSafeArea(.container, edges: .top)
             }
         }
+        // Trackpad / mouse swipe → toggle Viewer Mode. Lives on the
+        // workspace split view (not on a single pane) so the gesture
+        // works regardless of which pane the user happens to be over,
+        // matching the toolbar button — which is also reachable from
+        // anywhere — as a parallel input path. See
+        // `ViewerModeSwipeGesture` for the threshold/dominance
+        // rationale and platform branches. `canEnter` mirrors the
+        // toolbar button's gate so a swipe-to-enter without an active
+        // tab is a no-op (same as clicking the disabled button); exits
+        // are always allowed regardless.
+        .viewerModeSwipeGesture(
+            isActive: $isViewerModeActive,
+            canEnter: tabManager.activeTab != nil
+        )
     }
 
     private var libraryContentPane: some View {
