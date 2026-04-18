@@ -1260,13 +1260,23 @@ private struct CodeBlockView: View {
             .padding(.top, 6)
             .padding(.bottom, 4)
 
-            ScrollView(.horizontal, showsIndicators: true) {
-                Text(code)
-                    .font(.system(size: fontSize, design: .monospaced))
-                    .textSelection(.enabled)
-                    .padding(.horizontal, 10)
-                    .padding(.bottom, 10)
-            }
+            // Word-wrap (no horizontal ScrollView) so a two-finger
+            // horizontal trackpad swipe inside the code can't be
+            // mis-recognized as a Viewer Mode swipe — the swipe gesture
+            // on the workspace split view (`ViewerModeSwipeGesture`) eats
+            // events when the user actually meant to scroll the code
+            // sideways. Wrapping also matches the reading flow of the
+            // surrounding paragraphs; very long single-token lines (URLs,
+            // dotted identifier chains) still wrap because Text breaks at
+            // word boundaries including `.` and `/`. Colored via
+            // `SyntaxHighlighter` so the per-language palette stays in
+            // sync with whatever `bodyFontSize` the bubble is using.
+            Text(SyntaxHighlighter.highlight(code, language: language, fontSize: fontSize))
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, 10)
+                .padding(.bottom, 10)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(PlatformColors.textBackground.opacity(0.5))
