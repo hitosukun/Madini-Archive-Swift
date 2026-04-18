@@ -42,6 +42,12 @@ actor MockTagRepository: TagRepository {
         }
     }
 
+    func findTagByName(_ name: String) -> TagEntry? {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return tags.first { $0.name.caseInsensitiveCompare(trimmed) == .orderedSame }
+    }
+
     func createTag(name: String) throws -> TagEntry {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {

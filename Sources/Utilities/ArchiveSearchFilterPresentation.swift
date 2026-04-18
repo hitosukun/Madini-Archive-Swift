@@ -13,6 +13,16 @@ extension ArchiveSearchFilter {
         if !models.isEmpty {
             parts.append(Array(models).sorted().joined(separator: ", "))
         }
+        if !sourceFiles.isEmpty {
+            // Show just filenames — full absolute paths would blow out the
+            // chip width in the saved-filter summary.
+            parts.append(
+                sourceFiles
+                    .map { ($0 as NSString).lastPathComponent }
+                    .sorted()
+                    .joined(separator: ", ")
+            )
+        }
         if bookmarkedOnly {
             parts.append("bookmarked")
         }

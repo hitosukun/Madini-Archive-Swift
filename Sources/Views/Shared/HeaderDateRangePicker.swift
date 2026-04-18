@@ -18,22 +18,34 @@ struct HeaderDateRangePicker: View {
         Button {
             isPresented.toggle()
         } label: {
-            HStack(spacing: 4) {
+            ZStack {
+                // `.title3` (~20pt) vs the prior `.body` (~17pt) — the
+                // icon-only toolbar chips (calendar, viewer-mode toggle,
+                // export) kept reading as undersized against the 30pt
+                // chip height and the text-carrying sort pill beside
+                // them. One typography step up gives these glyphs
+                // clear presence without overflowing the chip.
                 Image(systemName: "calendar")
-                    .font(.caption.weight(.semibold))
+                    .font(.title3.weight(.semibold))
+
+                // Active-state badge dot — sits as a top-trailing pip
+                // on the icon rather than as an inline sibling, so the
+                // square chip stays centered on its glyph regardless of
+                // filter state. Apple's own toolbar buttons (Mail's
+                // "Unread" badge on the filter button, etc.) decorate
+                // the chip the same way.
                 if hasDateFilter {
                     Circle()
                         .fill(Color.accentColor)
                         .frame(width: 5, height: 5)
+                        .offset(x: 7, y: -6)
                 }
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
-            .background(
-                RoundedRectangle(cornerRadius: WorkspaceLayoutMetrics.chipCornerRadius, style: .continuous)
-                    .fill(hasDateFilter ? Color.accentColor.opacity(0.18) : Color.secondary.opacity(0.10))
-            )
-            .foregroundStyle(hasDateFilter ? Color.accentColor : Color.primary)
+            // Rounded-square icon chip — matches Apple's titlebar
+            // sidebar-toggle shape so this button and the macOS-supplied
+            // sidebar toggle read as one family. `isActive` flips the
+            // chrome to accent when a date filter is set.
+            .headerIconChipStyle(isActive: hasDateFilter)
         }
         .buttonStyle(.plain)
         .help("Filter by date range")

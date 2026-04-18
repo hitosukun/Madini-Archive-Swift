@@ -408,9 +408,6 @@ final class GRDBViewService: ViewService, @unchecked Sendable {
     }
 
     private static func currentTimestamp() -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        return formatter.string(from: Date())
+        TimestampFormatter.now()
     }
 }

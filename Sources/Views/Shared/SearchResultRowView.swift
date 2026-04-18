@@ -16,15 +16,17 @@ struct SearchResultRowView: View {
                     action: onToggleBookmark
                 )
 
-                if let source = result.source {
-                    SourceBadge(source: source)
-                }
-
+                // Model preferred, source fallback — same rule as
+                // `ConversationRowView`. Model pill inherits the service's
+                // brand color so an explicit `source` next to it would be
+                // redundant.
                 if let model = result.model {
                     Text(model)
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(SourceAppearance.color(forModel: model))
                         .lineLimit(1)
+                } else if let source = result.source {
+                    SourceText(source: source)
                 }
 
                 Spacer()

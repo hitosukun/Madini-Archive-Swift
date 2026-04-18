@@ -56,6 +56,36 @@ final class MockConversationRepository: ConversationRepository, @unchecked Senda
             }
     }
 
+    func fetchSourceFileFacets(filter: ArchiveSearchFilter?) async throws -> [FilterOption] {
+        // Mock fixtures have no source_file provenance — the sidebar entry
+        // stays empty under previews, which is fine.
+        []
+    }
+
+    func fetchSourceModelFacets(filter: ArchiveSearchFilter?) async throws -> [SourceModelFacet] {
+        var facetFilter = filter ?? ArchiveSearchFilter()
+        facetFilter.sources = []
+        facetFilter.models = []
+        let filtered = filteredItems(filter: facetFilter)
+        let grouped = Dictionary(grouping: filtered) { item in
+            SourceModelKey(source: item.source ?? "Unknown", model: item.model)
+        }
+        return grouped
+            .map { key, items in
+                SourceModelFacet(source: key.source, model: key.model, count: items.count)
+            }
+            .sorted { lhs, rhs in
+                if lhs.source != rhs.source { return lhs.source < rhs.source }
+                if lhs.count != rhs.count { return lhs.count > rhs.count }
+                return (lhs.model ?? "") < (rhs.model ?? "")
+            }
+    }
+
+    private struct SourceModelKey: Hashable {
+        let source: String
+        let model: String?
+    }
+
     private func filteredItems(filter: ArchiveSearchFilter) -> [ConversationSummary] {
         items.filter { item in
             let sourceMatches = filter.sources.isEmpty || filter.sources.contains(item.source ?? "")
@@ -93,13 +123,25 @@ final class MockConversationRepository: ConversationRepository, @unchecked Senda
         by sortKey: ConversationSortKey
     ) -> [ConversationSummary] {
         items.sorted { lhs, rhs in
-            let left = lhs.primaryTime ?? ""
-            let right = rhs.primaryTime ?? ""
             switch sortKey {
             case .dateAsc:
+                let left = lhs.primaryTime ?? ""
+                let right = rhs.primaryTime ?? ""
                 return left == right ? lhs.id < rhs.id : left < right
             case .dateDesc:
+                let left = lhs.primaryTime ?? ""
+                let right = rhs.primaryTime ?? ""
                 return left == right ? lhs.id < rhs.id : left > right
+            case .promptCountDesc:
+                if lhs.messageCount != rhs.messageCount {
+                    return lhs.messageCount > rhs.messageCount
+                }
+                return lhs.id < rhs.id
+            case .promptCountAsc:
+                if lhs.messageCount != rhs.messageCount {
+                    return lhs.messageCount < rhs.messageCount
+                }
+                return lhs.id < rhs.id
             }
         }
     }

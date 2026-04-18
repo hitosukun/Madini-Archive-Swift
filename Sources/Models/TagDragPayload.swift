@@ -2,24 +2,58 @@ import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// Lightweight drag payload used when the sidebar's tag row is dragged onto
-/// a conversation card to attach the tag. The name is the source of truth —
-/// the receiving view resolves it back to a `TagEntry` via `LibraryViewModel`.
+/// Drag payload for "tag row → conversation card" attaches.
+///
+/// We deliberately piggy-back on the system-registered `public.json`
+/// UTI rather than defining a private one. SwiftPM executable targets
+/// do not expose Info.plist, so private UTIs declared with
+/// `UTType(exportedAs:)` / `UTType(importedAs:)` are never actually
+/// registered — Xcode warns about it, and more importantly the
+/// `NSItemProvider` produced for the drag carries a type the system
+/// doesn't recognize, which silently breaks `.dropDestination` matching.
+///
+/// Using `.json` + a `kind` discriminator inside the Codable payload
+/// keeps in-app DnD reliable without a bundle plist. The companion
+/// `ConversationDragPayload` uses `.propertyList` instead of `.json`
+/// so cross-type drops reject at the item-provider layer (no decode
+/// attempt, no console spam). The `kind` discriminator remains as a
+/// cheap safety net.
 struct TagDragPayload: Codable, Hashable, Transferable, Sendable {
+    static let payloadKind = "madini.tag"
+
     let name: String
 
-    static var transferRepresentation: some TransferRepresentation {
-        CodableRepresentation(contentType: .madiniTag)
-    }
-}
+    private var kind: String { Self.payloadKind }
 
-extension UTType {
-    /// Private UTI for Madini tag drags. Declared as `importedAs` rather
-    /// than `exportedAs` so we do not need a matching entry in the app
-    /// bundle's Info.plist — Xcode logs a warning like
-    /// `Type "app.madini.archive.tag" was expected to be declared and
-    /// exported in the Info.plist` when `exportedAs` is used without a
-    /// bundle declaration. Drops are scoped in-process (sidebar tag row
-    /// → conversation card), so either kind works functionally.
-    static let madiniTag = UTType(importedAs: "app.madini.archive.tag")
+    init(name: String) {
+        self.name = name
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case kind
+        case name
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let storedKind = try container.decode(String.self, forKey: .kind)
+        guard storedKind == Self.payloadKind else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .kind,
+                in: container,
+                debugDescription: "Not a Madini tag payload (got \(storedKind))."
+            )
+        }
+        self.name = try container.decode(String.self, forKey: .name)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(kind, forKey: .kind)
+        try container.encode(name, forKey: .name)
+    }
+
+    static var transferRepresentation: some TransferRepresentation {
+        CodableRepresentation(contentType: .json)
+    }
 }

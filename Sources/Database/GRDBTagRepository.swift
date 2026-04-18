@@ -36,6 +36,26 @@ final class GRDBTagRepository: TagRepository, @unchecked Sendable {
         }
     }
 
+    func findTagByName(_ name: String) async throws -> TagEntry? {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return try await GRDBAsync.read(from: dbQueue) { db in
+            let row = try Row.fetchOne(
+                db,
+                sql: """
+                    SELECT
+                        id, name, system_key, is_system, created_at, updated_at,
+                        0 AS usage_count
+                    FROM bookmark_tags
+                    WHERE name = ? COLLATE NOCASE
+                    LIMIT 1
+                """,
+                arguments: [trimmed]
+            )
+            return row.map(Self.mapTag)
+        }
+    }
+
     func createTag(name: String) async throws -> TagEntry {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
@@ -112,12 +132,51 @@ final class GRDBTagRepository: TagRepository, @unchecked Sendable {
         }
     }
 
+    /// Delete a user-created tag. Rather than dropping the links outright,
+    /// we **reroute them to the Trash system tag** so the user can recover
+    /// the affected conversations (Trash is a rescue lane, not a grave —
+    /// attaching any non-Trash tag back auto-detaches it).
+    ///
+    /// All steps run inside a single transaction so a crash mid-way cannot
+    /// leave dangling links pointing at a tag row that's already gone.
     func deleteTag(id: Int) async throws {
         try await GRDBAsync.write(to: dbQueue) { db in
+            // System tags (including Trash itself) are immutable — bail
+            // early and match the previous contract.
+            guard let isSystem = try Int64.fetchOne(
+                db,
+                sql: "SELECT is_system FROM bookmark_tags WHERE id = ?",
+                arguments: [id]
+            ), isSystem == 0 else {
+                return
+            }
+
+            let trashID = try Self.ensureTrashTagID(db: db)
+            let timestamp = Self.currentTimestamp()
+
+            // 1. For every bookmark currently carrying the doomed tag,
+            //    attach Trash (INSERT OR IGNORE so duplicates are fine).
+            try db.execute(
+                sql: """
+                    INSERT OR IGNORE INTO bookmark_tag_links (
+                        bookmark_id, tag_id, created_at
+                    )
+                    SELECT tl.bookmark_id, ?, ?
+                    FROM bookmark_tag_links tl
+                    WHERE tl.tag_id = ?
+                """,
+                arguments: [trashID, timestamp, id]
+            )
+
+            // 2. Drop the old links.
             try db.execute(
                 sql: "DELETE FROM bookmark_tag_links WHERE tag_id = ?",
                 arguments: [id]
             )
+
+            // 3. Delete the tag row itself (is_system = 0 guard retained
+            //    for belt-and-braces — the earlier guard already returned
+            //    for system rows).
             try db.execute(
                 sql: "DELETE FROM bookmark_tags WHERE id = ? AND is_system = 0",
                 arguments: [id]
@@ -136,42 +195,28 @@ final class GRDBTagRepository: TagRepository, @unchecked Sendable {
             let placeholders = Array(repeating: "?", count: ids.count).joined(separator: ", ")
             let arguments = StatementArguments(ids)
 
-            // Match both thread-level bookmarks (target_id = conversationID) and
-            // prompt-level bookmarks (target_id = "<conversationID>:<msgIndex>"),
-            // since the Python app stores tags primarily as prompt-level.
+            // Thread-level bookmarks only. Prompt-level tagging has been
+            // retired; any legacy `target_type = 'prompt'` rows were rolled
+            // up to thread-level and then physically deleted by migrations
+            // 1 and 2 (see AppServices.bootstrapViewLayerSchema).
             let bookmarkRows = try Row.fetchAll(
                 db,
                 sql: """
                     SELECT
                         b.id AS bookmark_id,
-                        b.target_type,
-                        b.target_id,
-                        CASE
-                            WHEN b.target_type = 'thread' THEN b.target_id
-                            WHEN b.target_type = 'prompt' THEN substr(b.target_id, 1, instr(b.target_id, ':') - 1)
-                            ELSE NULL
-                        END AS conversation_id
+                        b.target_id AS conversation_id
                     FROM bookmarks b
-                    WHERE (
-                        (b.target_type = 'thread' AND b.target_id IN (\(placeholders)))
-                        OR (b.target_type = 'prompt'
-                            AND substr(b.target_id, 1, instr(b.target_id, ':') - 1) IN (\(placeholders)))
-                    )
+                    WHERE b.target_type = 'thread'
+                      AND b.target_id IN (\(placeholders))
                 """,
-                arguments: arguments + arguments
+                arguments: arguments
             )
 
-            // Track the thread-level bookmark id per conversation (used as the
-            // canonical writable target for attach/detach from SwiftUI).
             var threadBookmarkIDByConversation: [String: Int] = [:]
-            var allBookmarkIDsByConversation: [String: [Int]] = [:]
             for row in bookmarkRows {
                 guard let convID = row["conversation_id"] as String? else { continue }
                 let bookmarkID = Int(row["bookmark_id"] as Int64? ?? 0)
-                allBookmarkIDsByConversation[convID, default: []].append(bookmarkID)
-                if (row["target_type"] as String?) == "thread" {
-                    threadBookmarkIDByConversation[convID] = bookmarkID
-                }
+                threadBookmarkIDByConversation[convID] = bookmarkID
             }
 
             var result: [String: ConversationTagBinding] = [:]
@@ -183,7 +228,7 @@ final class GRDBTagRepository: TagRepository, @unchecked Sendable {
                 )
             }
 
-            let bookmarkIDs = Array(Set(allBookmarkIDsByConversation.values.flatMap { $0 }))
+            let bookmarkIDs = Array(threadBookmarkIDByConversation.values)
             guard !bookmarkIDs.isEmpty else {
                 return result
             }
@@ -196,11 +241,7 @@ final class GRDBTagRepository: TagRepository, @unchecked Sendable {
                     SELECT
                         tl.bookmark_id,
                         t.id, t.name, t.system_key, t.is_system, t.created_at, t.updated_at,
-                        (
-                            SELECT COUNT(*)
-                            FROM bookmark_tag_links inner_tl
-                            WHERE inner_tl.tag_id = t.id
-                        ) AS usage_count
+                        0 AS usage_count
                     FROM bookmark_tag_links tl
                     JOIN bookmark_tags t ON t.id = tl.tag_id
                     WHERE tl.bookmark_id IN (\(tagPlaceholders))
@@ -215,23 +256,12 @@ final class GRDBTagRepository: TagRepository, @unchecked Sendable {
                 tagsByBookmarkID[bookmarkID, default: []].append(Self.mapTag(row))
             }
 
-            for (conversationID, bookmarkIDs) in allBookmarkIDsByConversation {
-                // Union all tags across this conversation's bookmarks (thread + prompt-level).
-                var seenTagIDs = Set<Int>()
-                var merged: [TagEntry] = []
-                for bookmarkID in bookmarkIDs {
-                    for tag in tagsByBookmarkID[bookmarkID] ?? [] {
-                        if seenTagIDs.insert(tag.id).inserted {
-                            merged.append(tag)
-                        }
-                    }
-                }
-                merged.sort { $0.name.lowercased() < $1.name.lowercased() }
-
+            for (conversationID, bookmarkID) in threadBookmarkIDByConversation {
+                let tags = tagsByBookmarkID[bookmarkID] ?? []
                 result[conversationID] = ConversationTagBinding(
                     conversationID: conversationID,
-                    tags: merged,
-                    bookmarkID: threadBookmarkIDByConversation[conversationID]
+                    tags: tags,
+                    bookmarkID: bookmarkID
                 )
             }
 
@@ -291,6 +321,20 @@ final class GRDBTagRepository: TagRepository, @unchecked Sendable {
                 arguments: [bookmarkID, tagID, timestamp]
             )
 
+            // Rescue semantics: attaching any non-Trash tag implicitly
+            // pulls the conversation out of Trash. Skip if the caller is
+            // itself attaching Trash (that's a manual "soft-delete").
+            let trashID = try Self.ensureTrashTagID(db: db)
+            if Int64(tagID) != trashID {
+                try db.execute(
+                    sql: """
+                        DELETE FROM bookmark_tag_links
+                        WHERE bookmark_id = ? AND tag_id = ?
+                    """,
+                    arguments: [bookmarkID, trashID]
+                )
+            }
+
             return Int(bookmarkID)
         }
     }
@@ -313,6 +357,29 @@ final class GRDBTagRepository: TagRepository, @unchecked Sendable {
 
     // MARK: - Helpers
 
+    /// Resolve the Trash system tag's id, creating it on the fly if the
+    /// schema-bootstrap seed did not run (e.g. an older DB file). Called
+    /// from within a `write` block so we share the transaction.
+    private static func ensureTrashTagID(db: Database) throws -> Int64 {
+        if let id = try Int64.fetchOne(
+            db,
+            sql: "SELECT id FROM bookmark_tags WHERE system_key = 'trash'"
+        ) {
+            return id
+        }
+        let timestamp = currentTimestamp()
+        try db.execute(
+            sql: """
+                INSERT INTO bookmark_tags (
+                    name, system_key, is_system, created_at, updated_at
+                )
+                VALUES ('Trash', 'trash', 1, ?, ?)
+            """,
+            arguments: [timestamp, timestamp]
+        )
+        return db.lastInsertedRowID
+    }
+
     private static func mapTag(_ row: Row) -> TagEntry {
         TagEntry(
             id: Int(row["id"] as Int64? ?? 0),
@@ -326,10 +393,7 @@ final class GRDBTagRepository: TagRepository, @unchecked Sendable {
     }
 
     private static func currentTimestamp() -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        return formatter.string(from: Date())
+        TimestampFormatter.now()
     }
 
     private static func encodePayload(_ payload: [String: String]) -> String? {

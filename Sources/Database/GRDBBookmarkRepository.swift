@@ -124,6 +124,9 @@ final class GRDBBookmarkRepository: BookmarkRepository, @unchecked Sendable {
                     LEFT JOIN conversations c
                         ON b.target_type = 'thread'
                        AND c.id = b.target_id
+                    -- markdown import 会話は render 未対応のため一覧から除外。
+                    -- thread 以外のブックマーク (c が NULL) は影響させない。
+                    WHERE c.source IS NULL OR c.source != 'markdown'
                     ORDER BY b.updated_at DESC, b.created_at DESC, b.id DESC
                 """
             )
@@ -156,10 +159,7 @@ final class GRDBBookmarkRepository: BookmarkRepository, @unchecked Sendable {
     }
 
     private static func currentTimestamp() -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        return formatter.string(from: Date())
+        TimestampFormatter.now()
     }
 
     private static func encodePayload(_ payload: [String: String]) -> String? {

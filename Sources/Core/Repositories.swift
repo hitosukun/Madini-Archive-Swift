@@ -171,12 +171,22 @@ enum MessageRole: String, Codable, Hashable, Sendable {
 enum ConversationSortKey: Hashable, Sendable {
     case dateAsc
     case dateDesc
+    /// Sort by the conversation's prompt count (stored as `prompt_count` in
+    /// GRDB, surfaced as `messageCount` on `ConversationSummary`). "Most
+    /// prompts first" — useful for finding the long, substantive threads.
+    case promptCountDesc
+    /// Fewest prompts first — the inverse; surfaces one-off questions.
+    case promptCountAsc
 }
 
 struct ArchiveSearchFilter: Codable, Hashable, Sendable {
     var keyword: String
     var sources: Set<String>
     var models: Set<String>
+    /// Filter by `conversations.source_file` — the absolute path of the JSON
+    /// file the conversation was imported from. Drives the per-file checkbox
+    /// list under the sidebar's archive.db entry.
+    var sourceFiles: Set<String>
     var bookmarkedOnly: Bool
     var dateFrom: String?
     var dateTo: String?
@@ -189,6 +199,7 @@ struct ArchiveSearchFilter: Codable, Hashable, Sendable {
         model: String? = nil,
         sources: Set<String> = [],
         models: Set<String> = [],
+        sourceFiles: Set<String> = [],
         bookmarkedOnly: Bool = false,
         dateFrom: String? = nil,
         dateTo: String? = nil,
@@ -198,6 +209,7 @@ struct ArchiveSearchFilter: Codable, Hashable, Sendable {
         self.keyword = keyword
         self.sources = sources.isEmpty ? Set(source.map { [$0] } ?? []) : sources
         self.models = models.isEmpty ? Set(model.map { [$0] } ?? []) : models
+        self.sourceFiles = sourceFiles
         self.bookmarkedOnly = bookmarkedOnly
         self.dateFrom = dateFrom
         self.dateTo = dateTo
@@ -211,6 +223,7 @@ struct ArchiveSearchFilter: Codable, Hashable, Sendable {
         case model
         case sources
         case models
+        case sourceFiles
         case bookmarkedOnly
         case dateFrom
         case dateTo
@@ -233,6 +246,7 @@ struct ArchiveSearchFilter: Codable, Hashable, Sendable {
         let sources = Set(try container.decodeIfPresent([String].self, forKey: .sources) ?? source.map { [$0] } ?? [])
         let model = try container.decodeIfPresent(String.self, forKey: .model)
         let models = Set(try container.decodeIfPresent([String].self, forKey: .models) ?? model.map { [$0] } ?? [])
+        let sourceFiles = Set(try container.decodeIfPresent([String].self, forKey: .sourceFiles) ?? [])
 
         let rolesArray = try container.decodeIfPresent([MessageRole].self, forKey: .roles) ?? []
 
@@ -240,6 +254,7 @@ struct ArchiveSearchFilter: Codable, Hashable, Sendable {
             keyword: keyword,
             sources: sources,
             models: models,
+            sourceFiles: sourceFiles,
             bookmarkedOnly: try container.decodeIfPresent(Bool.self, forKey: .bookmarkedOnly) ?? false,
             dateFrom: try container.decodeIfPresent(String.self, forKey: .dateFrom),
             dateTo: try container.decodeIfPresent(String.self, forKey: .dateTo),
@@ -253,6 +268,7 @@ struct ArchiveSearchFilter: Codable, Hashable, Sendable {
         try container.encode(keyword, forKey: .keyword)
         try container.encode(Array(sources).sorted(), forKey: .sources)
         try container.encode(Array(models).sorted(), forKey: .models)
+        try container.encode(Array(sourceFiles).sorted(), forKey: .sourceFiles)
         try container.encodeIfPresent(source, forKey: .source)
         try container.encodeIfPresent(model, forKey: .model)
         try container.encode(bookmarkedOnly, forKey: .bookmarkedOnly)
@@ -270,6 +286,7 @@ struct ArchiveSearchFilter: Codable, Hashable, Sendable {
         !normalizedKeyword.isEmpty
             || !sources.isEmpty
             || !models.isEmpty
+            || !sourceFiles.isEmpty
             || bookmarkedOnly
             || normalized(dateFrom) != nil
             || normalized(dateTo) != nil
@@ -447,6 +464,14 @@ struct VirtualThread: Hashable, Sendable {
     let items: [VirtualThreadItem]
 }
 
+/// A (source, model) pair with its conversation count — used to build the
+/// sidebar facet tree in one DB round-trip instead of N+1.
+struct SourceModelFacet: Sendable, Hashable {
+    let source: String
+    let model: String?
+    let count: Int
+}
+
 protocol ConversationRepository: Sendable {
     func fetchIndex(query: ConversationListQuery) async throws -> [ConversationSummary]
     func fetchDetail(id: String) async throws -> ConversationDetail?
@@ -454,6 +479,15 @@ protocol ConversationRepository: Sendable {
     func count(query: ConversationListQuery) async throws -> Int
     func fetchSources(filter: ArchiveSearchFilter?) async throws -> [FilterOption]
     func fetchModels(filter: ArchiveSearchFilter?) async throws -> [FilterOption]
+    /// Single-query facet fetch: returns every (source, model) combination with
+    /// its conversation count, evaluated under the given filter with BOTH the
+    /// source and model filters excluded (so all sources/models remain visible).
+    /// Callers pivot the flat list into the sidebar tree structure.
+    func fetchSourceModelFacets(filter: ArchiveSearchFilter?) async throws -> [SourceModelFacet]
+    /// Per-imported-file conversation counts. Evaluated under the given filter
+    /// with the sourceFiles dimension removed (so every file always stays
+    /// visible in the sidebar regardless of which checkboxes are ticked).
+    func fetchSourceFileFacets(filter: ArchiveSearchFilter?) async throws -> [FilterOption]
 }
 
 extension ConversationRepository {
@@ -501,6 +535,10 @@ protocol TagRepository: Sendable {
     func renameTag(id: Int, name: String) async throws -> TagEntry
     func deleteTag(id: Int) async throws
     func bindings(forConversationIDs ids: [String]) async throws -> [String: ConversationTagBinding]
+    /// Look up a single tag by name (case-insensitive). Returns `nil` when no
+    /// tag matches — avoids loading the whole tag table into memory just to
+    /// resolve an id by name.
+    func findTagByName(_ name: String) async throws -> TagEntry?
     /// Attach a tag to the conversation's bookmark, creating the bookmark
     /// on the fly when one does not exist yet. Returns the bookmark row id.
     @discardableResult

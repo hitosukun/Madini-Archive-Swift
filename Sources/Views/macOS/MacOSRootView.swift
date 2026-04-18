@@ -1,10 +1,49 @@
 #if os(macOS)
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct MacOSRootView: View {
     let services: AppServices
     @State private var libraryViewModel: LibraryViewModel
     @State private var tabManager = ReaderTabManager()
+    /// State for the JSON drag-and-drop import flow. `isDropTargeted`
+    /// drives the blue highlight overlay rendered during an active hover;
+    /// `importToast` drives the short banner that appears at the bottom of
+    /// the window summarizing the importer's outcome. Kept here at the root
+    /// level (rather than owned by the window-level drop handler) because
+    /// the `.task(id: archiveEvents.importRevision)` refresh observer also
+    /// wants to touch the toast when a reload completes.
+    @State private var isJSONDropTargeted: Bool = false
+    @State private var importToast: ImportToast? = nil
+    /// Tracks NavigationSplitView column state so children (the middle-pane
+    /// header bar in particular) can adjust layout when the sidebar is
+    /// collapsed — otherwise the macOS traffic-light buttons overlap the
+    /// content column's leading toolbar.
+    @State private var columnVisibility: NavigationSplitViewVisibility = .all
+    /// Measured height of the floating middle-pane header bar. Drives the
+    /// List's top `contentMargins` so rows can scroll under the bar and get
+    /// blurred by its vibrancy material. Variable because the bar grows a
+    /// second row when active-filter chips are present.
+    @State private var libraryHeaderBarHeight: CGFloat = WorkspaceLayoutMetrics.headerBarContentRowHeight
+    /// Whether Viewer Mode is currently active. Flipped from the right-pane
+    /// toolbar's `ViewerModeToggleButton`. When on: left sidebar auto-
+    /// collapses, the middle-pane toolbar disappears, and the middle pane
+    /// swaps to `ViewerModePane` tracking the active reader tab. The mode
+    /// is deliberately volatile (no persistence) — it's a focus-mode, not
+    /// a preference.
+    @State private var isViewerModeActive: Bool = false
+    /// Snapshot of `columnVisibility` taken right before entering Viewer
+    /// Mode, so exiting can restore the user's prior sidebar state. Users
+    /// who were already in `.doubleColumn` don't get yanked back to `.all`
+    /// on exit — they return to exactly what they had.
+    @State private var columnVisibilityBeforeViewerMode: NavigationSplitViewVisibility = .all
+    // `selectedPromptID` used to live here as `@State`, but writing to it
+    // from the reader's scroll-position observer forced `MacOSRootView` to
+    // re-render every scroll tick, which cascaded into content-margin
+    // recalculations and flagged SwiftUI's "preference updated multiple
+    // times per frame" warning. It now lives on `ReaderTabManager` as an
+    // `@Observable` property so only the views that actually read it
+    // participate in the re-render. See the property's doc comment there.
     @Environment(ArchiveEvents.self) private var archiveEvents
 
     init(services: AppServices) {
@@ -21,15 +60,42 @@ struct MacOSRootView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            workspaceSplitView
-            DataSourceStatusView(
-                dataSource: services.dataSource,
-                loadedCount: libraryViewModel.conversations.count,
-                totalCount: libraryViewModel.totalCount,
-                itemLabel: "conversations"
-            )
+        // The loaded/total counter and archive filename used to live in a
+        // bottom status bar; both have moved into the left sidebar's Library
+        // section (see `UnifiedLibrarySidebar`). Dropping the bar reclaims a
+        // row of vertical space in the middle pane — a noticeable win on
+        // 13-inch displays.
+        workspaceSplitView
+        // Window-level JSON drop handler. Sits ABOVE the in-app tag /
+        // conversation drop destinations (which live on specific rows
+        // further down the view tree) so an external file drag lands
+        // here first. Accepting `UTType.fileURL` — not `UTType.json` —
+        // because we want the drop handler to fire on any file; we
+        // filter to JSONs ourselves inside `handleFileURLDrop(_:)` so
+        // the user can see a "only .json files are supported" toast
+        // rather than a silent rejection at the drop-zone layer.
+        .onDrop(of: [.fileURL], isTargeted: $isJSONDropTargeted) { providers in
+            handleFileURLDrop(providers: providers)
+            return true
         }
+        // Drop-target highlight + result toast live on the same overlay
+        // anchor (bottom of the window) so the feedback geometry stays
+        // stable as the user drags → drops → waits → sees result.
+        .overlay(alignment: .top) {
+            if isJSONDropTargeted {
+                dropTargetBanner
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
+        .overlay(alignment: .bottom) {
+            if let toast = importToast {
+                ImportToastView(toast: toast)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .padding(.bottom, 24)
+            }
+        }
+        .animation(.easeInOut(duration: 0.18), value: isJSONDropTargeted)
+        .animation(.easeInOut(duration: 0.2), value: importToast?.id)
         .focusedSceneValue(\.libraryViewModel, libraryViewModel)
         .task {
             await libraryViewModel.loadIfNeeded()
@@ -40,6 +106,17 @@ struct MacOSRootView: View {
         .task(id: archiveEvents.savedViewRevision) {
             await libraryViewModel.reloadSupportingState()
         }
+        // Fires after a successful JSON import bumps
+        // `archiveEvents.importRevision`. Reloads the main conversation
+        // list AND the sidebar's `sourceFileFacets` so the just-imported
+        // file appears under archive.db → "Sources" without the user
+        // having to restart. The initial run (revision == 0) is a no-op
+        // because SwiftUI fires `.task(id:)` on mount; the `guard` below
+        // short-circuits that first invocation.
+        .task(id: archiveEvents.importRevision) {
+            guard archiveEvents.importRevision > 0 else { return }
+            await libraryViewModel.reload()
+        }
         .onChange(of: libraryViewModel.selectedConversationId) { _, conversationID in
             guard let summary = libraryViewModel.summary(for: conversationID) else {
                 return
@@ -47,14 +124,202 @@ struct MacOSRootView: View {
 
             tabManager.openConversation(
                 id: summary.id,
-                title: summary.displayTitle,
-                mode: .replaceCurrent
+                title: summary.displayTitle
             )
+        }
+        // Viewer Mode toggle plumbing. Activating the mode collapses the
+        // sidebar and kicks off a detail fetch for the conversation
+        // currently in the reader; deactivating restores the snapshot
+        // `columnVisibility` and drops the cached viewer state so the VM
+        // doesn't retain a reference to a conversation that's no longer
+        // being shown.
+        .onChange(of: isViewerModeActive) { _, active in
+            if active {
+                columnVisibilityBeforeViewerMode = columnVisibility
+                columnVisibility = .doubleColumn
+                if let id = tabManager.activeTab?.conversationID {
+                    Task { await libraryViewModel.loadViewerConversation(id: id) }
+                }
+            } else {
+                columnVisibility = columnVisibilityBeforeViewerMode
+                libraryViewModel.clearViewerData()
+            }
+        }
+        // Clamp column visibility while Viewer Mode is active. macOS's
+        // built-in sidebar-toggle shortcut (⌘⌃S) and some internal
+        // `NavigationSplitView` rebuild paths can flip `columnVisibility`
+        // back to `.all` mid-session even though the toggle button itself
+        // is removed via `ConditionalSidebarToggleRemoval`. When that
+        // happens the sidebar reappears over the Viewer-Mode toolbar
+        // (user-visible symptom: "左サイドバーの開閉ボタンが重なってでる")
+        // and there's no obvious path back. Snap it back to `.doubleColumn`
+        // in the next runloop turn so the mode stays internally consistent.
+        .onChange(of: columnVisibility) { _, newValue in
+            guard isViewerModeActive, newValue != .doubleColumn else { return }
+            Task { @MainActor in
+                columnVisibility = .doubleColumn
+            }
+        }
+        // While in Viewer Mode, keep the middle-pane outline in sync with
+        // whichever tab is active in the reader. (Outside Viewer Mode this
+        // is a no-op — the list doesn't read `viewer*` state.)
+        .onChange(of: tabManager.activeTab?.conversationID) { _, newID in
+            guard isViewerModeActive, let newID else { return }
+            Task { await libraryViewModel.loadViewerConversation(id: newID) }
+        }
+        // Tab-switch reset for `selectedPromptID` now lives inside
+        // `ReaderTabManager.openConversation(…)` itself, so no onChange
+        // is needed here — clearing is atomic with the tab change, which
+        // also eliminates a brief window where the new tab would appear
+        // with a highlight pointing at a prompt from the previous one.
+    }
+
+    // MARK: - JSON drag-and-drop import
+
+    /// Banner shown over the top of the window while a drag is hovering.
+    /// Keeps the visual contract simple — tell the user we'll import
+    /// `.json` files and that anything else is ignored.
+    private var dropTargetBanner: some View {
+        Text("Drop .json files to import into archive.db")
+            .font(.callout.weight(.medium))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .background(
+                Capsule(style: .continuous)
+                    .fill(Color.accentColor.opacity(0.88))
+            )
+            .overlay(
+                Capsule(style: .continuous)
+                    .stroke(Color.white.opacity(0.25), lineWidth: 0.5)
+            )
+            .padding(.top, 48)
+            .shadow(color: .black.opacity(0.15), radius: 8, y: 2)
+            .allowsHitTesting(false)
+    }
+
+    /// Resolve each dragged provider into a URL, filter to .json, then hand
+    /// the batch to `JSONImporter`. Runs entirely as a fire-and-forget
+    /// `Task` so the `.onDrop` closure can return `true` immediately.
+    private func handleFileURLDrop(providers: [NSItemProvider]) {
+        // Per-provider URL loading is async (the system may have to
+        // materialize the file or fetch promise metadata). Gather a
+        // single array of URLs, dropping failures.
+        Task { @MainActor in
+            var urls: [URL] = []
+            for provider in providers {
+                if let url = await loadFileURL(from: provider) {
+                    urls.append(url)
+                }
+            }
+
+            // Filter to `.json` files by extension. Pathextension check is
+            // enough — we rely on the Python importer to detect whether
+            // the contents are ChatGPT/Claude/Gemini/etc. If the user
+            // drops a `.txt` or `.md` alongside the jsons, reject only
+            // the non-json entries and import the rest.
+            let jsonURLs = urls.filter { $0.pathExtension.lowercased() == "json" }
+            let rejectedCount = urls.count - jsonURLs.count
+
+            guard !jsonURLs.isEmpty else {
+                if rejectedCount > 0 {
+                    showToast(.failure(
+                        message: "Only .json files can be imported.",
+                        detail: nil
+                    ))
+                }
+                return
+            }
+
+            showToast(.progress(message: "Importing \(jsonURLs.count) file\(jsonURLs.count == 1 ? "" : "s")…"))
+
+            do {
+                // Actual shell-out runs on a detached background task so
+                // the importer's blocking IO doesn't pin the main actor.
+                let result = try await Task.detached(priority: .userInitiated) {
+                    try await JSONImporter.importFiles(jsonURLs)
+                }.value
+
+                if result.exitCode == 0 {
+                    archiveEvents.didImportConversations()
+                    let summary = rejectedCount > 0
+                        ? "Imported \(jsonURLs.count) file\(jsonURLs.count == 1 ? "" : "s"), skipped \(rejectedCount) non-JSON."
+                        : "Imported \(jsonURLs.count) file\(jsonURLs.count == 1 ? "" : "s")."
+                    showToast(.success(message: summary))
+                } else {
+                    // Non-zero exit: importer ran but the Python side
+                    // reported an error. Surface a short tail of stderr
+                    // so the user has a pointer to the cause (full
+                    // output is still in Console.app as stderr lines).
+                    let tail = result.stderr
+                        .split(separator: "\n")
+                        .suffix(2)
+                        .joined(separator: " ")
+                    showToast(.failure(
+                        message: "Import failed (exit \(result.exitCode)).",
+                        detail: tail.isEmpty ? nil : String(tail)
+                    ))
+                }
+            } catch {
+                showToast(.failure(
+                    message: "Import couldn't start.",
+                    detail: error.localizedDescription
+                ))
+            }
+        }
+    }
+
+    /// Async wrapper around `NSItemProvider.loadItem(forTypeIdentifier:…)`
+    /// for the `public.file-url` UTI. Returns nil when the provider
+    /// doesn't carry a file URL (e.g. a text-only drag from a browser).
+    private func loadFileURL(from provider: NSItemProvider) async -> URL? {
+        guard provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) else {
+            return nil
+        }
+        return await withCheckedContinuation { (cont: CheckedContinuation<URL?, Never>) in
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                // The system delivers the URL as either `URL`, `NSURL`,
+                // or a serialized `Data` blob depending on where the
+                // drag originated. Accept each form.
+                if let url = item as? URL {
+                    cont.resume(returning: url)
+                } else if let nsurl = item as? NSURL {
+                    cont.resume(returning: nsurl as URL)
+                } else if let data = item as? Data,
+                          let url = URL(dataRepresentation: data, relativeTo: nil) {
+                    cont.resume(returning: url)
+                } else {
+                    cont.resume(returning: nil)
+                }
+            }
+        }
+    }
+
+    /// Replace whatever toast is currently on screen and schedule a fade
+    /// for success/failure toasts. Progress toasts have no timeout — they
+    /// hang on screen until a subsequent `showToast(_:)` replaces them.
+    private func showToast(_ toast: ImportToast) {
+        importToast = toast
+        let autoDismissSeconds: Double?
+        switch toast.kind {
+        case .progress: autoDismissSeconds = nil
+        case .success: autoDismissSeconds = 3.2
+        case .failure: autoDismissSeconds = 5.0
+        }
+        guard let delay = autoDismissSeconds else { return }
+        let capturedID = toast.id
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            // Only dismiss if the current toast is still the one we scheduled
+            // for — otherwise a later toast's timer would kill it too early.
+            if importToast?.id == capturedID {
+                importToast = nil
+            }
         }
     }
 
     private var workspaceSplitView: some View {
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: $columnVisibility) {
             librarySidebar
         } content: {
             libraryContentPane
@@ -68,39 +333,163 @@ struct MacOSRootView: View {
             rightPane
                 .ignoresSafeArea(.container, edges: .top)
         }
+        // Hide the NavigationSplitView's built-in sidebar-toggle button
+        // while Viewer Mode is active. The user explicitly asked for this
+        // — there's no intended path to re-expand the sidebar during a
+        // reading session, and letting the toggle sit in the titlebar
+        // only invites accidental mode-break clicks. Applied as a
+        // conditional modifier so the toggle comes back on its own when
+        // the user exits Viewer Mode.
+        .modifier(ConditionalSidebarToggleRemoval(isActive: isViewerModeActive))
+        // Window-spanning Viewer-Mode toolbar. Sits on top of both the
+        // middle and right panes so the book toggle + title + prev/next
+        // + export read as ONE toolbar spanning the window rather than
+        // two disconnected bars stuck at each pane's leading edge. A
+        // leading 80pt spacer pushes everything clear of the macOS
+        // traffic-light cluster. In non-Viewer-Mode the overlay is
+        // absent and each pane's own header bar takes over as usual.
+        .overlay(alignment: .top) {
+            if isViewerModeActive {
+                ViewerModeTopToolbar(
+                    tabManager: tabManager,
+                    isViewerModeActive: $isViewerModeActive
+                )
+                // Each pane inside the NavigationSplitView applies its
+                // own `.ignoresSafeArea(.container, edges: .top)` so
+                // content can extend up under the titlebar — but the
+                // NavigationSplitView itself does NOT, so an overlay on
+                // it lands below the titlebar/toolbar region. Without
+                // this the bar floated down around y≈170 (screen
+                // report: "レイアウトが崩れてる"). Telling the overlay
+                // to ignore the top container safe area makes it
+                // render flush to window y=0, lining up with the pane
+                // contents that also ignore safe area.
+                .ignoresSafeArea(.container, edges: .top)
+            }
+        }
     }
 
     private var libraryContentPane: some View {
-        VStack(spacing: 0) {
-            UnifiedConversationListView(
-                viewModel: libraryViewModel,
-                onToggleBookmark: toggleBookmark(_:),
-                onTapTag: { tag in
-                    libraryViewModel.toggleBookmarkTag(tag.name)
-                }
-            )
+        // Overlay pattern (not safeAreaInset) so the List/ScrollView beneath
+        // fills the pane edge-to-edge and its rows actually slide UNDER the
+        // header bar when scrolled. safeAreaInset would clip the scroll
+        // region flush to the bar's bottom edge — no content behind the bar,
+        // no vibrancy blur to see. The bar's measured height is forwarded
+        // to the List as contentMargins(.top) so the first row isn't
+        // permanently hidden under it.
+        Group {
+            if isViewerModeActive {
+                // The root-level Viewer-Mode toolbar lives OVER this
+                // pane (as a sibling overlay on the NavigationSplitView)
+                // so reserve 52pt at the top of the prompt list, same
+                // as the other panes do for their own floating bars.
+                // Otherwise the first prompt row sits permanently hidden
+                // behind the toolbar chips.
+                ViewerModePane(
+                    viewModel: libraryViewModel,
+                    tabManager: tabManager,
+                    conversationID: tabManager.activeTab?.conversationID,
+                    topContentInset: WorkspaceLayoutMetrics.headerBarContentRowHeight
+                )
+            } else {
+                UnifiedConversationListView(
+                    viewModel: libraryViewModel,
+                    topContentInset: libraryHeaderBarHeight,
+                    onTapTag: { tag in
+                        libraryViewModel.toggleBookmarkTag(tag.name)
+                    }
+                )
+            }
         }
-        .safeAreaInset(edge: .top, spacing: 0) {
-            LibraryListHeaderBar(viewModel: libraryViewModel)
+        // Fade content passing under the floating toolbar strip so rows
+        // dissolve into the chrome instead of hitting a hard edge.
+        // Applied BEFORE the header overlay so the bar itself is not
+        // faded — only the scrolling content beneath. Viewer Mode used
+        // to skip this (back when the title card lived INSIDE the
+        // pane); now that the title lives in the root-level toolbar
+        // the mask can apply uniformly in both modes.
+        .topFadeMask(height: WorkspaceLayoutMetrics.topFadeHeight)
+        .overlay(alignment: .top) {
+            // Toolbar is suppressed entirely while Viewer Mode is active —
+            // sort / date-filter / active-filter chips don't apply to the
+            // focused reading layout, and hiding the whole bar rather than
+            // disabling controls keeps the mode's chrome truly minimal.
+            if !isViewerModeActive {
+                LibraryListHeaderBar(
+                    viewModel: libraryViewModel,
+                    sidebarIsCollapsed: columnVisibility != .all
+                )
+                .background(
+                    GeometryReader { proxy in
+                        Color.clear
+                            .preference(
+                                key: HeaderBarHeightPreferenceKey.self,
+                                value: proxy.size.height
+                            )
+                    }
+                )
+            }
+        }
+        .onPreferenceChange(HeaderBarHeightPreferenceKey.self) { newHeight in
+            libraryHeaderBarHeight = newHeight
         }
     }
 
     private var rightPane: some View {
-        ReaderWorkspaceView(tabManager: tabManager, repository: services.conversations)
+        ReaderWorkspaceView(
+            tabManager: tabManager,
+            repository: services.conversations,
+            isViewerModeActive: $isViewerModeActive,
+            onRevealActiveConversationInList: {
+                // Right-pane title tap → reveal the open card in the
+                // middle-pane list. The list view observes
+                // `pendingListScrollConversationID` via its own
+                // ScrollViewReader. The reader-body half of the
+                // "jump to top" combo is owned by
+                // `ReaderTabManager.scrollToTopToken`, which the
+                // ReaderWorkspaceView rotates in the same tap handler.
+                //
+                // `revealConversation(id:)` handles the case where the
+                // card has fallen off the currently-loaded window
+                // (common after a sort change, since the list is
+                // paged forward only) — it loads additional pages
+                // until the id shows up, then fires the scroll request.
+                guard let id = tabManager.activeTab?.conversationID else { return }
+                Task { await libraryViewModel.revealConversation(id: id) }
+            }
+        )
     }
 
     private var librarySidebar: some View {
-        VStack(spacing: 0) {
+        // Floating-search-bar layout. Previously the sidebar was a
+        // VStack(search, scroll) which stacked opaque rows and left no
+        // visible window material at the top. Now the ScrollView fills
+        // the column and the search bar rides as a frosted overlay at
+        // the top — same pattern as the middle pane's filter bar and
+        // the right pane's reader toolbar. Rows scroll up under the
+        // search band and blur, which gives the whole sidebar the same
+        // "openness" the other two columns get.
+        UnifiedLibrarySidebar(
+            viewModel: libraryViewModel,
+            dataSource: services.dataSource
+        )
+        // Reserve space so the first row isn't hidden behind the
+        // overlay. The height matches the shared header-bar content
+        // row so all three panes' top bands align at the same y.
+        .safeAreaInset(edge: .top, spacing: 0) {
+            Color.clear
+                .frame(height: WorkspaceLayoutMetrics.headerBarContentRowHeight)
+                .allowsHitTesting(false)
+        }
+        .overlay(alignment: .top) {
+            // Finder-pattern top strip: the band itself is transparent,
+            // only the search field carries glass chrome. Rows in the
+            // ScrollView below pass visibly up to the strip's top edge
+            // instead of hitting an opaque material wall.
             SidebarSearchBar(viewModel: libraryViewModel)
                 .padding(.horizontal, WorkspaceLayoutMetrics.paneHorizontalPadding)
-                .padding(.top, WorkspaceLayoutMetrics.paneTopPadding)
-                .padding(.bottom, WorkspaceLayoutMetrics.paneBottomPadding)
-
-            Divider()
-
-            UnifiedLibrarySidebar(
-                viewModel: libraryViewModel
-            )
+                .frame(height: WorkspaceLayoutMetrics.headerBarContentRowHeight)
+                .frame(maxWidth: .infinity)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .navigationSplitViewColumnWidth(
@@ -110,40 +499,21 @@ struct MacOSRootView: View {
         )
     }
 
-    private func toggleBookmark(_ summary: ConversationSummary) {
-        let nextState = !summary.isBookmarked
-        let target = BookmarkTarget(
-            targetType: .thread,
-            targetID: summary.id,
-            payload: bookmarkPayload(title: summary.displayTitle, source: summary.source, model: summary.model)
-        )
-
-        Task {
-            do {
-                _ = try await services.bookmarks.setBookmark(target: target, bookmarked: nextState)
-                libraryViewModel.setBookmarkState(for: summary.id, isBookmarked: nextState)
-                archiveEvents.didChangeBookmarks()
-            } catch {
-                print("Failed to toggle bookmark: \(error)")
-            }
-        }
-    }
-
-    private func bookmarkPayload(title: String, source: String?, model: String?) -> [String: String] {
-        var payload = ["title": title]
-        if let source {
-            payload["source"] = source
-        }
-        if let model {
-            payload["model"] = model
-        }
-        return payload
-    }
 }
 
 private struct UnifiedLibrarySidebar: View {
     @Bindable var viewModel: LibraryViewModel
+    let dataSource: AppServices.DataSource
     @State private var expandedSources: Set<String> = []
+    /// Separate expanded state for the archive.db entry so it doesn't collide
+    /// with source-facet ids (they share the `expandedSources` key space
+    /// otherwise via string overlap).
+    @State private var archiveFileListExpanded: Bool = false
+    /// Top-level section headers the user has collapsed. Stored as a Set
+    /// (rather than the inverse "expanded" set) so sections default to
+    /// expanded on first launch — a new user isn't greeted by a sidebar
+    /// full of collapsed headers.
+    @State private var collapsedSections: Set<String> = []
 
     var body: some View {
         ScrollView {
@@ -160,6 +530,11 @@ private struct UnifiedLibrarySidebar: View {
                         // bookmark concept folded into Tags. Kept as a header
                         // affordance so the sidebar still has a "Library" entry.
                     }
+
+                    // Replaces the old bottom status bar. Tapping the disclosure
+                    // arrow reveals one checkbox per imported JSON file so the
+                    // user can narrow the library to a specific import batch.
+                    archiveDataSourceRow
                 }
 
                 section(title: "Sources") {
@@ -169,8 +544,13 @@ private struct UnifiedLibrarySidebar: View {
                                 SidebarCheckboxRow(
                                     title: source.value,
                                     count: source.count,
-                                    systemImage: sourceIcon(source.value),
-                                    tint: sourceColor(source.value),
+                                    // Icon retired: the service's brand
+                                    // color lives on the title text itself
+                                    // now (green/orange/blue). Row reads
+                                    // as colored type instead of colored
+                                    // glyph + neutral type.
+                                    systemImage: nil,
+                                    tint: SourceAppearance.color(for: source.value),
                                     isSelected: source.isSelected,
                                     action: {
                                         viewModel.toggleSource(source.value)
@@ -195,8 +575,17 @@ private struct UnifiedLibrarySidebar: View {
                                         SidebarCheckboxRow(
                                             title: model.value,
                                             count: model.count,
-                                            systemImage: "cube.transparent",
-                                            tint: .secondary,
+                                            // Model rows inherit their
+                                            // parent service's brand color
+                                            // via the title text (no glyph).
+                                            // Visually links the model back
+                                            // to its parent source row
+                                            // above — "claude-3-5-sonnet"
+                                            // reads orange under a "claude"
+                                            // row painted orange, the
+                                            // relationship is obvious.
+                                            systemImage: nil,
+                                            tint: SourceAppearance.color(for: source.value),
                                             isSelected: model.isSelected,
                                             compact: true,
                                             action: {
@@ -215,25 +604,47 @@ private struct UnifiedLibrarySidebar: View {
                 // filter is retired; the date range was relocated into the
                 // middle-pane header popover for proximity to the sort bar.
 
-                SidebarTagsSection(libraryViewModel: viewModel)
+                // Tags + Filters wrapped in `section(title:)` so they get
+                // the same collapse/expand behavior as Library and
+                // Sources. Each section's view intentionally no longer
+                // draws its own "TAGS" / "FILTERS" header — the wrapper
+                // owns the title now so the stack reads as one family of
+                // collapsibles down the sidebar.
+                section(title: "Tags") {
+                    SidebarTagsSection(libraryViewModel: viewModel)
+                }
 
                 // "Saved View" name input removed. Pinning is now the way to
                 // promote a recent filter into a persistent view.
-                SavedFiltersSection(
-                    entries: viewModel.unifiedFilters,
-                    onSelect: { entry in viewModel.applySavedFilter(entry) },
-                    onTogglePin: { entry in
-                        viewModel.togglePinned(entry)
-                        archiveEvents.didChangeSavedViews()
-                    },
-                    onDelete: { entry in
-                        viewModel.deleteFilterEntry(entry)
-                        archiveEvents.didChangeSavedViews()
+                if !viewModel.unifiedFilters.isEmpty {
+                    // Suppress the whole section when there are no saved
+                    // entries — otherwise the user would be greeted by an
+                    // empty collapsible "FILTERS" header with nothing
+                    // under it.
+                    section(title: "Filters") {
+                        SavedFiltersSection(
+                            entries: viewModel.unifiedFilters,
+                            onSelect: { entry in viewModel.applySavedFilter(entry) },
+                            onTogglePin: { entry in
+                                viewModel.togglePinned(entry)
+                                archiveEvents.didChangeSavedViews()
+                            },
+                            onDelete: { entry in
+                                viewModel.deleteFilterEntry(entry)
+                                archiveEvents.didChangeSavedViews()
+                            }
+                        )
                     }
-                )
+                }
             }
             .padding(12)
         }
+        // Drop the ScrollView's own opaque backdrop so the translucent
+        // window material we install via `TranslucentWindowBackground`
+        // shows through the sidebar. Without this the ScrollView paints
+        // a solid fill and the column stays opaque despite the window
+        // being clear.
+        .scrollContentBackground(.hidden)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .onAppear {
             expandedSources = Set(viewModel.sourceFacets.map(\.value))
@@ -244,13 +655,36 @@ private struct UnifiedLibrarySidebar: View {
 
     @ViewBuilder
     private func section<Content: View>(title: String, @ViewBuilder content: () -> Content) -> some View {
+        let isCollapsed = collapsedSections.contains(title)
         VStack(alignment: .leading, spacing: 8) {
-            Text(title)
-                .font(.caption)
+            // Tappable header row — disclosure chevron + title act as a
+            // single hit target. `contentShape(Rectangle())` makes the
+            // trailing `Spacer` also clickable so the user can hit
+            // anywhere along the header band, not just on the text.
+            Button {
+                if isCollapsed {
+                    collapsedSections.remove(title)
+                } else {
+                    collapsedSections.insert(title)
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
+                        .font(.caption2.weight(.semibold))
+                        .frame(width: 10)
+                    Text(title)
+                        .font(.caption)
+                        .textCase(.uppercase)
+                    Spacer()
+                }
                 .foregroundStyle(.secondary)
-                .textCase(.uppercase)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
 
-            content()
+            if !isCollapsed {
+                content()
+            }
         }
     }
 
@@ -273,33 +707,116 @@ private struct UnifiedLibrarySidebar: View {
         }
     }
 
-    private func sourceIcon(_ source: String) -> String {
-        switch source.lowercased() {
-        case "chatgpt":
-            return "bubble.left.and.bubble.right"
-        case "claude":
-            return "text.bubble"
-        case "gemini":
-            return "sparkles"
-        case "markdown":
-            return "folder"
-        default:
-            return "folder"
+    @ViewBuilder
+    private var archiveDataSourceRow: some View {
+        // The data source row is expandable only when there are enumerable
+        // files (i.e. `.database`). For `.mock` the pill still renders but
+        // tapping it is a no-op and no chevron is drawn.
+        let isExpandable = !viewModel.sourceFileFacets.isEmpty
+
+        VStack(alignment: .leading, spacing: 6) {
+            // Entire pill row acts as the expansion hit target — previously
+            // only the small trailing chevron was tappable, which was an
+            // unforgiving target. Wrapping everything in a single Button
+            // means clicking anywhere on the "archive.db  5 / 619" band
+            // toggles the file list below.
+            Button {
+                guard isExpandable else { return }
+                archiveFileListExpanded.toggle()
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: archiveIconName)
+                        .foregroundStyle(archiveTint)
+                    Text(archiveDisplayName)
+                        .font(.body)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer(minLength: 4)
+                    Text("\(viewModel.conversations.count) / \(viewModel.totalCount)")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .monospacedDigit()
+
+                    // Disclosure chevron lives inside the same Button so it
+                    // stays visually aligned with the row label. It's now
+                    // an indicator rather than the only hit target.
+                    if isExpandable {
+                        Image(systemName: archiveFileListExpanded ? "chevron.down" : "chevron.right")
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 12)
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.secondary.opacity(0.06))
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(archiveHelpText)
+
+            if archiveFileListExpanded, !viewModel.sourceFileFacets.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(viewModel.sourceFileFacets) { file in
+                        SidebarCheckboxRow(
+                            title: file.displayName,
+                            count: file.count,
+                            systemImage: "doc.text",
+                            // Brown matches the `.sourceFile` active-
+                            // filter chip + saved-filter icon, and stays
+                            // distinct from the three LLM brand colors
+                            // (green/orange/blue) so import files never
+                            // read as a service.
+                            tint: .brown,
+                            isSelected: file.isSelected,
+                            compact: true,
+                            action: {
+                                viewModel.toggleSourceFile(file.path)
+                            }
+                        )
+                        .padding(.leading, 24)
+                        .help(file.path)
+                    }
+                }
+            }
         }
     }
 
-    private func sourceColor(_ source: String) -> Color {
-        switch source.lowercased() {
-        case "chatgpt":
-            return .green
-        case "claude":
-            return .orange
-        case "gemini":
-            return .blue
-        default:
-            return .gray
+    private var archiveIconName: String {
+        switch dataSource {
+        case .database: "externaldrive.fill"
+        case .mock: "shippingbox"
         }
     }
+
+    private var archiveTint: Color {
+        switch dataSource {
+        case .database: .green
+        case .mock: .orange
+        }
+    }
+
+    private var archiveDisplayName: String {
+        switch dataSource {
+        case .database(let path):
+            let component = (path as NSString).lastPathComponent
+            return component.isEmpty ? path : component
+        case .mock:
+            return "Mock Data"
+        }
+    }
+
+    private var archiveHelpText: String {
+        switch dataSource {
+        case .database(let path):
+            return path
+        case .mock:
+            return "In-memory preview fixtures"
+        }
+    }
+
 }
 
 private struct SidebarSelectionRow: View {
@@ -342,7 +859,13 @@ private struct SidebarSelectionRow: View {
 private struct SidebarCheckboxRow: View {
     let title: String
     let count: Int
-    let systemImage: String
+    /// Optional leading glyph. Pass `nil` for "text-only" rows where the
+    /// title itself carries the visual hook via `tint` (e.g. the source
+    /// rows after the per-service SF Symbol was retired — the word
+    /// "chatgpt" is painted green directly instead of sitting next to a
+    /// green bubble glyph). When non-nil the row behaves as before: glyph
+    /// in `tint`, title in `.primary`.
+    let systemImage: String?
     let tint: Color
     let isSelected: Bool
     var compact: Bool = false
@@ -354,13 +877,18 @@ private struct SidebarCheckboxRow: View {
                 Image(systemName: isSelected ? "checkmark.square.fill" : "square")
                     .foregroundStyle(isSelected ? Color.accentColor : .secondary)
 
-                Image(systemName: systemImage)
-                    .foregroundStyle(tint)
-                    .font(compact ? .caption : .body)
+                if let systemImage {
+                    Image(systemName: systemImage)
+                        .foregroundStyle(tint)
+                        .font(compact ? .caption : .body)
+                }
 
                 Text(title)
                     .font(compact ? .subheadline : .body)
-                    .foregroundStyle(.primary)
+                    // When no leading glyph exists, the tint migrates onto
+                    // the title text itself so the row still conveys its
+                    // service/kind at a glance.
+                    .foregroundStyle(systemImage == nil ? tint : .primary)
                     .lineLimit(1)
 
                 Spacer()
@@ -408,7 +936,10 @@ private struct RoleGrid: View {
 
 private struct UnifiedConversationListView: View {
     @Bindable var viewModel: LibraryViewModel
-    let onToggleBookmark: (ConversationSummary) -> Void
+    /// Top content inset — reserves vertical room above the first row so it
+    /// isn't permanently hidden under the floating header bar overlay.
+    /// Passed in from the parent which measures the bar's height at runtime.
+    var topContentInset: CGFloat = WorkspaceLayoutMetrics.headerBarContentRowHeight
     let onTapTag: (TagEntry) -> Void
 
     var body: some View {
@@ -431,29 +962,63 @@ private struct UnifiedConversationListView: View {
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                List(viewModel.conversations, selection: $viewModel.selectedConversationId) { conversation in
+                // Multi-select: using `selectedConversationIDs` (Set) drives
+                // the native Cmd/Shift-click multi-select for the card list.
+                // The detail pane / keyboard nav still peek at the scalar
+                // `selectedConversationId` (which returns `.first`), which
+                // is good enough when the user is picking one card; when
+                // they've selected many, none of the scalar consumers fire
+                // anything noisy — the primary purpose of multi-select is
+                // dragging a batch to a sidebar tag (see SidebarTagRow's
+                // drop destination, which now loops over payloads).
+                // Wrap in ScrollViewReader so external requests (the
+                // right-pane header's conversation-title button) can
+                // scroll the list back to the currently-open card. The
+                // proxy drives `proxy.scrollTo(id, anchor: .top)` keyed
+                // on the `.tag(conversation.id)` assigned per row.
+                ScrollViewReader { proxy in
+                List(viewModel.conversations, selection: $viewModel.selectedConversationIDs) { conversation in
                     ConversationRowView(
                         conversation: conversation,
                         tags: viewModel.conversationTags[conversation.id] ?? [],
-                        onToggleBookmark: { onToggleBookmark(conversation) },
-                        onTapTag: onTapTag
+                        onTapTag: onTapTag,
+                        onAttachTag: { tagName in
+                            Task {
+                                await viewModel.attachTag(
+                                    named: tagName,
+                                    toConversation: conversation.id
+                                )
+                            }
+                        }
                     )
                     .tag(conversation.id)
-                    .dropDestination(for: TagDragPayload.self) { payloads, _ in
-                        guard let first = payloads.first else { return false }
-                        Task {
-                            await viewModel.attachTag(
-                                named: first.name,
-                                toConversation: conversation.id
-                            )
-                        }
-                        return true
-                    }
+                    .id(conversation.id)
                     .onAppear {
                         Task {
                             await viewModel.loadMoreIfNeeded(currentItem: conversation)
                         }
                     }
+                }
+                // Hide the List's built-in opaque backdrop so the top header
+                // bar's vibrancy material has something to blur against
+                // (whatever shows through from the pane/window behind it).
+                .scrollContentBackground(.hidden)
+                // `.contentMargins(.top, X, for: .scrollContent)` is the
+                // "correct" API for this on ScrollView, but macOS List
+                // reliably IGNORES it and places its first row at the
+                // pane's top edge — exactly behind the overlay header bar,
+                // which is how the user sees cards disappearing under the
+                // bar. `.safeAreaInset(edge: .top)` reserves space through
+                // a path List *does* honor: it shrinks the scroll region
+                // from above and draws the inset content (an invisible
+                // Color.clear) in that reserved band. The header-bar
+                // overlay sits in front of that band, so the List's first
+                // row is flush with the bar's bottom edge and never
+                // occluded.
+                .safeAreaInset(edge: .top, spacing: 0) {
+                    Color.clear
+                        .frame(height: topContentInset)
+                        .allowsHitTesting(false)
                 }
                 .overlay(alignment: .bottom) {
                     if viewModel.isLoadingMore {
@@ -461,6 +1026,20 @@ private struct UnifiedConversationListView: View {
                             .padding()
                     }
                 }
+                // External scroll requests (e.g. tapping the reader
+                // header's title pill). Clears the request after
+                // applying so setting the same id twice still fires
+                // both times.
+                .onChange(of: viewModel.pendingListScrollConversationID) { _, newValue in
+                    guard let id = newValue else { return }
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        proxy.scrollTo(id, anchor: .top)
+                    }
+                    Task { @MainActor in
+                        viewModel.pendingListScrollConversationID = nil
+                    }
+                }
+                } // ScrollViewReader
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -533,4 +1112,473 @@ private struct SearchSavedFiltersSection: View {
         filters.summaryText
     }
 }
+
+/// Hides (and restores) the NavigationSplitView's built-in sidebar-
+/// toggle button in the window titlebar while `isActive` is true.
+///
+/// We reach down to AppKit because SwiftUI's `.toolbar(removing:
+/// .sidebarToggle)` doesn't visibly remove the item on the current SDK —
+/// the button stays drawn in the titlebar even when the modifier is
+/// applied. The root cause appears to be that `NavigationSplitView`
+/// synthesises the toggle as an `NSToolbarItem` outside the SwiftUI
+/// toolbar graph that `.toolbar(removing:)` operates on, so the removal
+/// modifier has nothing to target.
+///
+/// The workaround: walk the hosting `NSWindow`'s toolbar items and
+/// hide/show the one whose identifier is `.toggleSidebar` each time
+/// `isActive` flips. Done as an invisible `NSViewRepresentable` in a
+/// background so we can reach the window the SwiftUI view is hosted in
+/// (only available after layout), without disturbing hit-testing.
+///
+/// Why it matters for Viewer Mode: the mode pins `columnVisibility` to
+/// `.doubleColumn` and the user has no legitimate need to re-expand the
+/// sidebar mid-session. Letting the toggle sit in the titlebar only
+/// invites accidental mode-break clicks. When the user exits Viewer
+/// Mode, `isActive` flips false and the toggle is unhidden.
+private struct ConditionalSidebarToggleRemoval: ViewModifier {
+    let isActive: Bool
+
+    func body(content: Content) -> some View {
+        content.background(SidebarToggleHider(isHidden: isActive))
+    }
+}
+
+private struct SidebarToggleHider: NSViewRepresentable {
+    let isHidden: Bool
+
+    final class Coordinator {
+        /// Remembered insertion index of the sidebar-toggle item at the
+        /// moment we FIRST removed it, so we can put it back at the
+        /// same position when `isHidden` flips false. Stored per-
+        /// instance because toolbar layouts vary (e.g. future titlebar
+        /// additions) and we don't want to assume index 0.
+        var removedIndex: Int?
+        /// Identifier of the item we removed — re-insertion takes an
+        /// identifier, not the item object. Cached instead of hard-
+        /// coding `.toggleSidebar` so the "some macOS builds use a
+        /// different id" fallback path still round-trips correctly.
+        var removedIdentifier: NSToolbarItem.Identifier?
+        /// Are we currently in the hidden state? Kept as a mirror of
+        /// the latest `isHidden` prop so the KVO observer below can
+        /// decide whether to re-remove the item when SwiftUI re-adds
+        /// it without needing to round-trip through the View struct.
+        var wantsHidden: Bool = false
+        /// KVO observation on `NSToolbar.items`. SwiftUI re-synthesises
+        /// the sidebar toggle on its own whenever the split view
+        /// rebuilds its toolbar (which happens on unrelated state
+        /// changes), and `updateNSView` doesn't always fire afterwards
+        /// — so the toggle would creep back in even though our view
+        /// thinks it's hidden. The KVO fires every time the item array
+        /// actually changes, letting us re-remove the toggle the
+        /// moment it reappears.
+        var itemsObservation: NSKeyValueObservation?
+        /// The toolbar instance the `itemsObservation` above is
+        /// currently attached to. Kept as a weak reference because the
+        /// toolbar is owned by AppKit. We compare against
+        /// `nsView.window?.toolbar` on each access — if SwiftUI has
+        /// replaced the toolbar (which CAN happen during key-window
+        /// transitions or split-view rebuilds), the old KVO is
+        /// silently dead and has to be re-attached to the fresh
+        /// instance. Without this check the sidebar-toggle glyph
+        /// creeps back into the titlebar during Viewer Mode — exactly
+        /// the "戻れなくなった" lockout bug.
+        weak var observedToolbar: NSToolbar?
+        /// Window the notification observer below is scoped to.
+        weak var observedWindow: NSWindow?
+        /// `NSWindow.didBecomeKeyNotification` subscription token.
+        /// Re-fires a hide pass whenever the window gains key focus,
+        /// which is the most reliable macOS signal that AppKit has
+        /// just rebuilt the toolbar (common on focus-stealing modal
+        /// transitions, ⌘-Tab round-trips, and the Dock-click pattern
+        /// that put the user in this reproducer).
+        var windowKeyObserver: NSObjectProtocol?
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeNSView(context: Context) -> NSView {
+        // Zero-size, non-interactive — just a carrier for `updateNSView`
+        // callbacks so we can reach `nsView.window` once the host is
+        // mounted. The view itself never draws.
+        NSView(frame: .zero)
+    }
+
+    static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
+        // Tear down KVO + notification observers when the view leaves
+        // the hierarchy so we don't leak either onto a now-orphaned
+        // toolbar/window.
+        coordinator.itemsObservation?.invalidate()
+        coordinator.itemsObservation = nil
+        coordinator.observedToolbar = nil
+        if let observer = coordinator.windowKeyObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        coordinator.windowKeyObserver = nil
+        coordinator.observedWindow = nil
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        let targetHidden = isHidden
+        let coordinator = context.coordinator
+        coordinator.wantsHidden = targetHidden
+        // Defer to next runloop turn: `nsView.window` is often still nil
+        // on the very first update after the host mounts, and we also
+        // don't want to mutate the toolbar inside a SwiftUI layout pass.
+        DispatchQueue.main.async {
+            Self.ensureObservers(coordinator: coordinator, nsView: nsView)
+            Self.applyHiddenState(
+                targetHidden: targetHidden,
+                coordinator: coordinator,
+                nsView: nsView
+            )
+        }
+    }
+
+    /// Install (or re-install) the two observers the coordinator needs
+    /// to keep the sidebar-toggle item gone:
+    ///
+    /// 1. KVO on the CURRENT `NSToolbar.items` — fires when items
+    ///    array mutates (AppKit inserts toggle on rebuild).
+    /// 2. Notification on the CURRENT `NSWindow` for
+    ///    `didBecomeKeyNotification` — fires when the window is
+    ///    re-focused, which is the only reliable signal we have for
+    ///    "AppKit just rebuilt the titlebar and may have brought the
+    ///    toggle back with it".
+    ///
+    /// Both observers are torn down + re-attached if the toolbar or
+    /// window identity changes since last check. Without the identity
+    /// check, KVO can silently watch a dead toolbar instance and the
+    /// new one goes unobserved — which is the original lockout bug.
+    private static func ensureObservers(
+        coordinator: Coordinator,
+        nsView: NSView
+    ) {
+        guard let window = nsView.window else { return }
+
+        // Re-scope the window-became-key observer if the hosting
+        // window changed (e.g. the app was restored into a new scene).
+        if coordinator.observedWindow !== window {
+            if let old = coordinator.windowKeyObserver {
+                NotificationCenter.default.removeObserver(old)
+            }
+            coordinator.observedWindow = window
+            coordinator.windowKeyObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didBecomeKeyNotification,
+                object: window,
+                queue: .main
+            ) { [weak coordinator, weak window] _ in
+                guard let coordinator, coordinator.wantsHidden,
+                      let toolbar = window?.toolbar else { return }
+                // The window-key transition is the most common path
+                // that brings the toggle back. Re-verify observers in
+                // case the toolbar instance flipped under us too, and
+                // then force-remove.
+                rebindItemsObservationIfNeeded(
+                    coordinator: coordinator,
+                    toolbar: toolbar
+                )
+                removeSidebarToggleIfPresent(from: toolbar, coordinator: coordinator)
+            }
+        }
+
+        if let toolbar = window.toolbar {
+            rebindItemsObservationIfNeeded(
+                coordinator: coordinator,
+                toolbar: toolbar
+            )
+        }
+    }
+
+    /// Rebind the `items` KVO to the supplied toolbar if it isn't
+    /// already attached to THAT specific instance. No-op when already
+    /// bound. The identity check is critical — a stale observation on
+    /// a replaced toolbar never fires, and the new toolbar goes
+    /// unwatched forever.
+    private static func rebindItemsObservationIfNeeded(
+        coordinator: Coordinator,
+        toolbar: NSToolbar
+    ) {
+        if coordinator.observedToolbar === toolbar,
+           coordinator.itemsObservation != nil {
+            return
+        }
+        coordinator.itemsObservation?.invalidate()
+        coordinator.observedToolbar = toolbar
+        coordinator.itemsObservation = toolbar.observe(\.items, options: [.new]) { [weak coordinator] observedToolbar, _ in
+            guard let coordinator, coordinator.wantsHidden else { return }
+            removeSidebarToggleIfPresent(
+                from: observedToolbar,
+                coordinator: coordinator
+            )
+        }
+    }
+
+    private static func applyHiddenState(
+        targetHidden: Bool,
+        coordinator: Coordinator,
+        nsView: NSView
+    ) {
+        guard let toolbar = nsView.window?.toolbar else { return }
+        if targetHidden {
+            removeSidebarToggleIfPresent(
+                from: toolbar,
+                coordinator: coordinator
+            )
+        } else {
+            restoreSidebarToggleIfNeeded(
+                to: toolbar,
+                coordinator: coordinator
+            )
+        }
+    }
+
+    /// Locate the sidebar-toggle item and remove it. Idempotent: if the
+    /// item is already gone this is a no-op, which is exactly the
+    /// behavior we want when SwiftUI momentarily re-adds and then
+    /// re-removes the item itself (the KVO callback fires twice but
+    /// only the first finds something to remove).
+    private static func removeSidebarToggleIfPresent(
+        from toolbar: NSToolbar,
+        coordinator: Coordinator
+    ) {
+        let index = toolbar.items.firstIndex { item in
+            let id = item.itemIdentifier
+            return id == .toggleSidebar
+                || id.rawValue.lowercased().contains("togglesidebar")
+        }
+        guard let index else { return }
+        // Cache the original position + identifier only on the very
+        // first removal, so re-removals (from the KVO path) don't
+        // clobber what we'll need at restore time.
+        if coordinator.removedIdentifier == nil {
+            coordinator.removedIndex = index
+            coordinator.removedIdentifier = toolbar.items[index].itemIdentifier
+        }
+        toolbar.removeItem(at: index)
+    }
+
+    /// Put the toggle back at its original index when Viewer Mode exits.
+    /// Guards against the "already present" case — SwiftUI sometimes
+    /// re-synthesises the toggle on its own during the exit transition,
+    /// and inserting a duplicate throws NSInternalInconsistencyException
+    /// ("Duplicate items of this type are not allowed") which crashes
+    /// the app.
+    private static func restoreSidebarToggleIfNeeded(
+        to toolbar: NSToolbar,
+        coordinator: Coordinator
+    ) {
+        guard let identifier = coordinator.removedIdentifier else { return }
+        defer {
+            coordinator.removedIdentifier = nil
+            coordinator.removedIndex = nil
+        }
+        let alreadyPresent = toolbar.items.contains { $0.itemIdentifier == identifier }
+        guard !alreadyPresent else { return }
+        let index = min(coordinator.removedIndex ?? 0, toolbar.items.count)
+        toolbar.insertItem(withItemIdentifier: identifier, at: index)
+    }
+}
+
+/// Window-spanning toolbar that appears only while Viewer Mode is active.
+///
+/// Previously the Viewer-Mode controls (book toggle, title chip,
+/// prev/next, export) lived inside the right pane's `ReaderWorkspaceHeaderBar`,
+/// which made them clump together at the right pane's leading edge and
+/// left a lot of unused space in the middle pane's top strip. The user
+/// asked for one balanced toolbar across the whole window top, so the
+/// controls now render here as an overlay on top of the NavigationSplit-
+/// View (see `MacOSRootView.workspaceSplitView`). The leading 80pt
+/// clear-space matches the `LibraryListHeaderBar` traffic-light dodge
+/// so the book toggle lands right after the macOS traffic-light cluster.
+///
+/// The right pane's own header bar is suppressed while Viewer Mode is
+/// active (`ReaderWorkspaceView.body` guards its overlay on
+/// `!isViewerModeActive`), so there's no double bar.
+private struct ViewerModeTopToolbar: View {
+    @Bindable var tabManager: ReaderTabManager
+    @Binding var isViewerModeActive: Bool
+
+    var body: some View {
+        HStack(spacing: WorkspaceLayoutMetrics.headerChipHorizontalPadding) {
+            // Traffic-light clearance. 140pt matches the
+            // `LibraryListHeaderBar` traffic-light + sidebar-toggle
+            // dodge: in theory we removed the sidebar-toggle item
+            // (see `SidebarToggleHider`) and only needed 80pt, but
+            // the removal has been observed to fail when AppKit
+            // replaces the toolbar instance from under us — the
+            // stray toggle glyph ends up right on top of this
+            // button. At 140pt, even if the glyph sneaks back in,
+            // the book (exit) button stays clickable. Harmless
+            // cosmetic cost when the removal works as intended; a
+            // hard-stuck Viewer Mode otherwise.
+            Color.clear.frame(width: 140, height: 1)
+
+            ViewerModeToggleButton(
+                isActive: $isViewerModeActive,
+                isEnabled: tabManager.activeDetail != nil
+            )
+
+            if let summary = tabManager.activeDetail?.summary {
+                ViewerModeTitleChip(summary: summary) {
+                    // Same behavior as the non-viewer-mode title pill in
+                    // `ReaderHeaderTitlePill`: scroll the reader body
+                    // back to the conversation header. The
+                    // `ViewerModePane` middle pane also observes this
+                    // token and resets its prompt-directory scroll so
+                    // both panes snap to top together.
+                    tabManager.scrollToTopToken = UUID()
+                }
+                // Absorb leftover horizontal room so long titles
+                // breathe instead of truncating immediately.
+                .layoutPriority(1)
+            }
+
+            Spacer(minLength: 0)
+
+            WorkspaceFloatingExportButton(detail: tabManager.activeDetail)
+        }
+        .padding(.horizontal, WorkspaceLayoutMetrics.headerBarHorizontalPadding)
+        .frame(height: WorkspaceLayoutMetrics.headerBarContentRowHeight)
+        .frame(maxWidth: .infinity)
+    }
+}
+
+/// Glass-capsule chip showing the current conversation's title + ISO
+/// date. Used in the root-level Viewer-Mode toolbar. Matches the shape
+/// and material of the sort / outline pills so the top strip reads as
+/// one family of chips.
+private struct ViewerModeTitleChip: View {
+    let summary: ConversationSummary
+    /// Fired when the user clicks the chip. Mirrors the non-Viewer-Mode
+    /// `ReaderHeaderTitlePill`: the parent rotates
+    /// `ReaderTabManager.scrollToTopToken` so the right-pane body AND
+    /// the middle-pane prompt directory both snap back to their top.
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: "arrow.up.to.line")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+
+                Text(summary.displayTitle)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+
+                if let time = summary.primaryTime {
+                    Text(String(time.prefix(10)))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.horizontal, WorkspaceLayoutMetrics.headerChipHorizontalPadding)
+            .frame(height: WorkspaceLayoutMetrics.headerChipHeight)
+            .contentShape(Capsule(style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .background(
+            Capsule(style: .continuous)
+                .fill(.thinMaterial)
+        )
+        .overlay(
+            Capsule(style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+        )
+        .help("Jump to top")
+    }
+}
+
+// MARK: - Import toast
+
+/// One-shot banner model for the JSON DnD import flow.
+///
+/// `id` is a fresh `UUID` per instance so replacing an earlier toast with
+/// a later one (even of the same kind/message) still retriggers the
+/// `.transition` animation — without it, `.animation(value:)` on the
+/// parent doesn't see a change and the re-run would pop in without a
+/// fade. The auto-dismiss scheduler also uses `id` to verify it's
+/// dismissing the toast it originally targeted (vs. a newer one the
+/// user triggered before the timer fired).
+struct ImportToast: Identifiable, Equatable {
+    enum Kind: Equatable {
+        case progress
+        case success
+        case failure(detail: String?)
+    }
+
+    let id: UUID = UUID()
+    let kind: Kind
+    let message: String
+
+    static func progress(message: String) -> ImportToast {
+        ImportToast(kind: .progress, message: message)
+    }
+
+    static func success(message: String) -> ImportToast {
+        ImportToast(kind: .success, message: message)
+    }
+
+    static func failure(message: String, detail: String?) -> ImportToast {
+        ImportToast(kind: .failure(detail: detail), message: message)
+    }
+}
+
+private struct ImportToastView: View {
+    let toast: ImportToast
+
+    var body: some View {
+        HStack(spacing: 10) {
+            leadingGlyph
+            VStack(alignment: .leading, spacing: 2) {
+                Text(toast.message)
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(.primary)
+                if case .failure(let detail) = toast.kind, let detail, !detail.isEmpty {
+                    // Show the last line or two of Python stderr so the
+                    // user has a pointer to the cause. Clipped to a
+                    // single line + truncated — full output remains in
+                    // Console.app.
+                    Text(detail)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(.regularMaterial)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+        )
+        .shadow(color: .black.opacity(0.18), radius: 10, y: 4)
+        .allowsHitTesting(false)
+    }
+
+    @ViewBuilder
+    private var leadingGlyph: some View {
+        switch toast.kind {
+        case .progress:
+            // ProgressView renders as a tiny indeterminate spinner — the
+            // ideal "working on it" cue for a short-lived shell-out.
+            ProgressView()
+                .controlSize(.small)
+        case .success:
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+        case .failure:
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+        }
+    }
+}
+
 #endif

@@ -15,6 +15,7 @@ final class GRDBSearchRepository: SearchRepository, @unchecked Sendable {
                 || query.filter.bookmarkedOnly
                 || !query.filter.sources.isEmpty
                 || !query.filter.models.isEmpty
+                || !query.filter.sourceFiles.isEmpty
                 || query.filter.dateFrom != nil
                 || query.filter.dateTo != nil
                 || !query.filter.roles.isEmpty
@@ -75,6 +76,7 @@ final class GRDBSearchRepository: SearchRepository, @unchecked Sendable {
                 || query.filter.bookmarkedOnly
                 || !query.filter.sources.isEmpty
                 || !query.filter.models.isEmpty
+                || !query.filter.sourceFiles.isEmpty
                 || query.filter.dateFrom != nil
                 || query.filter.dateTo != nil
                 || !query.filter.roles.isEmpty
@@ -143,6 +145,10 @@ final class GRDBSearchRepository: SearchRepository, @unchecked Sendable {
         var filters: [String] = []
         var arguments = StatementArguments()
 
+        // Markdown import 会話は render 未対応として全面除外。
+        // `GRDBConversationRepository.makeConversationWhereClause` と揃える。
+        filters.append("COALESCE(c.source, '') != 'markdown'")
+
         if !query.normalizedText.isEmpty {
             filters.append("search_idx MATCH ?")
             arguments += [makeMatchQuery(from: query.normalizedText)]
@@ -163,6 +169,15 @@ final class GRDBSearchRepository: SearchRepository, @unchecked Sendable {
             filters.append("c.model IN (\(placeholders))")
             for model in sortedModels {
                 arguments += [model]
+            }
+        }
+
+        if !query.filter.sourceFiles.isEmpty {
+            let sortedFiles = Array(query.filter.sourceFiles).sorted()
+            let placeholders = Array(repeating: "?", count: sortedFiles.count).joined(separator: ", ")
+            filters.append("c.source_file IN (\(placeholders))")
+            for file in sortedFiles {
+                arguments += [file]
             }
         }
 
@@ -198,11 +213,8 @@ final class GRDBSearchRepository: SearchRepository, @unchecked Sendable {
                     JOIN bookmark_tag_links tl ON tl.bookmark_id = b.id
                     JOIN bookmark_tags t ON t.id = tl.tag_id
                     WHERE t.name COLLATE NOCASE IN (\(tagPlaceholders))
-                      AND (
-                          (b.target_type = 'thread' AND b.target_id = c.id)
-                          OR (b.target_type = 'prompt'
-                              AND substr(b.target_id, 1, instr(b.target_id, ':') - 1) = c.id)
-                      )
+                      AND b.target_type = 'thread'
+                      AND b.target_id = c.id
                 )
                 """)
             for tag in query.filter.bookmarkTags {

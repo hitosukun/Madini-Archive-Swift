@@ -31,8 +31,22 @@ struct SidebarSearchBar: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
-        .background(Color.secondary.opacity(0.08))
-        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        // Glass-chip treatment that matches the toolbar chip family
+        // (`HeaderChipBackground` in `WorkspaceLayoutMetrics.swift`).
+        // Previously we painted a flat 8% secondary tint, which read as
+        // a plain filled box — fine in isolation but out of step with
+        // the other panes' glass-capsule controls. `.thinMaterial` +
+        // a near-invisible stroke unifies the chip family so the
+        // sidebar search and the middle-pane sort pill look like the
+        // same kind of control.
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(.thinMaterial)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+        )
     }
 
     /// Extract `#tag` tokens from the raw text and sync them with the

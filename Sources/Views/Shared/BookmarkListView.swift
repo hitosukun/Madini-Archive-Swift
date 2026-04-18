@@ -48,15 +48,16 @@ private struct BookmarkListRowView: View {
             HStack(spacing: 8) {
                 BookmarkStatusIcon(isBookmarked: true)
 
-                if let source = entry.source {
-                    SourceBadge(source: source)
-                }
-
+                // Model preferred, source fallback — model text is painted
+                // in the service's brand color so a separate source label
+                // becomes redundant (see `ConversationRowView`).
                 if let model = entry.model, !model.isEmpty {
                     Text(model)
                         .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(SourceAppearance.color(forModel: model))
                         .lineLimit(1)
+                } else if let source = entry.source {
+                    SourceText(source: source)
                 }
 
                 Spacer()

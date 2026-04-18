@@ -11,7 +11,20 @@ final class GRDBConversationRepository: ConversationRepository, @unchecked Senda
     func fetchIndex(query: ConversationListQuery) async throws -> [ConversationSummary] {
         try await GRDBAsync.read(from: dbQueue) { db in
             let (whereSQL, arguments) = Self.makeConversationWhereClause(filter: query.filter)
-            let direction = query.sortBy == .dateDesc ? "DESC" : "ASC"
+            // Secondary sort is always `c.id` so the result ordering is
+            // deterministic when the primary sort ties (e.g. two threads
+            // with the same prompt count).
+            let orderBy: String
+            switch query.sortBy {
+            case .dateDesc:
+                orderBy = "primary_time DESC, c.id"
+            case .dateAsc:
+                orderBy = "primary_time ASC, c.id"
+            case .promptCountDesc:
+                orderBy = "c.prompt_count DESC, primary_time DESC, c.id"
+            case .promptCountAsc:
+                orderBy = "c.prompt_count ASC, primary_time DESC, c.id"
+            }
 
             let rows = try Row.fetchAll(
                 db,
@@ -28,7 +41,7 @@ final class GRDBConversationRepository: ConversationRepository, @unchecked Senda
                         \(Self.bookmarkStatusSQL) AS is_bookmarked
                     FROM conversations c
                     \(whereSQL)
-                    ORDER BY primary_time \(direction), c.id
+                    ORDER BY \(orderBy)
                     LIMIT ? OFFSET ?
                 """,
                 arguments: arguments + [query.limit, query.offset]
@@ -187,6 +200,67 @@ final class GRDBConversationRepository: ConversationRepository, @unchecked Senda
         }
     }
 
+    func fetchSourceFileFacets(filter: ArchiveSearchFilter?) async throws -> [FilterOption] {
+        try await GRDBAsync.read(from: dbQueue) { db in
+            let (whereSQL, arguments) = Self.makeConversationWhereClause(
+                filter: filter ?? ArchiveSearchFilter(),
+                excludingSourceFiles: true
+            )
+            let rows = try Row.fetchAll(
+                db,
+                sql: """
+                    SELECT c.source_file AS source_file, COUNT(*) AS count
+                    FROM conversations c
+                    \(whereSQL.isEmpty ? "WHERE c.source_file IS NOT NULL AND TRIM(c.source_file) <> ''" : "\(whereSQL) AND c.source_file IS NOT NULL AND TRIM(c.source_file) <> ''")
+                    GROUP BY c.source_file
+                    ORDER BY count DESC, c.source_file ASC
+                """,
+                arguments: arguments
+            )
+
+            return rows.compactMap { row in
+                guard let value: String = row["source_file"] else { return nil }
+                return FilterOption(value: value, count: row["count"] ?? 0)
+            }
+        }
+    }
+
+    func fetchSourceModelFacets(filter: ArchiveSearchFilter?) async throws -> [SourceModelFacet] {
+        try await GRDBAsync.read(from: dbQueue) { db in
+            let (whereSQL, arguments) = Self.makeConversationWhereClause(
+                filter: filter ?? ArchiveSearchFilter(),
+                excludingSources: true,
+                excludingModels: true
+            )
+            let rows = try Row.fetchAll(
+                db,
+                sql: """
+                    SELECT c.source AS source, c.model AS model, COUNT(*) AS count
+                    FROM conversations c
+                    \(whereSQL.isEmpty ? "WHERE c.source IS NOT NULL AND TRIM(c.source) <> ''" : "\(whereSQL) AND c.source IS NOT NULL AND TRIM(c.source) <> ''")
+                    GROUP BY c.source, c.model
+                    ORDER BY c.source ASC, count DESC, c.model ASC
+                """,
+                arguments: arguments
+            )
+
+            return rows.compactMap { row in
+                guard let source: String = row["source"] else { return nil }
+                let rawModel: String? = row["model"]
+                let normalizedModel: String? = {
+                    guard let value = rawModel?.trimmingCharacters(in: .whitespacesAndNewlines),
+                          !value.isEmpty else { return nil }
+                    return value
+                }()
+                return SourceModelFacet(
+                    source: source,
+                    model: normalizedModel,
+                    count: row["count"] ?? 0
+                )
+            }
+        }
+    }
+
     private static let primaryTimeSQL = """
     COALESCE(
         NULLIF(TRIM(c.source_created_at), ''),
@@ -229,10 +303,15 @@ final class GRDBConversationRepository: ConversationRepository, @unchecked Senda
     private static func makeConversationWhereClause(
         filter: ArchiveSearchFilter,
         excludingSources: Bool = false,
-        excludingModels: Bool = false
+        excludingModels: Bool = false,
+        excludingSourceFiles: Bool = false
     ) -> (String, StatementArguments) {
         var filters: [String] = []
         var arguments = StatementArguments()
+
+        // Markdown import 会話は当面 render しない方針のため、DB アクセスの
+        // 段階で常時除外する。サイドバー facet / 検索 / 一覧すべてに効く。
+        filters.append("COALESCE(c.source, '') != 'markdown'")
 
         if !excludingSources, !filter.sources.isEmpty {
             let sortedSources = Array(filter.sources).sorted()
@@ -249,6 +328,15 @@ final class GRDBConversationRepository: ConversationRepository, @unchecked Senda
             filters.append("c.model IN (\(placeholders))")
             for model in sortedModels {
                 arguments += [model]
+            }
+        }
+
+        if !excludingSourceFiles, !filter.sourceFiles.isEmpty {
+            let sortedFiles = Array(filter.sourceFiles).sorted()
+            let placeholders = Array(repeating: "?", count: sortedFiles.count).joined(separator: ", ")
+            filters.append("c.source_file IN (\(placeholders))")
+            for file in sortedFiles {
+                arguments += [file]
             }
         }
 
@@ -284,11 +372,8 @@ final class GRDBConversationRepository: ConversationRepository, @unchecked Senda
                     JOIN bookmark_tag_links tl ON tl.bookmark_id = b.id
                     JOIN bookmark_tags t ON t.id = tl.tag_id
                     WHERE t.name COLLATE NOCASE IN (\(tagPlaceholders))
-                      AND (
-                          (b.target_type = 'thread' AND b.target_id = c.id)
-                          OR (b.target_type = 'prompt'
-                              AND substr(b.target_id, 1, instr(b.target_id, ':') - 1) = c.id)
-                      )
+                      AND b.target_type = 'thread'
+                      AND b.target_id = c.id
                 )
                 """)
             for tag in filter.bookmarkTags {

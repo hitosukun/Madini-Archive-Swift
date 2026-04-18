@@ -15,12 +15,11 @@ struct SidebarTagsSection: View {
     @State private var tagPendingDeletion: TagEntry?
 
     var body: some View {
+        // No internal "TAGS" header — the parent sidebar wraps this view
+        // in its shared `section(title:)` helper so Tags can collapse
+        // alongside Library and Sources. Drawing our own header here
+        // too would produce a duplicate title stack.
         VStack(alignment: .leading, spacing: 8) {
-            Text("Tags")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .textCase(.uppercase)
-
             if let viewModel {
                 createTagField(viewModel: viewModel)
                 tagList(viewModel: viewModel)
@@ -88,7 +87,7 @@ struct SidebarTagsSection: View {
                 .foregroundStyle(.tertiary)
         } else {
             VStack(alignment: .leading, spacing: 2) {
-                ForEach(viewModel.tags) { tag in
+                ForEach(Self.orderedTags(viewModel.tags)) { tag in
                     SidebarTagRow(
                         tag: tag,
                         isFilterActive: viewModel.isTagFilterActive(tag),
@@ -97,11 +96,47 @@ struct SidebarTagsSection: View {
                         onToggleFilter: { viewModel.toggleTagFilter(tag) },
                         onToggleAttach: { viewModel.toggleAttachmentToSelection(tag) },
                         onRename: { newName in viewModel.renameTag(tag, to: newName) },
-                        onRequestDelete: { tagPendingDeletion = tag }
+                        onRequestDelete: { tagPendingDeletion = tag },
+                        onAttachDroppedConversations: { conversationIDs in
+                            // Multi-select drag: the user may drop several
+                            // selected cards at once. We attach sequentially
+                            // (each attach is its own transaction) and
+                            // refresh once at the end so tag counts / chip
+                            // strips update in one pass instead of N.
+                            Task {
+                                for conversationID in conversationIDs {
+                                    await libraryViewModel.attachTag(
+                                        named: tag.name,
+                                        toConversation: conversationID
+                                    )
+                                }
+                                await viewModel.refreshCurrentConversationTags()
+                                await viewModel.refreshTags()
+                            }
+                        }
                     )
                 }
             }
         }
+    }
+
+    /// Force the Trash system tag to always sit at the very top of the
+    /// list so it reads as the rescue lane regardless of alphabetical
+    /// ordering. Other system tags (if any are ever added) come next,
+    /// then user tags sorted by name (mirrors `listTags()` ORDER BY).
+    private static func orderedTags(_ tags: [TagEntry]) -> [TagEntry] {
+        tags.sorted { lhs, rhs in
+            let lhsRank = rank(lhs)
+            let rhsRank = rank(rhs)
+            if lhsRank != rhsRank { return lhsRank < rhsRank }
+            return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+        }
+    }
+
+    private static func rank(_ tag: TagEntry) -> Int {
+        if tag.systemKey == "trash" { return 0 }
+        if tag.isSystem { return 1 }
+        return 2
     }
 }
 
@@ -114,17 +149,21 @@ private struct SidebarTagRow: View {
     let onToggleAttach: () -> Void
     let onRename: (String) -> Void
     let onRequestDelete: () -> Void
+    let onAttachDroppedConversations: ([String]) -> Void
 
     @State private var isHovering = false
     @State private var isEditing = false
+    @State private var isDropTargeted = false
     @State private var draftName: String = ""
+
+    private var isTrash: Bool { tag.systemKey == "trash" }
 
     var body: some View {
         HStack(spacing: 8) {
             Button(action: onToggleFilter) {
                 HStack(spacing: 8) {
-                    Image(systemName: isFilterActive ? "line.3.horizontal.decrease.circle.fill" : "number")
-                        .foregroundStyle(isFilterActive ? Color.accentColor : .secondary)
+                    Image(systemName: leadingIconName)
+                        .foregroundStyle(leadingIconColor)
 
                     if isEditing {
                         TextField("Tag name", text: $draftName, onCommit: commitRename)
@@ -133,7 +172,10 @@ private struct SidebarTagRow: View {
                         Text(tag.name)
                             .foregroundStyle(.primary)
                             .lineLimit(1)
-                            .onTapGesture(count: 2) { beginEditing() }
+                            .onTapGesture(count: 2) {
+                                // Trash is locked; don't let the user rename it via double-tap.
+                                if !tag.isSystem { beginEditing() }
+                            }
                     }
 
                     Text("\(tag.usageCount)")
@@ -160,7 +202,7 @@ private struct SidebarTagRow: View {
             // Always render the ellipsis menu so hovering does not shift
             // the row's layout (was causing the +/✓ button to move,
             // making it hard to click). Opacity-gated to stay invisible
-            // until hover / for system tags.
+            // until hover / for system tags (Trash is system).
             Menu {
                 Button("Rename") { beginEditing() }
                 Button("Delete", role: .destructive, action: onRequestDelete)
@@ -180,17 +222,62 @@ private struct SidebarTagRow: View {
         .padding(.vertical, 4)
         .background(
             RoundedRectangle(cornerRadius: 5, style: .continuous)
-                .fill(isFilterActive ? Color.accentColor.opacity(0.12) : (isHovering ? Color.secondary.opacity(0.08) : Color.clear))
+                .fill(rowBackground)
+        )
+        .overlay(
+            // Accent border when a conversation card is being dragged over
+            // this row — gives the user a clear signal that the drop will
+            // land here. Width and opacity tuned to be visible against both
+            // the default sidebar tint and selection highlights.
+            RoundedRectangle(cornerRadius: 5, style: .continuous)
+                .strokeBorder(
+                    Color.accentColor.opacity(isDropTargeted ? 0.9 : 0),
+                    lineWidth: 2
+                )
         )
         .onHover { isHovering = $0 }
         .draggable(TagDragPayload(name: tag.name)) {
+            // Neutral drag preview — matches the monochrome treatment of
+            // tag chips elsewhere (card row, saved-filter list). The `#`
+            // prefix + capsule shape already signal "tag" without needing
+            // a colored fill.
             Text("#\(tag.name)")
                 .font(.caption.weight(.semibold))
                 .padding(.horizontal, 8)
                 .padding(.vertical, 4)
-                .background(Capsule().fill(Color.teal.opacity(0.9)))
-                .foregroundStyle(.white)
+                .background(Capsule().fill(.thinMaterial))
+                .overlay(
+                    Capsule().strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5)
+                )
+                .foregroundStyle(.primary)
         }
+        // Accept dragged conversation card(s) → attach this tag to each.
+        // When the drag originated from a multi-selected List row, SwiftUI
+        // delivers one payload per selected item, so we forward the full
+        // array to the handler rather than just the first element.
+        .dropDestination(for: ConversationDragPayload.self) { payloads, _ in
+            guard !payloads.isEmpty else { return false }
+            onAttachDroppedConversations(payloads.map { $0.id })
+            return true
+        } isTargeted: { isDropTargeted = $0 }
+    }
+
+    /// Leading glyph differentiates Trash (rescue lane) from regular
+    /// `#tag` rows. Color tracks filter-active state on both.
+    private var leadingIconName: String {
+        if isTrash { return "trash" }
+        return isFilterActive ? "line.3.horizontal.decrease.circle.fill" : "number"
+    }
+
+    private var leadingIconColor: Color {
+        isFilterActive ? Color.accentColor : .secondary
+    }
+
+    private var rowBackground: Color {
+        if isDropTargeted { return Color.accentColor.opacity(0.22) }
+        if isFilterActive { return Color.accentColor.opacity(0.12) }
+        if isHovering { return Color.secondary.opacity(0.08) }
+        return .clear
     }
 
     private func beginEditing() {

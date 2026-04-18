@@ -92,12 +92,7 @@ private struct IOSBrowseView: View {
                     NavigationLink {
                         ConversationDetailView(conversationId: conversation.id, repository: repository)
                     } label: {
-                        ConversationRowView(
-                            conversation: conversation,
-                            onToggleBookmark: {
-                                toggleBookmark(conversation)
-                            }
-                        )
+                        ConversationRowView(conversation: conversation)
                     }
                     .onAppear {
                         Task {
@@ -148,24 +143,6 @@ private struct IOSBrowseView: View {
         }
     }
 
-    private func toggleBookmark(_ conversation: ConversationSummary) {
-        let nextState = !conversation.isBookmarked
-        let target = BookmarkTarget(
-            targetType: .thread,
-            targetID: conversation.id,
-            payload: ["title": conversation.displayTitle]
-        )
-
-        Task {
-            do {
-                _ = try await bookmarkRepository.setBookmark(target: target, bookmarked: nextState)
-                viewModel.setBookmarkState(for: conversation.id, isBookmarked: nextState)
-                archiveEvents.didChangeBookmarks()
-            } catch {
-                print("Failed to toggle bookmark: \(error)")
-            }
-        }
-    }
 }
 
 private struct IOSSearchView: View {

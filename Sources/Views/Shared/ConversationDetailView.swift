@@ -5,7 +5,23 @@ import AppKit
 
 struct ConversationDetailView: View {
     private enum RenderSafety {
-        static let maxRenderedConversationLength = 12_000
+        /// Conversation-wide cap above which the whole detail pane flips
+        /// to `.plain`. The original 12_000 was catastrophically low —
+        /// a handful of prompts with modest answers easily crosses it,
+        /// and every such conversation rendered as raw markdown text.
+        /// But the opposite extreme (2_000_000, "basically disabled")
+        /// made opening a heavy conversation painfully slow: even with
+        /// `LazyVStack`, first-screen layout now pays for block parsing
+        /// + `AttributedString(markdown:)` on every visible paragraph
+        /// of every visible bubble, where previously the same
+        /// conversation rendered instantly via a single `Text(verbatim:)`
+        /// per message. 150_000 chars is the middle path — covers the
+        /// long tail of real chat threads (roughly 30 messages of 5k
+        /// chars each) while still auto-collapsing to `.plain` for
+        /// dumped-log-tier transcripts where rendered mode would be
+        /// unusable anyway. User can still opt into rendered via the
+        /// header toggle past this threshold.
+        static let maxRenderedConversationLength = 150_000
     }
 
     enum DetailDisplayMode: String, CaseIterable, Identifiable {
@@ -19,6 +35,25 @@ struct ConversationDetailView: View {
     @State private var localDisplayMode: DetailDisplayMode = .rendered
     private let externalDisplayMode: Binding<DetailDisplayMode>?
     private let externalSelectedPromptID: Binding<String?>?
+    /// One-shot "please scroll to this prompt" signal from outside the
+    /// reader pane (e.g. the middle-pane Viewer-Mode prompt directory,
+    /// or the header outline popover). The detail view observes this
+    /// binding and performs a programmatic scroll, then clears it back
+    /// to nil so the next tap — even on the SAME prompt — re-fires.
+    ///
+    /// Split from `selectedPromptID` because the selection binding is
+    /// also written continuously by the scroll observer, which means
+    /// "tap prompt you're already looking at" used to be a silent
+    /// no-op (the binding already equaled the tap target, onChange
+    /// never fired). Routing through this separate imperative token
+    /// fixes the "戻れなかった" report.
+    private let externalRequestedPromptID: Binding<String?>?
+    /// Observed one-shot signal asking the reader body to snap to its
+    /// top (the `ConversationHeaderView`). The caller rotates a fresh
+    /// `UUID` per tap so consecutive taps re-fire `.onChange`. `nil`
+    /// when no external party is driving scroll-to-top behavior (iOS,
+    /// previews, embedded uses).
+    private let externalScrollToTopToken: Binding<UUID?>?
     private let showsSystemChrome: Bool
     private let onDetailChanged: ((ConversationDetail?) -> Void)?
     private let onPromptOutlineChanged: (([ConversationPromptOutlineItem]) -> Void)?
@@ -28,6 +63,8 @@ struct ConversationDetailView: View {
         repository: any ConversationRepository,
         displayMode: Binding<DetailDisplayMode>? = nil,
         selectedPromptID: Binding<String?>? = nil,
+        requestedPromptID: Binding<String?>? = nil,
+        scrollToTopToken: Binding<UUID?>? = nil,
         showsSystemChrome: Bool = true,
         onDetailChanged: ((ConversationDetail?) -> Void)? = nil,
         onPromptOutlineChanged: (([ConversationPromptOutlineItem]) -> Void)? = nil
@@ -40,6 +77,8 @@ struct ConversationDetailView: View {
         )
         externalDisplayMode = displayMode
         externalSelectedPromptID = selectedPromptID
+        externalRequestedPromptID = requestedPromptID
+        externalScrollToTopToken = scrollToTopToken
         self.showsSystemChrome = showsSystemChrome
         self.onDetailChanged = onDetailChanged
         self.onPromptOutlineChanged = onPromptOutlineChanged
@@ -74,6 +113,8 @@ struct ConversationDetailView: View {
             LoadedConversationDetailView(
                 displayMode: resolvedDisplayMode,
                 selectedPromptID: resolvedSelectedPromptID,
+                requestedPromptID: externalRequestedPromptID ?? .constant(nil),
+                scrollToTopToken: externalScrollToTopToken ?? .constant(nil),
                 detail: detail,
                 supportsRenderedDisplay: Self.supportsRenderedDisplay(for: detail),
                 showsSystemChrome: showsSystemChrome
@@ -102,11 +143,22 @@ struct ConversationDetailView: View {
     }
 
     static func shouldPreferPlainDisplay(for detail: ConversationDetail) -> Bool {
-        if detail.summary.source?.lowercased() == "markdown" {
-            return true
-        }
-
-        return detail.messages.contains { $0.content.count > 20_000 }
+        // Previously returned true for `source == "markdown"` (so every
+        // imported `.md` conversation opened as verbatim text) and for
+        // any conversation containing a 20k+ char message. Both defaults
+        // were counter-intuitive:
+        //   - "markdown" imports are *the* source type that most benefits
+        //     from rendering — the user explicitly asked for markdown
+        //     yet the pane refused to parse it.
+        //   - A single long message flipped the entire transcript to
+        //     plain, erasing formatting from every other short response
+        //     in the conversation.
+        // Per-message degradation (`MessageBubbleView.canRenderMessage`
+        // falling back to a single paragraph when a single message
+        // exceeds its cap) already handles the "don't parse monsters"
+        // concern at the right granularity, so this helper no longer
+        // forces plain by default. The user can still switch manually.
+        return false
     }
 
     static func supportsRenderedDisplay(for detail: ConversationDetail) -> Bool {
@@ -117,17 +169,36 @@ struct ConversationDetailView: View {
     }
 
     static func promptOutline(for detail: ConversationDetail) -> [ConversationPromptOutlineItem] {
-        detail.messages.enumerated().compactMap { index, message in
-            guard message.isUser else {
-                return nil
-            }
+        // Straight-line pass over user-authored messages. Earlier iterations
+        // tried to color-code "topic shifts" here via a Jaccard similarity
+        // heuristic over leading keywords; that was scrapped because it
+        // was noisy for Japanese prompts (no token boundaries → every
+        // prompt scored as a shift) and the color signal couldn't render
+        // inside a native `NSMenu` anyway. Visual grouping is now done
+        // with zebra-striped row backgrounds in the outline popover, so
+        // the item itself doesn't need to carry any group metadata.
+        // `index` counts user prompts only (1, 2, 3, ...) — not the
+        // position in `detail.messages`, which interleaves assistant /
+        // system messages and produced a jumpy "13, 15, 17, 19, …"
+        // sequence in the outline popover. The header-bar counter
+        // ("15 / 23") already uses user-only numbering, so keeping
+        // the two in sync also avoids the mismatch where the popover
+        // showed an index that didn't match the header.
+        var items: [ConversationPromptOutlineItem] = []
+        var userIndex = 0
 
-            return ConversationPromptOutlineItem(
+        for message in detail.messages {
+            guard message.isUser else { continue }
+            userIndex += 1
+
+            items.append(ConversationPromptOutlineItem(
                 id: message.id,
-                index: index + 1,
+                index: userIndex,
                 label: promptLabel(from: message.content)
-            )
+            ))
         }
+
+        return items
     }
 
     // Pre-compiled once; `String.replacingOccurrences(options: .regularExpression)`
@@ -164,31 +235,84 @@ struct ConversationPromptOutlineItem: Identifiable, Hashable {
 }
 
 private struct LoadedConversationDetailView: View {
-    @EnvironmentObject private var services: AppServices
-    @Environment(ArchiveEvents.self) private var archiveEvents
+    private enum ScrollCoordinateSpace: Hashable {
+        case conversation
+    }
+
+    /// Top inset (points) below which a message is considered "current".
+    /// Roughly matches the floating header bar's vertical footprint so
+    /// the counter flips to the next prompt right as it appears from
+    /// behind the header, not when it crests the raw viewport top.
+    private static let currentPromptTopThreshold: CGFloat = 120
+
+    /// Anchor id attached to the `ConversationHeaderView` so the
+    /// ScrollViewReader can jump back to the very top of the body on
+    /// demand. String literal rather than a derived id so the value is
+    /// stable regardless of the underlying conversation.
+    private static let topAnchorID: String = "__conversation_top__"
+
     @Binding var displayMode: ConversationDetailView.DetailDisplayMode
     @Binding var selectedPromptID: String?
+    @Binding var requestedPromptID: String?
+    @Binding var scrollToTopToken: UUID?
     let detail: ConversationDetail
     let supportsRenderedDisplay: Bool
     let showsSystemChrome: Bool
-    @State private var bookmarkOverride: Bool?
+
+    /// Reader pane pushes its floating-header-bar height in via environment
+    /// so the ScrollView below can reserve matching top space without
+    /// losing scroll extent. `nil` on iOS / previews — those paths render
+    /// without an overlay bar, so no margin is needed.
+    @Environment(\.scrollTopContentInset) private var scrollTopContentInset
+
+    /// Written whenever the scroll-position observer updates
+    /// `selectedPromptID`. `.onChange(of: selectedPromptID)` consults
+    /// this to decide whether the change came from the user tapping
+    /// the outline (→ scroll to it) or from the user scrolling the
+    /// body (→ do NOT programmatically scroll, which would fight the
+    /// live gesture and create an infinite feedback loop).
+    @State private var scrollDrivenSelection: String?
+
+    /// Non-nil while a programmatic `proxy.scrollTo` animation is in
+    /// flight. The scroll-position observer skips updates while this
+    /// is set — without that guard, intermediate frames of the
+    /// animation would pick up transient "current prompts" and
+    /// flip-flop `selectedPromptID`, which cascades into the middle
+    /// pane scroll-chattering as it tries to keep the highlighted row
+    /// centered. A fresh UUID is minted per scroll and a dispatched
+    /// task clears it after ~0.45s (0.20s animation + slack for the
+    /// final preference emission to settle), so the lock is
+    /// self-healing even if a scroll is interrupted.
+    @State private var programmaticScrollLock: UUID?
 
     var body: some View {
         let detailBody = Group {
             if shouldUseDocumentViewer {
-                DocumentConversationView(detail: detail, isBookmarked: effectiveBookmarked, onToggleBookmark: toggleBookmark)
+                DocumentConversationView(detail: detail)
             } else {
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 0) {
-                            ConversationHeaderView(
-                                summary: detail.summary,
-                                isBookmarked: effectiveBookmarked,
-                                onToggleBookmark: toggleBookmark
-                            )
+                            ConversationHeaderView(summary: detail.summary)
                                 .padding(.bottom, 16)
+                                .id(Self.topAnchorID)
 
                             ForEach(Array(detail.messages.enumerated()), id: \.element.id) { index, message in
+                                // Turn boundary: draw a divider BEFORE each
+                                // user message (except the very first one
+                                // in the conversation). A "turn" is a user
+                                // prompt plus any assistant / tool messages
+                                // that follow it, so the visual group stays
+                                // together and the line only appears where
+                                // a new question starts. Previously every
+                                // message pair was separated, which made
+                                // the reader feel choppy — Q and its A
+                                // visually disconnected.
+                                if index > 0 && message.isUser {
+                                    Divider()
+                                        .padding(.vertical, 12)
+                                }
+
                                 MessageBubbleView(
                                     message: message,
                                     displayMode: messageDisplayMode,
@@ -198,6 +322,27 @@ private struct LoadedConversationDetailView: View {
                                     )
                                 )
                                 .id(message.id)
+                                .background(
+                                    // User messages publish their top-edge y
+                                    // coordinate into the ScrollView's named
+                                    // coordinate space. Non-user messages
+                                    // publish nothing, so the preference
+                                    // dictionary stays user-only.
+                                    Group {
+                                        if message.isUser {
+                                            GeometryReader { proxyGeo in
+                                                Color.clear.preference(
+                                                    key: PromptTopYPreferenceKey.self,
+                                                    value: [
+                                                        message.id: proxyGeo.frame(
+                                                            in: .named(ScrollCoordinateSpace.conversation)
+                                                        ).minY
+                                                    ]
+                                                )
+                                            }
+                                        }
+                                    }
+                                )
                                 .contentShape(Rectangle())
                                 .onTapGesture {
                                     guard message.isUser else {
@@ -207,19 +352,139 @@ private struct LoadedConversationDetailView: View {
                                     selectedPromptID = message.id
                                 }
 
-                                if index < detail.messages.count - 1 {
-                                    Divider()
-                                        .padding(.vertical, 12)
+                                // Within-turn spacer between this message
+                                // and the next one of the same turn. A
+                                // plain vertical gap (no line) keeps Q → A
+                                // visually paired. Skipped for the last
+                                // message (no following sibling) and when
+                                // the next message is a user prompt (the
+                                // divider above handles that transition).
+                                if index < detail.messages.count - 1,
+                                   !detail.messages[index + 1].isUser {
+                                    Spacer().frame(height: 8)
                                 }
                             }
                         }
                         .padding()
                     }
+                    .coordinateSpace(name: ScrollCoordinateSpace.conversation)
+                    .scrollContentBackground(.hidden)
+                    .contentMargins(.top, scrollTopContentInset ?? 0, for: .scrollContent)
+                    .onPreferenceChange(PromptTopYPreferenceKey.self) { offsets in
+                        // Defer the state write off the current layout pass.
+                        // Writing `selectedPromptID` synchronously here would
+                        // update the reader-pane outline pulldown in the
+                        // same frame, which can shift `contentMargins` via
+                        // the header-bar height preference and force the
+                        // GeometryReaders below to re-publish — SwiftUI
+                        // flags this as "preference updated multiple times
+                        // per frame". `Task { @MainActor in … }` hops to
+                        // the next runloop iteration, breaking the cycle.
+                        Task { @MainActor in
+                            handlePromptOffsetChange(offsets)
+                        }
+                    }
                     .onAppear {
+                        // Only scroll on appear if the selection was set
+                        // EXTERNALLY before mount (e.g. the pin pane
+                        // requested a specific prompt via
+                        // `ReaderTabManager.requestedPromptID`). A nil
+                        // selection is a fresh open — leave the
+                        // ScrollView at its natural top so the
+                        // conversation header + any preface messages are
+                        // visible. A selection that equals
+                        // `scrollDrivenSelection` means the scroll-
+                        // position observer already assigned it from the
+                        // current viewport; scrolling again would jump
+                        // to `.top` and push the header off-screen,
+                        // which is exactly the bug this guard is here
+                        // to prevent.
+                        guard let selectedPromptID,
+                              selectedPromptID != scrollDrivenSelection else {
+                            return
+                        }
                         scrollToSelectedPrompt(using: proxy, animated: false)
                     }
-                    .onChange(of: selectedPromptID) { _, _ in
-                        scrollToSelectedPrompt(using: proxy, animated: true)
+                    .onChange(of: selectedPromptID) { _, newValue in
+                        // Skip scrolling if this update came from the
+                        // scroll observer — the view is already at the
+                        // right position, and re-entering scrollTo mid-
+                        // gesture produces jitter.
+                        if newValue == scrollDrivenSelection {
+                            return
+                        }
+                        // Non-scroll-driven change (keyboard arrow key,
+                        // outline popover selection): animate to the
+                        // new target, holding the programmatic lock so
+                        // the scroll-position observer doesn't
+                        // re-write `selectedPromptID` to transient
+                        // mid-animation prompts.
+                        performProgrammaticScroll(to: newValue, using: proxy)
+                    }
+                    // Direct one-shot scroll request from outside the
+                    // pane (middle-pane Viewer-Mode row tap, or any
+                    // future imperative "jump to prompt X" call site).
+                    // Kept as a SEPARATE signal from `selectedPromptID`
+                    // because `selectedPromptID` dedupes on equality —
+                    // tapping the prompt you're currently reading
+                    // would otherwise be silently swallowed (→
+                    // "戻れなかった" bug). Routing through a dedicated
+                    // nil-after-fire token guarantees re-triggering
+                    // even for the same target.
+                    .onChange(of: requestedPromptID) { _, newID in
+                        guard let newID else { return }
+                        // Pre-seed `scrollDrivenSelection` so the
+                        // `selectedPromptID` write below is treated
+                        // as an "already-at-position" no-op by the
+                        // sibling `.onChange` handler. Without this
+                        // we'd scroll twice (once here, once from the
+                        // re-entrant change notification).
+                        scrollDrivenSelection = newID
+                        selectedPromptID = newID
+                        performProgrammaticScroll(to: newID, using: proxy)
+                        // Clear the one-shot on the next runloop tick
+                        // so the change notification for "X → nil"
+                        // doesn't race with our own scroll work.
+                        Task { @MainActor in
+                            requestedPromptID = nil
+                        }
+                    }
+                    // Scroll-to-top one-shot: fired by the right-pane
+                    // header's conversation-title button. Clears the
+                    // prompt selection first so `scrollToSelectedPrompt`
+                    // doesn't yank us back to a mid-body position on
+                    // the next layout pass, then scrolls the
+                    // `ConversationHeaderView` anchor back to the
+                    // viewport top. Token is cleared afterwards so the
+                    // next tap reassigns and re-triggers this handler.
+                    .onChange(of: scrollToTopToken) { _, newValue in
+                        guard newValue != nil else { return }
+                        // Hold the programmatic-scroll lock for the
+                        // same reason the prompt-tap path does: the
+                        // scroll observer would otherwise spot the
+                        // first prompt crossing the threshold
+                        // mid-animation and re-write
+                        // `selectedPromptID` away from our deliberate
+                        // nil, undoing the "no prompt highlighted at
+                        // the header" visual.
+                        let token = UUID()
+                        programmaticScrollLock = token
+                        scrollDrivenSelection = nil
+                        selectedPromptID = nil
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            proxy.scrollTo(Self.topAnchorID, anchor: .top)
+                        }
+                        Task { @MainActor in
+                            try? await Task.sleep(nanoseconds: 450_000_000)
+                            if programmaticScrollLock == token {
+                                programmaticScrollLock = nil
+                            }
+                        }
+                        // Clear so consecutive taps with the same
+                        // trivial outcome still fire a change event.
+                        Task { @MainActor in
+                            scrollToTopToken = nil
+                        }
                     }
                 }
             }
@@ -249,10 +514,6 @@ private struct LoadedConversationDetailView: View {
         }
     }
 
-    private var effectiveBookmarked: Bool {
-        bookmarkOverride ?? detail.summary.isBookmarked
-    }
-
     private var shouldPreferPlainDisplay: Bool {
         ConversationDetailView.shouldPreferPlainDisplay(for: detail)
     }
@@ -276,36 +537,6 @@ private struct LoadedConversationDetailView: View {
         supportsRenderedDisplay ? displayMode : .plain
     }
 
-    private func toggleBookmark() {
-        let target = BookmarkTarget(
-            targetType: .thread,
-            targetID: detail.summary.id,
-            payload: bookmarkPayload
-        )
-        let nextState = !effectiveBookmarked
-
-        Task {
-            do {
-                _ = try await services.bookmarks.setBookmark(target: target, bookmarked: nextState)
-                bookmarkOverride = nextState
-                archiveEvents.didChangeBookmarks()
-            } catch {
-                print("Failed to toggle bookmark: \(error)")
-            }
-        }
-    }
-
-    private var bookmarkPayload: [String: String] {
-        var payload: [String: String] = ["title": detail.summary.displayTitle]
-        if let source = detail.summary.source {
-            payload["source"] = source
-        }
-        if let model = detail.summary.model {
-            payload["model"] = model
-        }
-        return payload
-    }
-
     private func scrollToSelectedPrompt(
         using proxy: ScrollViewProxy,
         animated: Bool
@@ -324,6 +555,87 @@ private struct LoadedConversationDetailView: View {
             action()
         }
     }
+
+    /// Animated programmatic scroll that holds `programmaticScrollLock`
+    /// for the duration, suppressing the scroll-position observer so
+    /// it can't overwrite `selectedPromptID` with transient
+    /// mid-animation prompts. Callers just pass the target id — nil
+    /// short-circuits cleanly.
+    ///
+    /// Lock release is done on a dispatched Task sleeping ~0.45s
+    /// (animation length + a cushion for the final `PromptTopYPreferenceKey`
+    /// emission to arrive). The lock is keyed by a fresh UUID so if
+    /// another programmatic scroll starts before the sleep completes,
+    /// the older task's release is a no-op — the newer scroll's lock
+    /// stays in force for its own window.
+    private func performProgrammaticScroll(
+        to id: String?,
+        using proxy: ScrollViewProxy
+    ) {
+        guard let id else { return }
+        let token = UUID()
+        programmaticScrollLock = token
+        withAnimation(.easeInOut(duration: 0.2)) {
+            proxy.scrollTo(id, anchor: .top)
+        }
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 450_000_000)
+            if programmaticScrollLock == token {
+                programmaticScrollLock = nil
+            }
+        }
+    }
+
+    /// Given each user-message's top-edge y coordinate inside the
+    /// ScrollView, pick the one currently occupying the "current prompt"
+    /// slot and, if different from the current selection, propagate it
+    /// upward as a scroll-driven change.
+    ///
+    /// The rule is: among messages whose top has already crossed the
+    /// header-bar threshold (minY ≤ threshold), take the one with the
+    /// LARGEST minY — i.e. the latest prompt that has scrolled into
+    /// active reading position. If none have crossed yet (we're above
+    /// the first prompt), fall back to the first outline entry so the
+    /// counter reads "1 / N" instead of blank.
+    private func handlePromptOffsetChange(_ offsets: [String: CGFloat]) {
+        guard !offsets.isEmpty else { return }
+        // Suppress updates while a programmatic scroll is running —
+        // mid-animation frames otherwise pick intermediate prompts as
+        // "current" and flip-flop `selectedPromptID`, making the
+        // middle-pane highlighted row chatter between values. The
+        // lock auto-releases ~0.45s after the scroll kicks off, at
+        // which point the final resting position lands a single
+        // clean observer fire.
+        guard programmaticScrollLock == nil else { return }
+
+        let threshold = Self.currentPromptTopThreshold
+        let crossed = offsets.filter { $0.value <= threshold }
+
+        let candidate: String?
+        if let top = crossed.max(by: { $0.value < $1.value })?.key {
+            candidate = top
+        } else {
+            // Haven't scrolled past the first prompt yet — default to
+            // the earliest message (smallest minY).
+            candidate = offsets.min(by: { $0.value < $1.value })?.key
+        }
+
+        guard let candidate, candidate != selectedPromptID else { return }
+
+        scrollDrivenSelection = candidate
+        selectedPromptID = candidate
+    }
+}
+
+/// Per-message top-edge y coordinate in the ScrollView's coordinate
+/// space. Each user message contributes one entry; merge is a plain
+/// dictionary merge because keys (message ids) are unique.
+private struct PromptTopYPreferenceKey: PreferenceKey {
+    static var defaultValue: [String: CGFloat] = [:]
+
+    static func reduce(value: inout [String: CGFloat], nextValue: () -> [String: CGFloat]) {
+        value.merge(nextValue()) { _, new in new }
+    }
 }
 
 private struct DocumentConversationView: View {
@@ -333,17 +645,11 @@ private struct DocumentConversationView: View {
     }
 
     let detail: ConversationDetail
-    let isBookmarked: Bool
-    let onToggleBookmark: () -> Void
     @Environment(IdentityPreferencesStore.self) private var identityPreferences
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            ConversationHeaderView(
-                summary: detail.summary,
-                isBookmarked: isBookmarked,
-                onToggleBookmark: onToggleBookmark
-            )
+            ConversationHeaderView(summary: detail.summary)
                 .padding(.horizontal)
                 .padding(.top)
 
@@ -400,27 +706,28 @@ private struct DocumentConversationView: View {
 
 private struct ConversationHeaderView: View {
     let summary: ConversationSummary
-    let isBookmarked: Bool
-    let onToggleBookmark: () -> Void
 
     var body: some View {
         HStack(spacing: 12) {
-            BookmarkToggleButton(
-                isBookmarked: isBookmarked,
-                action: onToggleBookmark
+            // Pill-ified service/model display. When the conversation is
+            // from a service with a canonical per-thread URL (ChatGPT /
+            // Claude — id must be a real-looking UUID), the pill is
+            // clickable and jumps to the original thread in the default
+            // browser. When it's not (markdown imports, synthetic ids,
+            // unknown services), the pill degrades to plain tinted text
+            // with no button affordance — matches the pre-pill layout.
+            //
+            // Model / source selection rule mirrors the card row + search
+            // row: prefer model when known (so the brand color already
+            // identifies the service), fall back to source otherwise.
+            // Ported from the Python viewer's `getSourceButtonMarkup`
+            // in `viewer.js` (L5336–5358) which constructs the same
+            // three service URLs.
+            SourceOriginPill(
+                conversationID: summary.id,
+                source: summary.source,
+                model: summary.model
             )
-
-            if let source = summary.source {
-                Label(source, systemImage: sourceIcon(source))
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            }
-
-            if let model = summary.model {
-                Text(model)
-                    .font(.callout)
-                    .foregroundStyle(.tertiary)
-            }
 
             if let time = summary.primaryTime {
                 Spacer()
@@ -432,18 +739,6 @@ private struct ConversationHeaderView: View {
         .padding(.horizontal, 4)
     }
 
-    private func sourceIcon(_ source: String) -> String {
-        switch source.lowercased() {
-        case "chatgpt":
-            "bubble.left.and.bubble.right"
-        case "claude":
-            "text.bubble"
-        case "gemini":
-            "sparkles"
-        default:
-            "doc.text"
-        }
-    }
 }
 
 private struct DetailExportToolbar: ToolbarContent {
