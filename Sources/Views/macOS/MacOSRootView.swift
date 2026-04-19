@@ -390,9 +390,14 @@ struct MacOSRootView: View {
         //   * `.principal`: navigation bar (title + prompt pulldown).
         //     Mounted in every mode (including `.table`) so its position
         //     stays stable across the cascade.
-        //   * `.primaryAction`: share button + middle-pane mode picker.
-        //     Mode picker always-trailing matches Finder/Safari tab-bar
-        //     convention.
+        //   * `.secondaryAction`: share button. Kept in its own
+        //     placement (not stacked with the mode picker) so macOS 26
+        //     doesn't draw both inside a single grouped-toolbar chrome
+        //     bubble — the share glyph and the four mode segments
+        //     should read as two independent controls, not one
+        //     conglomerated pill.
+        //   * `.primaryAction`: middle-pane mode picker (trailing).
+        //     Always-trailing matches Finder/Safari tab-bar convention.
         // Sort menu / date range / search / filter chips all live in
         // the left sidebar (they control sidebar-driven filtering of
         // the middle pane — see `project_three_pane_architecture`).
@@ -417,7 +422,7 @@ struct MacOSRootView: View {
                     onTitlePulldownOpen: revealActiveConversationInMiddlePane
                 )
             }
-            ToolbarItem(id: "share", placement: .primaryAction) {
+            ToolbarItem(id: "share", placement: .secondaryAction) {
                 WorkspaceFloatingExportButton(detail: tabManager.activeDetail)
             }
             ToolbarItem(id: "mode-picker", placement: .primaryAction) {
@@ -1227,21 +1232,11 @@ struct MiddlePaneModePicker: View {
     @Binding var selection: MiddlePaneMode
 
     var body: some View {
-        HStack(spacing: 2) {
+        HStack(spacing: 4) {
             ForEach(MiddlePaneMode.allCases) { mode in
                 segmentButton(for: mode)
             }
         }
-        .padding(2)
-        .background(
-            Capsule(style: .continuous)
-                .fill(Color.primary.opacity(0.06))
-        )
-        .overlay(
-            Capsule(style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
-        )
-        .help("ビュー切替")
     }
 
     private func segmentButton(for mode: MiddlePaneMode) -> some View {
@@ -1259,20 +1254,14 @@ struct MiddlePaneModePicker: View {
             }
         } label: {
             Image(systemName: mode.systemImage)
-                .font(.subheadline.weight(.semibold))
-                .frame(width: 32, height: 22)
+                // `.title3` matches the share / calendar / outline
+                // chip family used elsewhere in the toolbar — share
+                // (left neighbour) is sized the same, so the four
+                // mode segments read as five equal-weight icons
+                // rather than "tiny icons next to a big share".
+                .font(.title3.weight(.semibold))
                 .foregroundStyle(isSelected ? Color.primary : Color.secondary)
-                .background(
-                    Capsule(style: .continuous)
-                        .fill(isSelected ? Color(nsColor: .controlBackgroundColor) : .clear)
-                )
-                .overlay(
-                    Capsule(style: .continuous)
-                        .strokeBorder(
-                            isSelected ? Color.primary.opacity(0.12) : .clear,
-                            lineWidth: 0.5
-                        )
-                )
+                .headerIconChipStyle(isActive: isSelected)
                 .contentShape(Capsule())
         }
         .buttonStyle(.plain)
