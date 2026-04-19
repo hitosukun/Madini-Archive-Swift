@@ -220,18 +220,20 @@ struct ReaderHeaderActivityPill: View {
         // for source compatibility but no longer fires — there is no
         // reliable Menu-open hook without dropping into AppKit.
         //
-        // Width behavior: segments use FIXED widths (thread 120pt,
-        // prompt 80pt) with `.fixedSize()` so the pill reports a
-        // stable intrinsic size to the window toolbar. Flexible
-        // min/max widths caused the principal toolbar item to be
-        // dropped entirely on narrow windows — SwiftUI's principal
-        // placement doesn't soft-fit oversized items, and an
-        // indeterminate width seemed to push the same overflow path.
-        // Pinning a modest fixed footprint (~220pt total pill) keeps
-        // the item visible across every usable window size; long
-        // titles truncate with tail ellipsis inside each segment.
-        // The counter sibling has no fixed width and is allowed to
-        // be clipped out on very narrow windows.
+        // Width behavior: each segment is pinned by an outer
+        // `.frame(width:)` on the Menu itself (thread 130pt,
+        // prompt 80pt). The fixed width has to go on the Menu,
+        // not on the Text label inside the Menu's label closure —
+        // `.menuStyle(.borderlessButton)` reads the label's natural
+        // content size for its own layout and ignores width frames
+        // set deeper in the label's view tree, so a `.frame(width:)`
+        // on the Text (or even a prior `.fixedSize()` on the Menu)
+        // let long prompts blow the pill out to their full natural
+        // width. Pinning the Menu itself is authoritative: the label
+        // then fills that fixed width and truncates with `.tail`.
+        // Total pill footprint is ~220pt; stays visible at every
+        // usable window size. The counter sibling is unconstrained
+        // and may be clipped on very narrow windows.
         HStack(spacing: 8) {
             HStack(spacing: 2) {
                 threadMenu
@@ -282,14 +284,14 @@ struct ReaderHeaderActivityPill: View {
                 .foregroundStyle(activeDetail == nil ? .secondary : .primary)
                 .lineLimit(1)
                 .truncationMode(.tail)
-                .frame(width: 120, alignment: .leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 6)
                 .frame(height: 22)
                 .contentShape(Rectangle())
         }
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
-        .fixedSize()
+        .frame(width: 130)
         .disabled(activeDetail == nil && conversations.isEmpty)
         .help("会話を切り替え")
     }
@@ -315,14 +317,14 @@ struct ReaderHeaderActivityPill: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .truncationMode(.tail)
-                .frame(width: 80, alignment: .leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 6)
                 .frame(height: 22)
                 .contentShape(Rectangle())
         }
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
-        .fixedSize()
+        .frame(width: 80)
         .disabled(promptOutline.isEmpty)
         .help("プロンプトを切り替え")
     }
