@@ -31,11 +31,6 @@ struct UnifiedWorkspaceTopBar: View {
     /// the traffic-light clearance spacer width. When the sidebar is
     /// visible it takes the traffic-light room itself.
     let sidebarIsCollapsed: Bool
-    /// Parent-supplied handler for "tap title pill" — reveal the active
-    /// conversation in the middle-pane list AND scroll the reader body
-    /// to the top. `MacOSRootView` owns both sides of that combo since
-    /// it holds references to both the library VM and the tab manager.
-    let onTapTitle: () -> Void
     /// Conversations currently rendered by the middle pane (already
     /// filtered/sorted by the sidebar). Forwarded into the title-pill
     /// pulldown so the user can switch to a sibling conversation
@@ -96,7 +91,6 @@ struct UnifiedWorkspaceTopBar: View {
                 onSelectPrompt: { id in
                     tabManager.requestPromptSelection(id)
                 },
-                onTapTitle: onTapTitle,
                 conversations: conversations,
                 onSelectConversation: onSelectConversation
             )

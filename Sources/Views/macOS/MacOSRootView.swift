@@ -395,7 +395,6 @@ struct MacOSRootView: View {
                 viewMode: $viewMode,
                 tabManager: tabManager,
                 sidebarIsCollapsed: columnVisibility != .all,
-                onTapTitle: revealActiveConversationInList,
                 conversations: libraryViewModel.conversations,
                 onSelectConversation: { id in
                     // Same path as a click in the middle-pane list
@@ -432,19 +431,6 @@ struct MacOSRootView: View {
             viewMode: $viewMode,
             canEnterViewer: tabManager.activeTab != nil
         )
-    }
-
-    /// Unified-bar "tap the title pill" handler. Reveals the active
-    /// conversation card in the middle-pane list (paging in if the id
-    /// has fallen off the currently-loaded window) AND rotates
-    /// `scrollToTopToken` so the right-pane body snaps back to the
-    /// conversation header. Lives here (not deeper) because it touches
-    /// both `libraryViewModel` and `tabManager` — the root is the only
-    /// place that holds references to both.
-    private func revealActiveConversationInList() {
-        guard let id = tabManager.activeTab?.conversationID else { return }
-        Task { await libraryViewModel.revealConversation(id: id) }
-        tabManager.scrollToTopToken = UUID()
     }
 
     /// Double-tap on the unified top bar's blank chrome → snap each

@@ -188,7 +188,6 @@ struct ReaderHeaderActivityPill: View {
     let promptOutline: [ConversationPromptOutlineItem]
     let selectedPromptID: String?
     let onSelectPrompt: (String) -> Void
-    let onTapTitle: () -> Void
     /// Conversations currently rendered by the middle pane (already
     /// filtered/sorted by the sidebar). Powers the title-pulldown's
     /// jump-to-other-conversation list — Xcode-style breadcrumb where
@@ -274,10 +273,6 @@ struct ReaderHeaderActivityPill: View {
             ConversationListPopover(
                 conversations: conversations,
                 activeConversationID: activeDetail?.summary.id,
-                onTapTitle: {
-                    onTapTitle()
-                    isTitlePresented = false
-                },
                 onSelect: { id in
                     onSelectConversation(id)
                     isTitlePresented = false
@@ -387,20 +382,18 @@ struct ReaderHeaderActivityPill: View {
 /// `Menu`-based jump bar so the pulldown can:
 ///
 ///   * Open with the active conversation centered and gray-highlighted
-///     (NSMenu has no programmatic scroll API).
+///     (NSMenu has no programmatic scroll API). The auto-scroll on
+///     appear replaces what used to be an explicit "現在の会話を中央
+///     リストで見る" header row — opening the pulldown is now itself
+///     the affordance for "show me where I am".
 ///   * Render multi-line conversation titles (NSMenu items are
 ///     single-line and truncate aggressively).
 ///   * Share visual language with the prompt-side `PromptOutlinePopover`
 ///     — both pulldowns now read as the same kind of "where am I in
 ///     this list" affordance.
-///
-/// The first row preserves the legacy "reveal active conversation in
-/// middle pane + scroll reader to top" action (`onTapTitle`). Below
-/// the divider is the conversation list itself.
 private struct ConversationListPopover: View {
     let conversations: [ConversationSummary]
     let activeConversationID: String?
-    let onTapTitle: () -> Void
     let onSelect: (String) -> Void
 
     private let popoverWidth: CGFloat = 360
@@ -410,20 +403,6 @@ private struct ConversationListPopover: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    Button(action: onTapTitle) {
-                        Label("現在の会話を中央リストで見る", systemImage: "arrow.up.to.line")
-                            .font(.subheadline)
-                            .foregroundStyle(activeConversationID == nil ? .secondary : .primary)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 8)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(activeConversationID == nil)
-
-                    Divider()
-
                     ForEach(Array(conversations.enumerated()), id: \.element.id) { offset, conversation in
                         ConversationListRow(
                             conversation: conversation,
