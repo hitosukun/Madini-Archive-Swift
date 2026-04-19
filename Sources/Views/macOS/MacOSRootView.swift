@@ -390,14 +390,13 @@ struct MacOSRootView: View {
         //   * `.principal`: navigation bar (title + prompt pulldown).
         //     Mounted in every mode (including `.table`) so its position
         //     stays stable across the cascade.
-        //   * `.secondaryAction`: share button. Kept in its own
-        //     placement (not stacked with the mode picker) so macOS 26
-        //     doesn't draw both inside a single grouped-toolbar chrome
-        //     bubble — the share glyph and the four mode segments
-        //     should read as two independent controls, not one
-        //     conglomerated pill.
-        //   * `.primaryAction`: middle-pane mode picker (trailing).
-        //     Always-trailing matches Finder/Safari tab-bar convention.
+        //   * `.primaryAction`: share button + middle-pane mode picker.
+        //     Kept adjacent (share immediately to the left of the
+        //     picker) per user spec. The picker's own outer capsule
+        //     was dropped so each mode segment sits as a standalone
+        //     `headerIconChipStyle` chip — same glyph size as share,
+        //     visually reading as five independent chips rather than
+        //     "share + a tiny-icon segmented control".
         // Sort menu / date range / search / filter chips all live in
         // the left sidebar (they control sidebar-driven filtering of
         // the middle pane — see `project_three_pane_architecture`).
@@ -422,7 +421,7 @@ struct MacOSRootView: View {
                     onTitlePulldownOpen: revealActiveConversationInMiddlePane
                 )
             }
-            ToolbarItem(id: "share", placement: .secondaryAction) {
+            ToolbarItem(id: "share", placement: .primaryAction) {
                 WorkspaceFloatingExportButton(detail: tabManager.activeDetail)
             }
             ToolbarItem(id: "mode-picker", placement: .primaryAction) {
