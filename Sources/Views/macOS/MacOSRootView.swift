@@ -1,4 +1,5 @@
 #if os(macOS)
+import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -60,6 +61,27 @@ struct MacOSRootView: View {
         // row of vertical space in the middle pane — a noticeable win on
         // 13-inch displays.
         workspaceSplitView
+        // Window chrome: intentionally left at SwiftUI defaults.
+        //
+        // We previously configured `toolbarStyle = .unifiedCompact`
+        // and `titlebarAppearsTransparent = true` here, but the
+        // resulting window pushed the toolbar up over the sidebar
+        // column boundary (sidebar toggle floated above the sidebar,
+        // content clipped by translucent chrome). The root cause
+        // wasn't narrowed down to a single flag — either of the two
+        // interacts oddly with `NavigationSplitView`'s own layout
+        // assumptions on the current SDK.
+        //
+        // Minimal-config baseline: no style tweaks. If a scroll-
+        // driven material / separator effect is wanted later, add it
+        // via an explicit scroll observer rather than the AppKit-
+        // automatic path (which depends on `.fullSizeContentView`,
+        // shown to break `NavigationSplitView` here).
+        //
+        // `WindowConfigurator` itself is kept for future AppKit
+        // tweaks that don't disturb the split view (traffic-light
+        // behavior, window appearance, etc.).
+        .background(WindowConfigurator { _ in })
         // Window-level JSON drop handler. Sits ABOVE the in-app tag /
         // conversation drop destinations (which live on specific rows
         // further down the view tree) so an external file drag lands
@@ -379,27 +401,22 @@ struct MacOSRootView: View {
                 )
         }
         // Window toolbar — the single home for window-chrome controls.
-        // Mounting into the real `.toolbar { }` (instead of a SwiftUI
-        // overlay over the NavigationSplitView, which we tried earlier)
-        // lets the system handle traffic-light clearance, fullscreen
-        // auto-hide, and safe-area insets automatically. The previous
-        // overlay approach fought AppKit for the titlebar region and
-        // broke on every window-state change — see commit history.
         //
         // Responsibility split:
         //   * `.principal`: navigation bar (title + prompt pulldown).
-        //     Mounted in every mode (including `.table`) so its position
-        //     stays stable across the cascade.
-        //   * `.primaryAction`: share button + middle-pane mode picker.
-        //     Kept adjacent (share immediately to the left of the
-        //     picker) per user spec. The picker's own outer capsule
-        //     was dropped so each mode segment sits as a standalone
-        //     `headerIconChipStyle` chip — same glyph size as share,
-        //     visually reading as five independent chips rather than
-        //     "share + a tiny-icon segmented control".
-        // Sort menu / date range / search / filter chips all live in
-        // the left sidebar (they control sidebar-driven filtering of
-        // the middle pane — see `project_three_pane_architecture`).
+        //   * `.primaryAction`: share button (standalone) + mode
+        //     picker (a real `NSSegmentedControl` wrapped as one
+        //     `NSToolbarItem`). See `MiddlePaneModePicker`.
+        //
+        // `.toolbarBackground(.automatic, for: .windowToolbar)` is
+        // set explicitly (rather than left implicit) so the chrome
+        // behavior is pinned to the SwiftUI-default unified-toolbar
+        // rendering for this window. We do NOT touch `NSWindow`
+        // (`toolbarStyle`, `titlebarAppearsTransparent`, style mask)
+        // — that path broke `NavigationSplitView`'s sidebar layout
+        // on the current SDK. Any scroll-driven material / separator
+        // work will go in a separate pane-internal observer, not via
+        // the AppKit-automatic titlebar path.
         .toolbar(id: "workspace") {
             ToolbarItem(id: "navigation-bar", placement: .principal) {
                 ReaderHeaderActivityPill(
@@ -411,11 +428,6 @@ struct MacOSRootView: View {
                     },
                     conversations: libraryViewModel.conversations,
                     onSelectConversation: { id in
-                        // Same path as a click in the middle-pane list:
-                        // mutating `selectedConversationId` triggers
-                        // `MacOSRootView.onChange` which resolves the
-                        // summary and asks `tabManager` to open it. Keeps
-                        // the reader-tab lifecycle in one place.
                         libraryViewModel.selectedConversationId = id
                     },
                     onTitlePulldownOpen: revealActiveConversationInMiddlePane
@@ -428,6 +440,7 @@ struct MacOSRootView: View {
                 MiddlePaneModePicker(selection: $viewMode)
             }
         }
+        .toolbarBackground(.automatic, for: .windowToolbar)
         // Trackpad / mouse swipe → toggle Viewer Mode. Lives on the
         // workspace split view (not on a single pane) so the gesture
         // works regardless of which pane the user happens to be over,
@@ -1197,74 +1210,142 @@ private struct SearchSavedFiltersSection: View {
     }
 }
 
-/// Custom segmented control for the middle-pane mode cascade, mounted
-/// as an `NSToolbarItem` in the window title bar
+/// Native `NSSegmentedControl` hosting the middle-pane mode cascade,
+/// mounted as a single `NSToolbarItem` in the window title bar
 /// (`MacOSRootView.workspaceSplitView`'s `.toolbar`). Four glyph
 /// segments — テーブル / デフォルト / ビューアー / フォーカス — matching
 /// the ordering of `MiddlePaneMode`'s cascade left-to-right so the
 /// control reads the same way the trackpad swipe feels.
 ///
-/// **Why not `Picker(.segmented)`**: the native segmented picker runs
-/// an internal AppKit press+selection animation that delays the
-/// `selection` binding write by roughly a frame, making direct clicks
-/// feel measurably heavier than the trackpad-swipe path (which writes
-/// the binding from an `NSEvent` monitor with no intermediary). Users
-/// reported this as "picker is heavier than swipe, especially when
-/// jumping back to `.table`". Rolling our own buttons on top of the
-/// shared `HeaderChipBackground` lets the click path skip that
-/// animation — a `Button` action mutates the binding on the same
-/// runloop turn the tap lands on — while keeping the visual family of
-/// the rest of the toolbar chrome (same thin-material fill, same
-/// capsule rim as the sort menu and date picker).
+/// **Why `NSSegmentedControl` directly, not `Picker(.segmented)` nor
+/// a custom HStack of `Button`s.** The goal of this rewrite is to let
+/// AppKit own the chrome — Finder's toolbar view picker is literally
+/// an `NSSegmentedControl` in a unified toolbar, and matching that
+/// requires the control to *be* the AppKit widget, not a SwiftUI
+/// approximation. The previous custom-`Button` version painted its
+/// own capsule fill and stroke on each segment, which caused macOS 26
+/// to group all five toolbar chips (share + four modes) into one pill
+/// bubble. Handing the four modes to AppKit as a single
+/// `NSSegmentedControl` means the toolbar sees ONE control with four
+/// internal segments — so the share button reads as its own item
+/// sitting next to the group, not a fifth segment absorbed into it.
+///
+/// A thin `Coordinator` routes `action:` callbacks back into the
+/// SwiftUI binding. The control fires on `mouseUp`, which lands on
+/// the same runloop turn the click happens — so click latency matches
+/// the trackpad-swipe path that writes the binding from an `NSEvent`
+/// monitor.
 ///
 /// Always visible across all four modes; no disabled states — the
 /// cascade accepts any target, and writing a mode with no active
 /// conversation just lands the user in an empty reader pane, same as
 /// the swipe path.
-///
-/// Mounted into the native window toolbar's `.primaryAction` slot by
-/// `MacOSRootView.workspaceSplitView`. The trailing placement is
-/// visible in every mode — including `.table` (right pane collapsed)
-/// and `.focus` (middle pane collapsed) — because the window toolbar
-/// spans the full width regardless of column visibility.
-struct MiddlePaneModePicker: View {
+struct MiddlePaneModePicker: NSViewRepresentable {
     @Binding var selection: MiddlePaneMode
 
-    var body: some View {
-        HStack(spacing: 4) {
-            ForEach(MiddlePaneMode.allCases) { mode in
-                segmentButton(for: mode)
-            }
+    func makeCoordinator() -> Coordinator {
+        Coordinator(binding: $selection)
+    }
+
+    func makeNSView(context: Context) -> NSSegmentedControl {
+        let modes = MiddlePaneMode.allCases
+        let images: [NSImage] = modes.map { mode in
+            NSImage(
+                systemSymbolName: mode.systemImage,
+                accessibilityDescription: mode.displayName
+            ) ?? NSImage()
+        }
+
+        let control = NSSegmentedControl(
+            images: images,
+            trackingMode: .selectOne,
+            target: context.coordinator,
+            action: #selector(Coordinator.segmentChanged(_:))
+        )
+        // `.automatic` picks whichever style the current window style
+        // mask / toolbar style implies — in a unified toolbar that
+        // resolves to the "separated" pill look Finder uses.
+        control.segmentStyle = .automatic
+        control.controlSize = .regular
+
+        for (index, mode) in modes.enumerated() {
+            control.setToolTip(mode.displayName, forSegment: index)
+        }
+        if let index = modes.firstIndex(of: selection) {
+            control.selectedSegment = index
+        }
+        return control
+    }
+
+    func updateNSView(_ nsView: NSSegmentedControl, context: Context) {
+        context.coordinator.binding = $selection
+        let modes = MiddlePaneMode.allCases
+        if let index = modes.firstIndex(of: selection),
+           nsView.selectedSegment != index {
+            nsView.selectedSegment = index
         }
     }
 
-    private func segmentButton(for mode: MiddlePaneMode) -> some View {
-        let isSelected = selection == mode
-        return Button {
-            // Skip animation on the state write so the view-tree swap
-            // happens on the click's own runloop turn. The downstream
-            // `.onChange(of: viewMode)` observers still run normally —
-            // only the visual crossfade is disabled, which is the bit
-            // that made the picker feel laggy vs. swipe.
+    final class Coordinator {
+        var binding: Binding<MiddlePaneMode>
+
+        init(binding: Binding<MiddlePaneMode>) {
+            self.binding = binding
+        }
+
+        @objc func segmentChanged(_ sender: NSSegmentedControl) {
+            let modes = MiddlePaneMode.allCases
+            let idx = sender.selectedSegment
+            guard idx >= 0 && idx < modes.count else { return }
+            let next = modes[idx]
+            guard next != binding.wrappedValue else { return }
+            // Match the swipe path: write the binding synchronously
+            // with animation disabled so the view-tree swap lands on
+            // the click's own runloop turn.
             var transaction = Transaction()
             transaction.disablesAnimations = true
             withTransaction(transaction) {
-                selection = mode
+                binding.wrappedValue = next
             }
-        } label: {
-            Image(systemName: mode.systemImage)
-                // `.title3` matches the share / calendar / outline
-                // chip family used elsewhere in the toolbar — share
-                // (left neighbour) is sized the same, so the four
-                // mode segments read as five equal-weight icons
-                // rather than "tiny icons next to a big share".
-                .font(.title3.weight(.semibold))
-                .foregroundStyle(isSelected ? Color.primary : Color.secondary)
-                .headerIconChipStyle(isActive: isSelected)
-                .contentShape(Capsule())
         }
-        .buttonStyle(.plain)
-        .help(mode.displayName)
+    }
+}
+
+// MARK: - Window configuration
+
+/// Walks up to the hosting `NSWindow` on first layout and applies the
+/// window-level chrome settings SwiftUI doesn't expose: toolbar style
+/// (`.unified` — merges title bar + toolbar into one Finder-style
+/// region), full-size content view toggle, and any future AppKit-only
+/// tweaks. Attached via `.background(WindowConfigurator { … })` at the
+/// root of `MacOSRootView.body`.
+///
+/// **Why `viewDidMoveToWindow` rather than a `DispatchQueue.main.async`
+/// poke from `makeNSView`.** The representable is built before the
+/// view has been added to a window, so `view.window` is `nil` in
+/// `makeNSView`. Hooking the AppKit lifecycle callback fires exactly
+/// once when the view actually joins the window hierarchy, which is
+/// also when the window is ready to accept chrome changes.
+struct WindowConfigurator: NSViewRepresentable {
+    let configure: (NSWindow) -> Void
+
+    func makeNSView(context: Context) -> WindowAccessorView {
+        let view = WindowAccessorView()
+        view.onAttach = configure
+        return view
+    }
+
+    func updateNSView(_ nsView: WindowAccessorView, context: Context) {}
+
+    final class WindowAccessorView: NSView {
+        var onAttach: ((NSWindow) -> Void)?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if let window = self.window {
+                onAttach?(window)
+            }
+        }
     }
 }
 

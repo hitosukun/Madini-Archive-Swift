@@ -198,12 +198,19 @@ struct ReaderHeaderActivityPill: View {
     @State private var isTitlePresented = false
 
     var body: some View {
+        // Height pinned to 26pt (not the app-wide
+        // `headerChipHeight = 30`) so the pill sits inside the
+        // toolbar at the same vertical density as the neighbouring
+        // `NSSegmentedControl` (`.regular` control size ≈ 24pt) and
+        // the share button (system toolbar button ≈ 24pt). Keeping
+        // the chip style on the sidebar controls at 30 — they live
+        // in a taller band and want the extra breathing room.
         HStack(spacing: 0) {
             titleHalf
             divider
             promptHalf
         }
-        .frame(height: WorkspaceLayoutMetrics.headerChipHeight)
+        .frame(height: 26)
         .background(
             Capsule(style: .continuous)
                 .fill(.thinMaterial)
@@ -259,7 +266,7 @@ struct ReaderHeaderActivityPill: View {
             }
             .padding(.leading, WorkspaceLayoutMetrics.headerChipHorizontalPadding)
             .padding(.trailing, 10)
-            .frame(height: WorkspaceLayoutMetrics.headerChipHeight)
+            .frame(height: 26)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -323,7 +330,7 @@ struct ReaderHeaderActivityPill: View {
             }
             .padding(.leading, 10)
             .padding(.trailing, WorkspaceLayoutMetrics.headerChipHorizontalPadding)
-            .frame(height: WorkspaceLayoutMetrics.headerChipHeight)
+            .frame(height: 26)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -663,7 +670,6 @@ struct WorkspaceFloatingExportButton: View {
                 ) {
                     chipLabel
                 }
-                .buttonStyle(.plain)
                 .help("Share conversation")
             } else {
                 // Disabled-looking placeholder while the markdown temp
@@ -673,7 +679,6 @@ struct WorkspaceFloatingExportButton: View {
                 Button {} label: {
                     chipLabel
                 }
-                .buttonStyle(.plain)
                 .disabled(true)
                 .opacity(detail == nil ? 0.4 : 0.6)
                 .help(detail == nil ? "Export as Markdown" : "Preparing…")
@@ -690,17 +695,30 @@ struct WorkspaceFloatingExportButton: View {
 
     @ViewBuilder
     private var chipLabel: some View {
-        #if os(macOS)
-        // Glass chip — matches the sort / date / outline controls so the
-        // three panes' top bars read as one family of translucent
-        // buttons. `.title3` (~20pt) icon size is shared with the
-        // calendar + viewer-mode glyphs so the icon-only chips carry
-        // visible presence against the 30pt chip height.
+        // Deliberately bare: just the SF Symbol at the standard
+        // toolbar glyph size. We let SwiftUI's default toolbar
+        // button style own the chrome around it — hover tint, press
+        // state, keyboard focus ring, and sizing all come from the
+        // system, matching every other native toolbar button in
+        // Finder / Mail / Notes.
+        //
+        // **Why no `.buttonStyle(.plain)`, no custom `.frame(...)`,
+        // no `.contentShape(...)`.** Each of those overrides a piece
+        // of the default toolbar-button chrome. `.plain` kills the
+        // hover/press tint; explicit frames shrink the click area
+        // below the system default (~28×24); `.contentShape` gates
+        // hit-testing in a way that fights the style's own target
+        // rect. Removing them all lets the button render at the
+        // exact same visual weight as a neighbouring
+        // `NSSegmentedControl` segment, which is what L1 / L3 of
+        // the low-risk pass asked for.
+        //
+        // `.font(.body.weight(.regular))` pins the glyph to the
+        // toolbar body size (~15pt). Without it the symbol
+        // occasionally picked up an inherited smaller font from the
+        // ShareLink ancestor and read thin next to the segmented
+        // control images.
         Image(systemName: "square.and.arrow.up")
-            .font(.title3.weight(.semibold))
-            .headerIconChipStyle()
-        #else
-        Image(systemName: "square.and.arrow.up")
-        #endif
+            .font(.body.weight(.regular))
     }
 }
