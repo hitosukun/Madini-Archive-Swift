@@ -150,6 +150,22 @@ struct ConversationTableView: View {
         .onChange(of: sortOrder) { _, newValue in
             persistSortOrder(newValue)
         }
+        // Title-pulldown "reveal active conversation" hook. The default
+        // card list observes the same `pendingListScrollConversationID`
+        // and calls `proxy.scrollTo(id)`; SwiftUI `Table` doesn't expose
+        // a scroll proxy, but updating the `selection` set to the
+        // target id has the same user-visible effect — Table auto-
+        // scrolls the selected row into view and the row gets the
+        // standard selection highlight, which also carries the "you are
+        // here" semantics. Clear the pending id on a follow-up runloop
+        // turn so re-firing the same id still triggers the observer.
+        .onChange(of: viewModel.pendingListScrollConversationID) { _, newValue in
+            guard let id = newValue else { return }
+            selection = [id]
+            Task { @MainActor in
+                viewModel.pendingListScrollConversationID = nil
+            }
+        }
         // Bulk-load every conversation passing the current filters.
         // The normal `List` view pages in 100-at-a-time via a tail-cell
         // `.onAppear` trigger, but SwiftUI `Table` doesn't mount rows

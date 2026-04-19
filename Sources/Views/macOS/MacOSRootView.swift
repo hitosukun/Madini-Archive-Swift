@@ -405,6 +405,7 @@ struct MacOSRootView: View {
                     // the reader-tab lifecycle in one place.
                     libraryViewModel.selectedConversationId = id
                 },
+                onTitlePulldownOpen: revealActiveConversationInMiddlePane,
                 onDoubleTapBlankArea: scrollAllPanesToTop
             )
             // Same rationale as the pane contents: each column ignores
@@ -431,6 +432,23 @@ struct MacOSRootView: View {
             viewMode: $viewMode,
             canEnterViewer: tabManager.activeTab != nil
         )
+    }
+
+    /// Reveal the currently-active conversation in whichever middle-pane
+    /// representation is mounted (default card list OR table view). Fires
+    /// when the title pulldown opens, so the underlying pane scrolls to
+    /// the same row the pulldown highlights — the user sees "you are
+    /// here" in both surfaces simultaneously.
+    ///
+    /// Both panes observe `pendingListScrollConversationID`:
+    ///   * Default list: scrolls the `List` to the matching row.
+    ///   * Table: sets `selection = [id]`, which auto-scrolls the row
+    ///     into view AND carries the table-row selection highlight.
+    /// `revealConversation(id:)` also pages in additional rows if the
+    /// target id has fallen off the currently-loaded window.
+    private func revealActiveConversationInMiddlePane() {
+        guard let id = tabManager.activeTab?.conversationID else { return }
+        Task { await libraryViewModel.revealConversation(id: id) }
     }
 
     /// Double-tap on the unified top bar's blank chrome → snap each
@@ -893,7 +911,11 @@ private struct UnifiedLibrarySidebar: View {
 
     private var archiveTint: Color {
         switch dataSource {
-        case .database: .green
+        // Brown matches the per-source-file rows nested directly under
+        // this row (see `SidebarCheckboxRow(tint: .brown)` below) so the
+        // storage drive and the JSON files inside it read as one
+        // colour-coded import family.
+        case .database: .brown
         case .mock: .orange
         }
     }

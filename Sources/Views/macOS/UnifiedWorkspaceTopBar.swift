@@ -40,6 +40,10 @@ struct UnifiedWorkspaceTopBar: View {
     /// to `ReaderHeaderActivityPill` and called from the pulldown's
     /// peer rows.
     let onSelectConversation: (String) -> Void
+    /// Fires when the title pulldown opens. Parent uses it to reveal
+    /// the active conversation in the underlying middle pane (scroll
+    /// the card list to it / select + scroll the table to it).
+    let onTitlePulldownOpen: () -> Void
     /// Double-tap on the bar's blank area → scroll panes back to the
     /// top. Window chrome convention (matches macOS app titlebars and
     /// browser tab bars where double-clicking blank chrome jumps to
@@ -92,7 +96,8 @@ struct UnifiedWorkspaceTopBar: View {
                     tabManager.requestPromptSelection(id)
                 },
                 conversations: conversations,
-                onSelectConversation: onSelectConversation
+                onSelectConversation: onSelectConversation,
+                onTitlePulldownOpen: onTitlePulldownOpen
             )
 
             // Share button — always present. In table mode there's no

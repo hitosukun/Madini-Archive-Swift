@@ -198,6 +198,13 @@ struct ReaderHeaderActivityPill: View {
     /// to `selectedConversationId =` which fans out via
     /// `MacOSRootView.onChange` into the tab-manager open path.
     let onSelectConversation: (String) -> Void
+    /// Fires when the title pulldown is opened. The parent uses this to
+    /// reveal the active conversation in the underlying middle pane —
+    /// scroll the card list to it, or select + scroll the table to it.
+    /// Driven from the popover's `.task`, not the button's tap action,
+    /// so single-shot reveals fire even if the user closes and reopens
+    /// the pulldown without ever tapping a row.
+    let onTitlePulldownOpen: () -> Void
 
     @State private var isOutlinePresented = false
     @State private var isTitlePresented = false
@@ -276,7 +283,8 @@ struct ReaderHeaderActivityPill: View {
                 onSelect: { id in
                     onSelectConversation(id)
                     isTitlePresented = false
-                }
+                },
+                onAppear: onTitlePulldownOpen
             )
         }
         .help("会話・プロンプトに移動")
@@ -395,6 +403,7 @@ private struct ConversationListPopover: View {
     let conversations: [ConversationSummary]
     let activeConversationID: String?
     let onSelect: (String) -> Void
+    let onAppear: () -> Void
 
     private let popoverWidth: CGFloat = 360
     private let popoverMaxHeight: CGFloat = 440
@@ -414,16 +423,27 @@ private struct ConversationListPopover: View {
                     }
                 }
             }
-            .onAppear {
-                // Same deferral as `PromptOutlinePopover.onAppear` —
-                // `LazyVStack` rows aren't materialized synchronously on
-                // first display, so an immediate `scrollTo` can land on
-                // the wrong row (it scrolls to where the row WILL be
-                // rather than where it lands once measured).
+            .task {
+                // Reveal the active card in the underlying middle pane
+                // (so the user can see it both inside the pulldown AND
+                // in the list/table behind it).
+                onAppear()
+                // Anchor the popover's own scroll on the active row.
+                // `.onAppear` + `DispatchQueue.main.async` proved
+                // unreliable — SwiftUI's popover content doesn't fully
+                // measure until at least one runloop turn after first
+                // appear, AND `LazyVStack` rows for off-screen children
+                // aren't materialized yet, so `proxy.scrollTo` would
+                // either no-op or land on the wrong row. Sleeping ~80ms
+                // before the call gives both layout and lazy
+                // materialization time to settle; a second pass after
+                // another short sleep covers cases where the first
+                // scroll bounced because rows were still resolving.
                 guard let activeConversationID else { return }
-                DispatchQueue.main.async {
-                    proxy.scrollTo(activeConversationID, anchor: .center)
-                }
+                try? await Task.sleep(nanoseconds: 80_000_000)
+                proxy.scrollTo(activeConversationID, anchor: .center)
+                try? await Task.sleep(nanoseconds: 80_000_000)
+                proxy.scrollTo(activeConversationID, anchor: .center)
             }
         }
         .frame(width: popoverWidth)
