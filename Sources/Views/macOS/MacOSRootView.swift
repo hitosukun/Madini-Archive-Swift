@@ -135,8 +135,8 @@ struct MacOSRootView: View {
         // tears down the viewer-pane detail fetch and triggers the
         // reveal-active-card scroll on entry into Viewer Mode.
         .onChange(of: viewMode) { old, new in
-            let wasReading = old == .viewer || old == .hidden
-            let isReading = new == .viewer || new == .hidden
+            let wasReading = old == .viewer || old == .focus
+            let isReading = new == .viewer || new == .focus
             if !wasReading && isReading {
                 if let id = tabManager.activeTab?.conversationID {
                     Task { await libraryViewModel.loadViewerConversation(id: id) }
@@ -151,12 +151,12 @@ struct MacOSRootView: View {
             // `pendingListScrollConversationID` off the view model, so
             // `revealConversation(id:)` routes to whichever list just
             // mounted — and pages in the target row if it had fallen
-            // off the currently-loaded window. `.hidden` is skipped
+            // off the currently-loaded window. `.focus` is skipped
             // because there's no list to scroll. For `.viewer` the
             // active id lives on the reader tab; for the other two it
             // lives on `selectedConversationId`, so we pick whichever
             // is non-nil (both should usually be set).
-            if old != new && new != .hidden {
+            if old != new && new != .focus {
                 let activeID = libraryViewModel.selectedConversationId
                     ?? tabManager.activeTab?.conversationID
                 if let id = activeID {
@@ -168,7 +168,7 @@ struct MacOSRootView: View {
         // with whichever tab is active in the reader. (Outside reading
         // modes this is a no-op — the list doesn't read `viewer*` state.)
         .onChange(of: tabManager.activeTab?.conversationID) { _, newID in
-            guard viewMode == .viewer || viewMode == .hidden,
+            guard viewMode == .viewer || viewMode == .focus,
                   let newID else { return }
             Task { await libraryViewModel.loadViewerConversation(id: newID) }
             // Viewer mode: keep the middle-pane list pinned to whichever
@@ -352,13 +352,13 @@ struct MacOSRootView: View {
                 // values in this mode so the table absorbs all available
                 // horizontal space.
                 .navigationSplitViewColumnWidth(
-                    min: viewMode == .hidden ? 0
+                    min: viewMode == .focus ? 0
                         : viewMode == .table ? WorkspaceLayoutMetrics.contentMinWidth
                         : WorkspaceLayoutMetrics.contentMinWidth,
-                    ideal: viewMode == .hidden ? 0
+                    ideal: viewMode == .focus ? 0
                         : viewMode == .table ? 1200
                         : WorkspaceLayoutMetrics.contentIdealWidth,
-                    max: viewMode == .hidden ? 0
+                    max: viewMode == .focus ? 0
                         : viewMode == .table ? .infinity
                         : WorkspaceLayoutMetrics.contentMaxWidth
                 )
@@ -475,7 +475,7 @@ struct MacOSRootView: View {
                     tabManager: tabManager,
                     onExitTableMode: { viewMode = .default }
                 )
-            } else if viewMode == .hidden {
+            } else if viewMode == .focus {
                 // Focus sub-mode: middle column is collapsed via
                 // `columnVisibility = .detailOnly`, but macOS's 3-column
                 // NavigationSplitView can still fleetingly render this
@@ -1099,6 +1099,27 @@ private struct UnifiedConversationListView: View {
                         viewModel.pendingListScrollConversationID = nil
                     }
                 }
+                // Scroll-on-mount: when this list appears (e.g. after
+                // a mode switch into `.default`), land on the active
+                // card immediately. The `.onChange` above only fires
+                // for *changes* after mount — if `revealConversation`
+                // had already set `pendingListScrollConversationID`
+                // before this view even existed, the scroll request
+                // would be silently lost. Reading on mount closes that
+                // race. Consumes the token so subsequent external
+                // reveals still fire through `.onChange`.
+                .task {
+                    let id = viewModel.pendingListScrollConversationID
+                        ?? viewModel.selectedConversationId
+                    guard let id else { return }
+                    try? await Task.sleep(nanoseconds: 40_000_000)
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        proxy.scrollTo(id, anchor: .top)
+                    }
+                    if viewModel.pendingListScrollConversationID == id {
+                        viewModel.pendingListScrollConversationID = nil
+                    }
+                }
                 } // ScrollViewReader
             }
         }
@@ -1173,39 +1194,90 @@ private struct SearchSavedFiltersSection: View {
     }
 }
 
-/// Finder-style segmented picker mounted as an `NSToolbarItem` in the
-/// window title bar (`MacOSRootView.workspaceSplitView`'s `.toolbar`).
-/// Four glyph segments — テーブル / デフォルト / ビューアー / フォーカス —
-/// matching the ordering of `MiddlePaneMode`'s cascade left-to-right so the
-/// control reads the same way the trackpad swipe feels. Always visible
-/// across all four modes; no disabled states — the cascade accepts any
-/// target, and writing a mode with no active conversation just lands
-/// the user in an empty reader pane, same as the swipe path.
+/// Custom segmented control for the middle-pane mode cascade, mounted
+/// as an `NSToolbarItem` in the window title bar
+/// (`MacOSRootView.workspaceSplitView`'s `.toolbar`). Four glyph
+/// segments — テーブル / デフォルト / ビューアー / フォーカス — matching
+/// the ordering of `MiddlePaneMode`'s cascade left-to-right so the
+/// control reads the same way the trackpad swipe feels.
 ///
-/// Rendered with `.pickerStyle(.segmented)` so macOS paints the
-/// standard segment chrome + selection highlight — this is the whole
-/// point of the "use Finder's familiar design" user ask, we just lean
-/// on the built-in segmented control rather than rolling our own.
-/// Not private: mounted into the native window toolbar's
-/// `.primaryAction` slot by `MacOSRootView.workspaceSplitView`. The
-/// trailing placement is visible in every mode — including `.table`
-/// (right pane collapsed) and `.hidden` (middle pane collapsed) —
-/// because the window toolbar spans the full width regardless of
-/// column visibility.
+/// **Why not `Picker(.segmented)`**: the native segmented picker runs
+/// an internal AppKit press+selection animation that delays the
+/// `selection` binding write by roughly a frame, making direct clicks
+/// feel measurably heavier than the trackpad-swipe path (which writes
+/// the binding from an `NSEvent` monitor with no intermediary). Users
+/// reported this as "picker is heavier than swipe, especially when
+/// jumping back to `.table`". Rolling our own buttons on top of the
+/// shared `HeaderChipBackground` lets the click path skip that
+/// animation — a `Button` action mutates the binding on the same
+/// runloop turn the tap lands on — while keeping the visual family of
+/// the rest of the toolbar chrome (same thin-material fill, same
+/// capsule rim as the sort menu and date picker).
+///
+/// Always visible across all four modes; no disabled states — the
+/// cascade accepts any target, and writing a mode with no active
+/// conversation just lands the user in an empty reader pane, same as
+/// the swipe path.
+///
+/// Mounted into the native window toolbar's `.primaryAction` slot by
+/// `MacOSRootView.workspaceSplitView`. The trailing placement is
+/// visible in every mode — including `.table` (right pane collapsed)
+/// and `.focus` (middle pane collapsed) — because the window toolbar
+/// spans the full width regardless of column visibility.
 struct MiddlePaneModePicker: View {
     @Binding var selection: MiddlePaneMode
 
     var body: some View {
-        Picker("View Mode", selection: $selection) {
+        HStack(spacing: 2) {
             ForEach(MiddlePaneMode.allCases) { mode in
-                Image(systemName: mode.systemImage)
-                    .help(mode.displayName)
-                    .tag(mode)
+                segmentButton(for: mode)
             }
         }
-        .pickerStyle(.segmented)
-        .labelsHidden()
+        .padding(2)
+        .background(
+            Capsule(style: .continuous)
+                .fill(Color.primary.opacity(0.06))
+        )
+        .overlay(
+            Capsule(style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+        )
         .help("ビュー切替")
+    }
+
+    private func segmentButton(for mode: MiddlePaneMode) -> some View {
+        let isSelected = selection == mode
+        return Button {
+            // Skip animation on the state write so the view-tree swap
+            // happens on the click's own runloop turn. The downstream
+            // `.onChange(of: viewMode)` observers still run normally —
+            // only the visual crossfade is disabled, which is the bit
+            // that made the picker feel laggy vs. swipe.
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                selection = mode
+            }
+        } label: {
+            Image(systemName: mode.systemImage)
+                .font(.subheadline.weight(.semibold))
+                .frame(width: 32, height: 22)
+                .foregroundStyle(isSelected ? Color.primary : Color.secondary)
+                .background(
+                    Capsule(style: .continuous)
+                        .fill(isSelected ? Color(nsColor: .controlBackgroundColor) : .clear)
+                )
+                .overlay(
+                    Capsule(style: .continuous)
+                        .strokeBorder(
+                            isSelected ? Color.primary.opacity(0.12) : .clear,
+                            lineWidth: 0.5
+                        )
+                )
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .help(mode.displayName)
     }
 }
 

@@ -32,7 +32,7 @@ import AppKit
 /// The per-gesture fire lock inside `SwipeScrollMonitor` keeps a single
 /// deliberate trackpad swipe from skipping past the mode the user
 /// wanted. The `MiddlePaneMode` transitions themselves are idempotent at the
-/// cascade ends (`.stepTowardHidden` on `.hidden` stays `.hidden`, same
+/// cascade ends (`.stepTowardFocus` on `.focus` stays `.focus`, same
 /// for `.table`), so over-swiping never boots the user out of a mode.
 ///
 /// **Thresholds — why these numbers.**
@@ -91,7 +91,7 @@ import AppKit
 struct ViewerModeSwipeGesture: ViewModifier {
     /// Single source of truth for the mode cascade. Reads the current
     /// mode to decide the next step; writes the one-step transition
-    /// back atomically. See `MiddlePaneMode.stepTowardHidden` /
+    /// back atomically. See `MiddlePaneMode.stepTowardFocus` /
     /// `stepTowardOverview` for the cascade mechanics.
     ///
     /// (The historical name `viewMode` is preserved here as the
@@ -130,7 +130,7 @@ struct ViewerModeSwipeGesture: ViewModifier {
                         return
                     }
                     if dx < 0 {
-                        viewMode = viewMode.stepTowardHidden(canEnterViewer: canEnterViewer)
+                        viewMode = viewMode.stepTowardFocus(canEnterViewer: canEnterViewer)
                     } else {
                         viewMode = viewMode.stepTowardOverview()
                     }
@@ -256,7 +256,7 @@ private struct SwipeScrollMonitor: NSViewRepresentable {
             // moving LEFT produce NEGATIVE dx. We map "fingers left" →
             // one step toward the hidden / single-pane end (sidebar
             // and middle pane peel off leftward), so:
-            //   dx < 0  →  stepTowardHidden
+            //   dx < 0  →  stepTowardFocus
             //   dx > 0  →  stepTowardOverview
             // Users who flipped natural scrolling off get the inverted
             // mapping for free, which still matches their finger
@@ -274,7 +274,7 @@ private struct SwipeScrollMonitor: NSViewRepresentable {
                 guard let self else { return }
                 let current = self.binding.wrappedValue
                 let next = towardHidden
-                    ? current.stepTowardHidden(canEnterViewer: self.canEnterViewer)
+                    ? current.stepTowardFocus(canEnterViewer: self.canEnterViewer)
                     : current.stepTowardOverview()
                 if next != current {
                     self.binding.wrappedValue = next

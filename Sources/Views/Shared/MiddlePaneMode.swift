@@ -4,13 +4,13 @@ import SwiftUI
 /// **middle pane**. Per the three-pane architecture, the segment picker
 /// in the top bar selects a representation of the SQL database for the
 /// middle pane to render — left and right pane behavior is unaffected
-/// by this enum (modulo the `.hidden` case which collapses the middle
+/// by this enum (modulo the `.focus` case which collapses the middle
 /// column entirely).
 ///
 /// The four modes are ordered as a single cascade the user moves
 /// through left-to-right via the toolbar picker or trackpad swipe:
 ///
-///   `.table` → `.default` → `.viewer` → `.hidden`
+///   `.table` → `.default` → `.viewer` → `.focus`
 ///
 /// Replaces the three independent `is*Active: Bool` flags
 /// `MacOSRootView` used to juggle, which permitted contradictory
@@ -34,7 +34,7 @@ enum MiddlePaneMode: String, CaseIterable, Identifiable, Hashable {
     /// Middle pane collapsed to zero width: both sidebar and middle
     /// pane disappear, the prompt outline moves to a pulldown on the
     /// top toolbar, and the reader alone occupies the content area.
-    case hidden
+    case focus
 
     var id: String { rawValue }
 
@@ -44,7 +44,7 @@ enum MiddlePaneMode: String, CaseIterable, Identifiable, Hashable {
         case .table: return "テーブル"
         case .default: return "デフォルト"
         case .viewer: return "ビューアー"
-        case .hidden: return "フォーカス"
+        case .focus: return "フォーカス"
         }
     }
 
@@ -57,11 +57,11 @@ enum MiddlePaneMode: String, CaseIterable, Identifiable, Hashable {
         case .table: return "tablecells"
         case .default: return "rectangle.split.3x1"
         case .viewer: return "book.pages"
-        case .hidden: return "doc.plaintext"
+        case .focus: return "doc.plaintext"
         }
     }
 
-    /// Cascade neighbor one step toward the hidden / single-pane end
+    /// Cascade neighbor one step toward the focus / single-pane end
     /// (LEFT swipe on a natural-scrolling trackpad). Returns `self` at
     /// the end of the cascade so an over-swipe is idempotent rather
     /// than dropping the user out of the mode they're in.
@@ -69,21 +69,21 @@ enum MiddlePaneMode: String, CaseIterable, Identifiable, Hashable {
     /// `canEnterViewer` gates the `.default → .viewer` step — no
     /// active conversation means there's nothing to focus on, so the
     /// step short-circuits.
-    func stepTowardHidden(canEnterViewer: Bool) -> MiddlePaneMode {
+    func stepTowardFocus(canEnterViewer: Bool) -> MiddlePaneMode {
         switch self {
         case .table: return .default
         case .default: return canEnterViewer ? .viewer : .default
-        case .viewer: return .hidden
-        case .hidden: return .hidden
+        case .viewer: return .focus
+        case .focus: return .focus
         }
     }
 
     /// Cascade neighbor one step toward overview (RIGHT swipe).
     /// Returns `self` at the `.table` end so over-swiping is
-    /// idempotent, mirroring `stepTowardHidden`.
+    /// idempotent, mirroring `stepTowardFocus`.
     func stepTowardOverview() -> MiddlePaneMode {
         switch self {
-        case .hidden: return .viewer
+        case .focus: return .viewer
         case .viewer: return .default
         case .default: return .table
         case .table: return .table

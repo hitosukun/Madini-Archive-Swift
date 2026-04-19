@@ -166,6 +166,30 @@ struct ConversationTableView: View {
                     viewModel.pendingListScrollConversationID = nil
                 }
             }
+            // Scroll-on-mount: if this table appears while a
+            // conversation is already selected (e.g. the user switched
+            // from `.default` → `.table` on a card they were reading),
+            // land on that row with selection highlight. The
+            // `.onChange` above only fires for changes *after* mount;
+            // if the reveal token was raised before this view
+            // materialized (which is the common race on mode switch)
+            // the scroll request would go unheard. Sleep a bit longer
+            // than the other lists because the bulk load in the
+            // `.task(id:)` below runs concurrently — the row we want
+            // may not be realized yet in the first few ticks.
+            .task {
+                let id = viewModel.pendingListScrollConversationID
+                    ?? viewModel.selectedConversationId
+                guard let id else { return }
+                try? await Task.sleep(nanoseconds: 120_000_000)
+                selection = [id]
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    proxy.scrollTo(id, anchor: .center)
+                }
+                if viewModel.pendingListScrollConversationID == id {
+                    viewModel.pendingListScrollConversationID = nil
+                }
+            }
             // Bulk-load every conversation passing the current filters.
             // The normal `List` view pages in 100-at-a-time via a
             // tail-cell `.onAppear` trigger, but SwiftUI `Table` doesn't
