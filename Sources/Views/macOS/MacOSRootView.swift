@@ -571,7 +571,6 @@ private struct UnifiedLibrarySidebar: View {
                         activeFilterChips: viewModel.activeFilterChips,
                         onClearChip: viewModel.clearFilterChip
                     )
-                    .frame(minHeight: WorkspaceLayoutMetrics.headerBarContentRowHeight)
 
                     HStack(spacing: WorkspaceLayoutMetrics.headerBarInteriorSpacing) {
                         LibraryListSortMenu(viewModel: viewModel)
