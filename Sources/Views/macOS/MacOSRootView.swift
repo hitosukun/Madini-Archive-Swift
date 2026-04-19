@@ -440,7 +440,15 @@ struct MacOSRootView: View {
                 MiddlePaneModePicker(selection: $viewMode)
             }
         }
-        .toolbarBackground(.automatic, for: .windowToolbar)
+        // `.toolbarBackground(.automatic, for: .windowToolbar)`
+        // intentionally omitted for this diagnostic pass. Hypothesis:
+        // the dark strip at the sidebar's top edge (reported on
+        // maximize) is the window toolbar's own background layer, not
+        // app padding. With no explicit toolbarBackground call the
+        // window falls back to SwiftUI's implicit chrome — if the
+        // strip changes / disappears, we treat it as the chrome layer
+        // and address it by fitting the sidebar's top to it (not by
+        // trying to hide the chrome or by touching NSWindow).
         // Trackpad / mouse swipe → toggle Viewer Mode. Lives on the
         // workspace split view (not on a single pane) so the gesture
         // works regardless of which pane the user happens to be over,
