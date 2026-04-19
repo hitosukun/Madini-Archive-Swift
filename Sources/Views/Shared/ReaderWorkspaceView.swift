@@ -220,15 +220,18 @@ struct ReaderHeaderActivityPill: View {
         // for source compatibility but no longer fires — there is no
         // reliable Menu-open hook without dropping into AppKit.
         //
-        // Width behavior: no `.fixedSize()` on the segments, so
-        // SwiftUI can compress the breadcrumb when the window is
-        // narrow. Each segment has a 40pt floor (so a segment never
-        // shrinks to zero and vanishes) and a 160pt ceiling (where
-        // truncation kicks in). Thread has higher `layoutPriority`
-        // than prompt, so the primary axis is the last thing to
-        // compress. The counter sits outside the capsule and is
-        // allowed to be pushed out of view entirely on very narrow
-        // windows — that's fine, it's ancillary.
+        // Width behavior: segments use FIXED widths (thread 120pt,
+        // prompt 80pt) with `.fixedSize()` so the pill reports a
+        // stable intrinsic size to the window toolbar. Flexible
+        // min/max widths caused the principal toolbar item to be
+        // dropped entirely on narrow windows — SwiftUI's principal
+        // placement doesn't soft-fit oversized items, and an
+        // indeterminate width seemed to push the same overflow path.
+        // Pinning a modest fixed footprint (~220pt total pill) keeps
+        // the item visible across every usable window size; long
+        // titles truncate with tail ellipsis inside each segment.
+        // The counter sibling has no fixed width and is allowed to
+        // be clipped out on very narrow windows.
         HStack(spacing: 8) {
             HStack(spacing: 2) {
                 threadMenu
@@ -279,14 +282,14 @@ struct ReaderHeaderActivityPill: View {
                 .foregroundStyle(activeDetail == nil ? .secondary : .primary)
                 .lineLimit(1)
                 .truncationMode(.tail)
-                .frame(minWidth: 40, maxWidth: 160, alignment: .leading)
+                .frame(width: 120, alignment: .leading)
                 .padding(.horizontal, 6)
                 .frame(height: 22)
                 .contentShape(Rectangle())
         }
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
-        .layoutPriority(2)
+        .fixedSize()
         .disabled(activeDetail == nil && conversations.isEmpty)
         .help("会話を切り替え")
     }
@@ -312,14 +315,14 @@ struct ReaderHeaderActivityPill: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .truncationMode(.tail)
-                .frame(minWidth: 40, maxWidth: 160, alignment: .leading)
+                .frame(width: 80, alignment: .leading)
                 .padding(.horizontal, 6)
                 .frame(height: 22)
                 .contentShape(Rectangle())
         }
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
-        .layoutPriority(1)
+        .fixedSize()
         .disabled(promptOutline.isEmpty)
         .help("プロンプトを切り替え")
     }
