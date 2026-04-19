@@ -460,6 +460,93 @@ final class LibraryViewModel {
         }
     }
 
+    /// Page through the entire current filtered set in one go so the
+    /// table view can render every row without relying on the infinite-
+    /// scroll trigger. The normal list view pulls the next page from a
+    /// `.onAppear` on the tail-most cell, which never fires when the
+    /// container is a `SwiftUI.Table` (rows aren't mounted the same way
+    /// as a `List`). Bulk-loading sidesteps that entirely — the user
+    /// asked for "全部表示" in the table, so we pay the up-front fetch.
+    ///
+    /// Always begins with a fresh `reload()` so the bulk walk starts
+    /// from the FIRST page of the CURRENT filter/sort. Without this,
+    /// the bulk walk raced the debounced `reloadNow()` that sidebar
+    /// checkbox clicks schedule: `reloadNow()` would replace
+    /// `conversations` with the new filter's first page while we
+    /// were paging against the OLD filter, and the table ended up
+    /// showing only the most-recent page (the reported "両方
+    /// チェックしてるのに片方しか出てこない" symptom — claude rows
+    /// existed but lived past the first page so they never loaded
+    /// when the gpt-4o filter was added on top).
+    ///
+    /// Snapshots `(filter, sortKey)` on entry and bails if either
+    /// changes mid-walk; the next caller (driven by the table view's
+    /// `.task(id:)` modifier) will restart the walk against the new
+    /// filter.
+    func loadAllConversations() async {
+        // Serialize concurrent callers. SwiftUI may fire the table
+        // view's `.task(id:)` again before a previous walk has
+        // settled — wait for the in-flight walk to release
+        // `isLoadingMore` before claiming it ourselves so we don't
+        // double-write the conversations array.
+        while isLoadingMore {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+
+        // Cancels any pending debounced reload and runs `reloadNow()`
+        // synchronously, so `conversations` / `totalCount` /
+        // `hasMorePages` reflect the current filter's first page
+        // before we decide how many more to walk.
+        await reload()
+
+        let snapshotFilter = filter
+        let snapshotSort = sortKey
+
+        guard hasMorePages else { return }
+        isLoadingMore = true
+        defer { isLoadingMore = false }
+
+        // Unbounded loop with a hard sanity cap (totalCount is known
+        // upfront, so ceiling = ceil(total/pageSize) + a small margin).
+        // Empty page with `hasMorePages` still true means a totalCount
+        // mismatch — bail rather than spin.
+        let maxIterations = max(1, (totalCount / pageSize) + 2)
+        var iterations = 0
+        while hasMorePages, iterations < maxIterations {
+            // Filter / sort changed since we started the walk — discard
+            // the rest. The new `.task(id:)` invocation will restart.
+            guard filter == snapshotFilter, sortKey == snapshotSort else {
+                return
+            }
+            iterations += 1
+            do {
+                let nextPage = try await fetchPage(offset: conversations.count)
+                // Recheck after the suspension: a parallel `reloadNow()`
+                // may have replaced `conversations` while we awaited
+                // GRDB. If filter/sort still match, the offset is still
+                // valid; if not, drop the page and let the new walk
+                // take over.
+                guard filter == snapshotFilter, sortKey == snapshotSort else {
+                    return
+                }
+                if nextPage.isEmpty {
+                    hasMorePages = false
+                    break
+                }
+                conversations.append(contentsOf: nextPage)
+                hasMorePages = conversations.count < totalCount
+                await refreshConversationTags(for: nextPage.map(\.id), replace: false)
+            } catch is CancellationError {
+                // `.task(id:)` cancelled us in favor of a fresh walk —
+                // exit silently so we don't surface a phantom error.
+                return
+            } catch {
+                errorText = error.localizedDescription
+                return
+            }
+        }
+    }
+
     func summary(for conversationID: String?) -> ConversationSummary? {
         guard let conversationID else {
             return nil

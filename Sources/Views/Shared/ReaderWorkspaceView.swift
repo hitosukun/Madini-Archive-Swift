@@ -6,22 +6,13 @@ import AppKit
 struct ReaderWorkspaceView: View {
     @Bindable var tabManager: ReaderTabManager
     let repository: any ConversationRepository
-    /// Binding to the parent's Viewer Mode state. The reader-pane toolbar
-    /// carries the toggle button; flipping it from here is what drives the
-    /// middle-pane swap and the sidebar auto-collapse (wired up in
-    /// `MacOSRootView`). Passed as a binding rather than an observed
-    /// object so the source of truth stays in the root view — only one
-    /// place needs to persist/restore column visibility.
-    @Binding var isViewerModeActive: Bool
-    /// Invoked when the user taps the header-bar conversation title.
-    /// Parent (MacOSRootView) is expected to scroll the middle-pane list
-    /// so that the active conversation's card is at the top; this view
-    /// separately rotates `tabManager.scrollToTopToken` to snap the
-    /// reader body back to its header. Split across two sinks because
-    /// the list lives on `LibraryViewModel` and the reader lives on
-    /// `ReaderTabManager` — the parent is the only place that holds
-    /// references to both.
-    var onRevealActiveConversationInList: (() -> Void)? = nil
+    /// Reserved room above the first line of reader content. The
+    /// window-spanning `UnifiedWorkspaceTopBar` floats above this pane
+    /// (mounted at the NavigationSplitView level in `MacOSRootView`) and
+    /// its measured height is passed in here so rows can slide under
+    /// the bar and get blurred by its vibrancy material — the local
+    /// reader-pane header bar that used to live here has been removed.
+    var topContentInset: CGFloat = WorkspaceLayoutMetrics.headerBarContentRowHeight
 
     // `selectedPromptID` lives on `tabManager` (see its doc comment) so
     // the viewer-mode middle pane can observe the same reading position
@@ -30,9 +21,9 @@ struct ReaderWorkspaceView: View {
     // re-hoist it back to `@State` here, that reintroduces the
     // "PromptTopYPreferenceKey updated multiple times per frame" warning.
 
-    /// `activeDetail` and `promptOutline` now live on `tabManager` (they
-    /// have to be readable from the root-level Viewer-Mode toolbar, which
-    /// can't reach into this view's `@State`). See their doc comments in
+    /// `activeDetail` and `promptOutline` live on `tabManager` (they
+    /// have to be readable from the unified top bar, which can't reach
+    /// into this view's `@State`). See their doc comments in
     /// `ReaderTabManager`. This view still writes to them via the
     /// `onDetailChanged` / `onPromptOutlineChanged` callbacks below.
     /// Display mode (rendered vs. plain) for the currently-open conversation.
@@ -41,11 +32,6 @@ struct ReaderWorkspaceView: View {
     /// view of whatever card was just clicked and re-inheriting a prior
     /// mode across unrelated conversations is surprising.
     @State private var displayModes: [ReaderTab.ID: ConversationDetailView.DetailDisplayMode] = [:]
-    /// Measured height of the floating reader-pane header bar (outline
-    /// control + export). Threaded into the inner ScrollView via the
-    /// `scrollTopContentInset` environment so rows can slide under the
-    /// translucent bar and get blurred by its vibrancy material.
-    @State private var headerBarHeight: CGFloat = WorkspaceLayoutMetrics.headerBarContentRowHeight
     @FocusState private var workspaceFocused: Bool
 
     var body: some View {
@@ -135,48 +121,18 @@ struct ReaderWorkspaceView: View {
         // Inject the measured header-bar height so descendants (notably
         // `ConversationDetailView`'s inner ScrollView) can reserve
         // top-of-content room without having the bar take that space out
-        // of their scrollable region. Same rationale as the middle pane.
-        .environment(\.scrollTopContentInset, headerBarHeight)
+        // of their scrollable region. The bar itself is mounted on the
+        // root `workspaceSplitView`, so its height arrives here as a
+        // parameter from `MacOSRootView` instead of being measured in
+        // this view directly.
+        .environment(\.scrollTopContentInset, topContentInset)
         // Fade message content as it scrolls up under the floating
-        // toolbar strip. Same technique as the middle pane — see
-        // MacOSRootView.libraryContentPane. Applied before the header
-        // overlay so the toolbar chrome itself stays crisp.
-        .topFadeMask(height: WorkspaceLayoutMetrics.topFadeHeight)
-        // Overlay (not safeAreaInset) — see MacOSRootView.libraryContentPane
-        // for the rationale. The short version: we want rows to scroll
-        // UNDER the bar so its material can blur them.
-        //
-        // Viewer Mode: the header bar is HIDDEN in this pane because
-        // the root view paints a single window-spanning toolbar above
-        // both middle + right panes instead (see
-        // `MacOSRootView.viewerModeTopToolbar`). Keeping our own header
-        // here in Viewer Mode would produce two toolbars stacked
-        // awkwardly on top of each other.
-        .overlay(alignment: .top) {
-            if !isViewerModeActive {
-                ReaderWorkspaceHeaderBar(
-                    activeDetail: tabManager.activeDetail,
-                    promptOutline: tabManager.promptOutline,
-                    selectedPromptID: tabManager.selectedPromptID,
-                    isViewerModeActive: $isViewerModeActive,
-                    onSelectPrompt: selectPrompt,
-                    onTapTitle: handleTitleTap
-                ) {
-                    WorkspaceFloatingExportButton(detail: tabManager.activeDetail)
-                }
-                .background(
-                    GeometryReader { proxy in
-                        Color.clear.preference(
-                            key: HeaderBarHeightPreferenceKey.self,
-                            value: proxy.size.height
-                        )
-                    }
-                )
-            }
-        }
-        .onPreferenceChange(HeaderBarHeightPreferenceKey.self) { newHeight in
-            headerBarHeight = newHeight
-        }
+        // toolbar strip AND off the bottom edge. Same technique as the
+        // middle pane — see MacOSRootView.libraryContentPane.
+        .edgeFadeMask(
+            top: WorkspaceLayoutMetrics.topFadeHeight,
+            bottom: WorkspaceLayoutMetrics.bottomFadeHeight
+        )
     }
 
     private func displayModeBinding(for tab: ReaderTab) -> Binding<ConversationDetailView.DetailDisplayMode> {
@@ -184,24 +140,6 @@ struct ReaderWorkspaceView: View {
             get: { displayModes[tab.id] ?? .rendered },
             set: { displayModes[tab.id] = $0 }
         )
-    }
-
-    private func selectPrompt(_ promptID: String) {
-        tabManager.selectedPromptID = promptID
-        workspaceFocused = true
-    }
-
-    /// Conversation-title tap in the header bar. Fires the middle-pane
-    /// reveal callback (provided by the root view, which has a handle on
-    /// the `LibraryViewModel` holding the list's scroll request) and
-    /// rotates the reader-body scroll-to-top token so the right pane
-    /// snaps back to the conversation's `ConversationHeaderView`. Only
-    /// meaningful when there's an active tab.
-    private func handleTitleTap() {
-        guard tabManager.activeTab != nil else { return }
-        onRevealActiveConversationInList?()
-        tabManager.scrollToTopToken = UUID()
-        workspaceFocused = true
     }
 
     private func handleMoveCommand(_ direction: MoveCommandDirection) {
@@ -219,264 +157,67 @@ struct ReaderWorkspaceView: View {
 
 }
 
-private struct ReaderWorkspaceHeaderBar<Accessory: View>: View {
+/// Single connected capsule combining the conversation-title anchor
+/// and the prompt-outline pull-down. Previously these rendered as two
+/// separate pills sitting side by side in the unified top bar; the
+/// user asked for them merged into one window so the "what am I
+/// reading / where am I in it" read as a single piece of chrome.
+///
+/// Layout, left to right:
+///
+///   [ ↑ Title ] │ [ N/M PromptTitle ⌄ ]
+///
+/// Left half = title pulldown. `Menu` listing the conversations
+/// currently rendered by the middle pane; the active conversation
+/// nests its prompt outline as a cascading submenu (Xcode jump-bar
+/// style). Top item preserves the legacy `onTapTitle` action so the
+/// muscle memory still works.
+///
+/// Right half = prompt pulldown. Custom popover (`PromptOutlinePopover`)
+/// rather than an NSMenu, kept as a popover after a brief detour to
+/// `Menu` because NSMenu's single-line text rendering truncated long
+/// prompt labels too aggressively — the user reads each row's label
+/// to pick a prompt, so legibility wins over visual symmetry with
+/// the title-side `Menu`.
+///
+/// Single capsule, single thin-material fill. A `>` chevron sits
+/// between the two halves so the chip reads as a "Title › Prompt"
+/// breadcrumb rather than two unrelated buttons under one capsule.
+///
+/// Reused by `UnifiedWorkspaceTopBar` in every non-table mode.
+struct ReaderHeaderActivityPill: View {
     let activeDetail: ConversationDetail?
     let promptOutline: [ConversationPromptOutlineItem]
     let selectedPromptID: String?
-    @Binding var isViewerModeActive: Bool
     let onSelectPrompt: (String) -> Void
     let onTapTitle: () -> Void
-    @ViewBuilder let accessory: () -> Accessory
-
-    var body: some View {
-        WorkspaceHeaderBar {
-            // Leading-most: Viewer Mode toggle. Placed first so the bar
-            // bookends — mode control on the left, export on the right —
-            // in the same pattern as Safari's Reader View button sitting
-            // at the start of its URL bar. Disabled until there's
-            // actually a conversation open to read.
-            ViewerModeToggleButton(
-                isActive: $isViewerModeActive,
-                isEnabled: activeDetail != nil
-            )
-
-            // Conversation-title pill. Previously the title only appeared
-            // in Viewer Mode's window-spanning toolbar; users expected it
-            // as an always-on anchor they could tap to "take me back to
-            // the top" of both this reader pane and the middle-pane list
-            // card. Rendered before the outline control so the header
-            // reads as "what am I looking at?" → "where am I in it?".
-            if let summary = activeDetail?.summary {
-                ReaderHeaderTitlePill(
-                    summary: summary,
-                    action: onTapTitle
-                )
-            }
-
-            ReaderWorkspaceOutlineControl(
-                activeDetail: activeDetail,
-                promptOutline: promptOutline,
-                selectedPromptID: selectedPromptID,
-                onSelectPrompt: onSelectPrompt
-            )
-
-            Spacer(minLength: 0)
-
-            accessory()
-        }
-    }
-}
-
-/// Glass-capsule chip showing the active conversation's title + ISO date.
-/// Styled to match the outline pill's material recipe so the header bar
-/// reads as a single family of translucent chips. Tapping it fires
-/// `action` — the parent wires that to a "reveal this conversation in
-/// the middle-pane list AND snap the reader body to its top" combo.
-///
-/// Shape choices: single-line, fixed max width, truncating tail. Long
-/// conversation titles would otherwise stretch the bar past the outline
-/// pill and force it off-screen on narrow windows.
-private struct ReaderHeaderTitlePill: View {
-    let summary: ConversationSummary
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 8) {
-                // Up-arrow glyph signals "jump to top" — matches Safari's
-                // URL-bar reload/back affordance pattern where the icon
-                // telegraphs the destination of the tap.
-                Image(systemName: "arrow.up.to.line")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-
-                Text(summary.displayTitle)
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    // Cap width so a long title can't push the outline
-                    // pill off the bar. 280pt is enough room for a
-                    // typical chat title while keeping the bar balanced.
-                    .frame(maxWidth: 280, alignment: .leading)
-            }
-            .padding(.horizontal, WorkspaceLayoutMetrics.headerChipHorizontalPadding)
-            .frame(height: WorkspaceLayoutMetrics.headerChipHeight)
-            .contentShape(Capsule(style: .continuous))
-        }
-        .buttonStyle(.plain)
-        .background(
-            Capsule(style: .continuous)
-                .fill(.thinMaterial)
-        )
-        .overlay(
-            Capsule(style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
-        )
-        .help("Jump to top · reveal in list")
-    }
-}
-
-/// Leading-edge toggle that flips Madini into Viewer Mode (see
-/// `MacOSRootView.isViewerModeActive` for the full plumbing). Uses the
-/// Safari Reader-View convention of `book` / `book.fill` — hollow when
-/// off, filled when on — so the glyph itself advertises its current
-/// state independent of the chip's accent tint. The same
-/// `headerIconChipStyle` as the trailing export button keeps the bar's
-/// icon buttons visually matched.
-///
-/// Accessible to other files (not `private`) because the root-level
-/// Viewer-Mode toolbar reuses it too — the button lives in the reader
-/// header outside Viewer Mode and in the window-spanning toolbar
-/// inside it.
-struct ViewerModeToggleButton: View {
-    @Binding var isActive: Bool
-    let isEnabled: Bool
-
-    /// While Viewer Mode is ALREADY on, the button's job is "退出する"
-    /// — so it must stay enabled regardless of `isEnabled`
-    /// (which only gates entry, based on whether there's a detail
-    /// loaded). Previously, if `activeDetail` briefly went nil during
-    /// a keyboard-driven conversation switch, the exit button
-    /// disabled itself and the user was trapped in Viewer Mode with
-    /// no way back. Latch "exit is always available" here.
-    private var effectiveEnabled: Bool { isActive || isEnabled }
-
-    var body: some View {
-        Button {
-            isActive.toggle()
-        } label: {
-            Image(systemName: isActive ? "book.fill" : "book")
-                // `.title3` (~20pt) — matches the bumped calendar /
-                // export glyphs so all three icon-only toolbar chips
-                // share a single optical size. The prior `.body`
-                // (~17pt) read as undersized once the chips all
-                // shared the capsule shape.
-                .font(.title3.weight(.semibold))
-                .headerIconChipStyle(isActive: isActive)
-        }
-        .buttonStyle(.plain)
-        .disabled(!effectiveEnabled)
-        // Dim the chip rather than letting SwiftUI's default disabled
-        // treatment apply — the default washes the glyph but leaves the
-        // material chip fully opaque, which reads as "active but
-        // broken" instead of "intentionally unavailable".
-        .opacity(effectiveEnabled ? 1 : 0.4)
-        // Escape hatch: even if focus drifts or the chip stops accepting
-        // clicks for any reason, ⎋ always drops Viewer Mode. Registered
-        // only while the mode is active so it doesn't steal Escape from
-        // the rest of the UI (search field, popovers, etc.).
-        .modifier(ViewerModeEscapeShortcut(enabled: isActive))
-        .help(isActive ? "Exit Viewer Mode (Esc)" : "Enter Viewer Mode")
-    }
-}
-
-/// Attaches the Escape-key shortcut to the enclosing button only while
-/// `enabled` is true. Split out into a modifier so the `.keyboardShortcut`
-/// call site can truly be absent when off — SwiftUI will otherwise latch
-/// a shortcut registration even if we pass a no-op key, producing odd
-/// stolen-keystroke behavior elsewhere in the UI.
-private struct ViewerModeEscapeShortcut: ViewModifier {
-    let enabled: Bool
-
-    func body(content: Content) -> some View {
-        if enabled {
-            content.keyboardShortcut(.cancelAction)
-        } else {
-            content
-        }
-    }
-}
-
-private struct ReaderWorkspaceOutlineControl: View {
-    let activeDetail: ConversationDetail?
-    let promptOutline: [ConversationPromptOutlineItem]
-    let selectedPromptID: String?
-    let onSelectPrompt: (String) -> Void
+    /// Conversations currently rendered by the middle pane (already
+    /// filtered/sorted by the sidebar). Powers the title-pulldown's
+    /// jump-to-other-conversation list — Xcode-style breadcrumb where
+    /// each row is a peer the user can switch to without leaving the
+    /// reader.
+    let conversations: [ConversationSummary]
+    /// Switch the reader to a different conversation. Wired upstream
+    /// to `selectedConversationId =` which fans out via
+    /// `MacOSRootView.onChange` into the tab-manager open path.
+    let onSelectConversation: (String) -> Void
+    /// Repository forwarded into the title popover so it can lazy-load
+    /// prompt outlines for non-active conversations when the user
+    /// expands their row. Optional because not every callsite has a
+    /// repository handy yet (the older two-pane preview-style mounts);
+    /// when nil, per-row expansion is disabled and the popover degrades
+    /// to a flat conversation list.
+    let repository: (any ConversationRepository)?
 
     @State private var isOutlinePresented = false
+    @State private var isTitlePresented = false
 
-    /// Outline pull-down pill: counter + current prompt title + chevron,
-    /// opening a searchable prompt-list popover. The trailing prev/next
-    /// step chips used to live inside this capsule; they were removed
-    /// per user request — keyboard arrow keys still move selection (see
-    /// `ReaderWorkspaceView.handleMoveCommand`), the chips were
-    /// redundant chrome.
     var body: some View {
         HStack(spacing: 0) {
-            // The outline is a custom popover rather than a Menu because
-            // SwiftUI's Menu renders as a native NSMenu on macOS, which
-            // only honors Text + Image inside item labels — alternating
-            // row backgrounds (and any other custom styling we might add
-            // later) are silently discarded during the AppKit bridge.
-            // A popover hosting a real SwiftUI list gives us full
-            // control over row chrome.
-            Button {
-                guard !promptOutline.isEmpty else { return }
-                isOutlinePresented.toggle()
-            } label: {
-                HStack(spacing: 8) {
-                    // Prompt counter ("3 / 42") replaces a prior bubble icon.
-                    // The denominator uses the outline count — assistant /
-                    // system messages are excluded, matching the popover.
-                    // Tabular digits so the width stays steady as the
-                    // numerator grows from 1 → 2 → 3 digits.
-                    Text(promptCounterText)
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                        .frame(minWidth: 42, alignment: .leading)
-
-                    // Single-line title so the capsule's height matches
-                    // the sibling chip controls in the middle pane. The
-                    // two-line form (conversation title + current prompt)
-                    // was making this pill ~16pt taller than its siblings
-                    // and visually broke the "one toolbar family" read.
-                    Text(currentPromptTitle)
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-                        // Fixed width so the trailing chevron stays at the
-                        // same x-coordinate regardless of title length.
-                        // Otherwise opening and re-opening the popover
-                        // becomes a moving target — the arrow drifts as the
-                        // selected prompt changes, which makes it
-                        // surprisingly hard to click twice in a row.
-                        .frame(width: 260, alignment: .leading)
-
-                    Image(systemName: "chevron.down")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .padding(.leading, WorkspaceLayoutMetrics.headerChipHorizontalPadding)
-            .disabled(promptOutline.isEmpty)
-            .popover(isPresented: $isOutlinePresented, arrowEdge: .bottom) {
-                PromptOutlinePopover(
-                    prompts: promptOutline,
-                    selectedPromptID: selectedPromptID,
-                    onSelect: { id in
-                        onSelectPrompt(id)
-                        isOutlinePresented = false
-                    }
-                )
-            }
-
-            // Trailing breathing room so the chevron-down on the main
-            // button doesn't sit flush against the capsule's right wall.
-            Color.clear.frame(width: WorkspaceLayoutMetrics.headerChipHorizontalPadding, height: 1)
+            titleHalf
+            divider
+            promptHalf
         }
-        // Shared glass treatment — matches the middle pane's sort pill
-        // so the top strip reads as one family of pill-shaped glass
-        // controls. Inlined (rather than via `.headerChipStyle()`)
-        // because this pill contains a divider + step buttons alongside
-        // its main button and the modifier's single horizontal padding
-        // would double-pad the contents. Keep this recipe in sync with
-        // `HeaderChipBackground` — thin material + monochrome hairline
-        // stroke, no rim gradient, no shadow. Apple's own toolbar chips
-        // are this restrained; adding chrome made Madini's bar read as
-        // a skin instead of native UI.
         .frame(height: WorkspaceLayoutMetrics.headerChipHeight)
         .background(
             Capsule(style: .continuous)
@@ -488,12 +229,169 @@ private struct ReaderWorkspaceOutlineControl: View {
         )
     }
 
+    // MARK: - Title half (left)
+    //
+    // Custom popover (`ConversationListPopover`) instead of an
+    // NSMenu. Earlier iterations used `Menu` for the Xcode-jump-bar
+    // cascade-out submenu effect, but two requirements pushed us back
+    // to a popover:
+    //
+    //   1. Open the pulldown anchored on the active conversation, with
+    //      that row highlighted in gray and visible without scrolling.
+    //      `Menu`/NSMenu always opens at the top of its item list with
+    //      no programmatic scroll API — there's no way to seed a
+    //      "current selection" the way a popover + ScrollViewReader can.
+    //   2. Match the prompt-side popover's visual language (gray
+    //      highlight on the current row, multi-line titles, zebra
+    //      stripes). `Menu` items are NSMenu-backed, single-line, with
+    //      a fixed checked-state glyph that doesn't read as the same
+    //      "current row" affordance.
+    //
+    // The popover lists every conversation in the current middle-pane
+    // filter; the active one carries the gray highlight + checkmark.
+    // The top "現在の会話を中央リストで見る" row preserves the legacy
+    // `onTapTitle` muscle memory.
+
+    @ViewBuilder
+    private var titleHalf: some View {
+        Button {
+            guard activeDetail != nil || !conversations.isEmpty else { return }
+            isTitlePresented.toggle()
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "list.bullet.indent")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+
+                Text(titleText)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(activeDetail == nil ? .secondary : .primary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    // Fixed cap so a long title can't push the prompt
+                    // half off the trailing edge of the bar.
+                    .frame(maxWidth: 180, alignment: .leading)
+            }
+            .padding(.leading, WorkspaceLayoutMetrics.headerChipHorizontalPadding)
+            .padding(.trailing, 10)
+            .frame(height: WorkspaceLayoutMetrics.headerChipHeight)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(activeDetail == nil && conversations.isEmpty)
+        .popover(isPresented: $isTitlePresented, arrowEdge: .bottom) {
+            ConversationListPopover(
+                conversations: conversations,
+                activeConversationID: activeDetail?.summary.id,
+                activePromptOutline: promptOutline,
+                selectedPromptID: selectedPromptID,
+                repository: repository,
+                onTapTitle: {
+                    onTapTitle()
+                    isTitlePresented = false
+                },
+                onSelect: { id in
+                    onSelectConversation(id)
+                    isTitlePresented = false
+                },
+                onSelectPromptInConversation: { conversationID, promptID in
+                    if conversationID != activeDetail?.summary.id {
+                        onSelectConversation(conversationID)
+                    }
+                    onSelectPrompt(promptID)
+                    isTitlePresented = false
+                }
+            )
+        }
+        .help("会話・プロンプトに移動")
+    }
+
+    // MARK: - Prompt half (right)
+    //
+    // Layout reads left-to-right as `[prompt label] [N/M] [chev]`.
+    // The counter sits AFTER the prompt label so it's visually anchored
+    // to the prompt side and not crowding the title divider — an
+    // earlier ordering put `[N/M]` first, immediately right of the
+    // chip's central `>` separator, which made the count read as
+    // metadata about the title (the user reported it as "プロンプト
+    // 数の表記がタイトル側に近くてわかりにくい").
+    //
+    // Stays a `Button` + `.popover` (not a `Menu` like the title
+    // half) so the popover's multi-line prompt-label rendering and
+    // checkmark-on-current-prompt highlight survive — NSMenu items
+    // are single-line only and that lost too much of the prompt text
+    // for long prompts.
+
+    @ViewBuilder
+    private var promptHalf: some View {
+        Button {
+            guard !promptOutline.isEmpty else { return }
+            isOutlinePresented.toggle()
+        } label: {
+            HStack(spacing: 8) {
+                Text(currentPromptTitle)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(promptOutline.isEmpty ? .secondary : .primary)
+                    .lineLimit(1)
+                    // Fixed width so the trailing counter + chevron
+                    // stay at a consistent x-coordinate regardless of
+                    // current prompt title.
+                    .frame(width: 180, alignment: .leading)
+
+                // Tabular digits so the counter column doesn't shift
+                // width as the numerator grows from 1 → 10 → 100.
+                Text(promptCounterText)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .frame(minWidth: 42, alignment: .trailing)
+
+                Image(systemName: "chevron.down")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.leading, 10)
+            .padding(.trailing, WorkspaceLayoutMetrics.headerChipHorizontalPadding)
+            .frame(height: WorkspaceLayoutMetrics.headerChipHeight)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(promptOutline.isEmpty)
+        .popover(isPresented: $isOutlinePresented, arrowEdge: .bottom) {
+            PromptOutlinePopover(
+                prompts: promptOutline,
+                selectedPromptID: selectedPromptID,
+                onSelect: { id in
+                    onSelectPrompt(id)
+                    isOutlinePresented = false
+                }
+            )
+        }
+    }
+
+    // MARK: - Divider
+
+    /// Breadcrumb chevron between the two halves, so the chip reads
+    /// as a "Title › Prompt" path rather than two adjacent buttons.
+    /// Same direction and weight as Finder's path bar / Xcode's
+    /// jump-bar separators.
+    private var divider: some View {
+        Image(systemName: "chevron.right")
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(.tertiary)
+            .padding(.horizontal, 2)
+    }
+
+    // MARK: - Text helpers
+
+    private var titleText: String {
+        activeDetail?.summary.displayTitle ?? "—"
+    }
+
     private var currentPromptTitle: String {
         guard let selectedPromptID,
               let selectedPrompt = promptOutline.first(where: { $0.id == selectedPromptID }) else {
             return activeDetail?.summary.displayTitle ?? "Reader"
         }
-
         return selectedPrompt.label
     }
 
@@ -502,16 +400,339 @@ private struct ReaderWorkspaceOutlineControl: View {
         let current = promptOutline.firstIndex(where: { $0.id == selectedPromptID }).map { $0 + 1 } ?? 1
         return "\(current) / \(promptOutline.count)"
     }
-
 }
 
-/// Popover-backed replacement for the outline `Menu`. The whole reason
-/// this exists as a separate view (instead of being inlined in
-/// `ReaderWorkspaceOutlineControl`'s `.popover` closure) is so the row
-/// layout is a normal SwiftUI subtree — NSMenu's restriction on label
-/// contents doesn't apply here, so we can alternate row backgrounds,
-/// highlight the current selection, and show the "Prompt N" subtitle
-/// on its own line.
+/// Custom popover for the title-half pulldown. Replaced an earlier
+/// `Menu`-based jump bar so the pulldown can:
+///
+///   * Open with the active conversation centered and gray-highlighted
+///     (NSMenu has no programmatic scroll API).
+///   * Render multi-line conversation titles (NSMenu items are
+///     single-line and truncate aggressively).
+///   * Share visual language with the prompt-side `PromptOutlinePopover`
+///     — both pulldowns now read as the same kind of "where am I in
+///     this list" affordance.
+///
+/// The first row preserves the legacy "reveal active conversation in
+/// middle pane + scroll reader to top" action (`onTapTitle`). Below
+/// the divider is the conversation list itself.
+private struct ConversationListPopover: View {
+    let conversations: [ConversationSummary]
+    let activeConversationID: String?
+    /// Already-loaded outline for the active conversation. Reused as-is
+    /// when the user expands the active row (no fetch needed) so the
+    /// only DB hits the popover triggers are for non-active rows.
+    let activePromptOutline: [ConversationPromptOutlineItem]
+    let selectedPromptID: String?
+    /// Optional repository — when nil, per-row expansion is disabled
+    /// and the popover degrades gracefully to a flat conversation list.
+    let repository: (any ConversationRepository)?
+    let onTapTitle: () -> Void
+    let onSelect: (String) -> Void
+    /// Switch to (conversationID) and jump to (promptID) inside it.
+    /// Caller is responsible for the open-then-jump ordering — the
+    /// popover just hands back a (conv, prompt) pair when the user
+    /// taps a nested prompt row.
+    let onSelectPromptInConversation: (String, String) -> Void
+
+    /// Per-row expansion state. Defaults to expanded for the active
+    /// conversation since the user almost always wants to see "where
+    /// am I" without an extra click.
+    @State private var expandedConversationIDs: Set<String> = []
+    /// Lazy cache of fetched outlines keyed by conversation id. The
+    /// active conversation is served from `activePromptOutline` and
+    /// never enters this cache (one source of truth per state slot).
+    @State private var outlineCache: [String: [ConversationPromptOutlineItem]] = [:]
+    /// Conversations currently being fetched. Drives the per-row
+    /// progress spinner without re-rendering the whole popover when a
+    /// fetch flips between in-flight and done.
+    @State private var loadingConversationIDs: Set<String> = []
+    @State private var didSeedActiveExpansion = false
+
+    private let popoverWidth: CGFloat = 360
+    private let popoverMaxHeight: CGFloat = 440
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    Button(action: onTapTitle) {
+                        Label("現在の会話を中央リストで見る", systemImage: "arrow.up.to.line")
+                            .font(.subheadline)
+                            .foregroundStyle(activeConversationID == nil ? .secondary : .primary)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(activeConversationID == nil)
+
+                    Divider()
+
+                    ForEach(Array(conversations.enumerated()), id: \.element.id) { offset, conversation in
+                        VStack(alignment: .leading, spacing: 0) {
+                            ConversationListRow(
+                                conversation: conversation,
+                                isSelected: conversation.id == activeConversationID,
+                                isAlternate: offset.isMultiple(of: 2),
+                                isExpanded: expandedConversationIDs.contains(conversation.id),
+                                isLoading: loadingConversationIDs.contains(conversation.id),
+                                canExpand: repository != nil,
+                                onSelect: { onSelect(conversation.id) },
+                                onToggleExpand: { toggleExpansion(for: conversation.id) }
+                            )
+                            .id(conversation.id)
+
+                            if expandedConversationIDs.contains(conversation.id) {
+                                expandedPrompts(for: conversation)
+                            }
+                        }
+                    }
+                }
+            }
+            .onAppear {
+                // Seed the active conversation as expanded on first
+                // open so "where am I in this thread" reads at a
+                // glance. Guarded by `didSeedActiveExpansion` so a
+                // re-open after a manual collapse respects the user's
+                // last toggle.
+                if !didSeedActiveExpansion, let activeConversationID {
+                    expandedConversationIDs.insert(activeConversationID)
+                    didSeedActiveExpansion = true
+                }
+                // Same deferral as `PromptOutlinePopover.onAppear` —
+                // `LazyVStack` rows aren't materialized synchronously on
+                // first display, so an immediate `scrollTo` can land on
+                // the wrong row (it scrolls to where the row WILL be
+                // rather than where it lands once measured).
+                guard let activeConversationID else { return }
+                DispatchQueue.main.async {
+                    proxy.scrollTo(activeConversationID, anchor: .center)
+                }
+            }
+        }
+        .frame(width: popoverWidth)
+        .frame(maxHeight: popoverMaxHeight)
+    }
+
+    @ViewBuilder
+    private func expandedPrompts(for conversation: ConversationSummary) -> some View {
+        let prompts = outline(for: conversation.id)
+        if let prompts {
+            if prompts.isEmpty {
+                Text("プロンプトなし")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.leading, 36)
+                    .padding(.vertical, 4)
+            } else {
+                ForEach(prompts) { prompt in
+                    ConversationPromptChildRow(
+                        prompt: prompt,
+                        isSelected: conversation.id == activeConversationID
+                            && prompt.id == selectedPromptID,
+                        onSelect: {
+                            onSelectPromptInConversation(conversation.id, prompt.id)
+                        }
+                    )
+                }
+            }
+        } else if loadingConversationIDs.contains(conversation.id) {
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.small)
+                Text("プロンプトを読み込み中…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.leading, 36)
+            .padding(.vertical, 4)
+        }
+    }
+
+    /// Returns the cached outline if available — checks the active
+    /// conversation's pre-loaded outline first, then the lazy cache.
+    private func outline(for conversationID: String) -> [ConversationPromptOutlineItem]? {
+        if conversationID == activeConversationID {
+            return activePromptOutline
+        }
+        return outlineCache[conversationID]
+    }
+
+    private func toggleExpansion(for conversationID: String) {
+        if expandedConversationIDs.contains(conversationID) {
+            expandedConversationIDs.remove(conversationID)
+            return
+        }
+        expandedConversationIDs.insert(conversationID)
+        // Active conversation is served from `activePromptOutline` —
+        // no fetch needed.
+        guard conversationID != activeConversationID,
+              outlineCache[conversationID] == nil,
+              !loadingConversationIDs.contains(conversationID),
+              let repository else {
+            return
+        }
+        loadingConversationIDs.insert(conversationID)
+        Task {
+            // Best-effort fetch. Failure quietly leaves the cache
+            // empty and the row collapsed-equivalent — the user can
+            // re-expand to retry. We don't surface error UI here
+            // because the popover's job is navigation, not error
+            // reporting; persistent failures should show up in the
+            // app's main error channel anyway.
+            let detail = try? await repository.fetchDetail(id: conversationID)
+            await MainActor.run {
+                loadingConversationIDs.remove(conversationID)
+                if let detail {
+                    outlineCache[conversationID] = ConversationDetailView.promptOutline(for: detail)
+                }
+            }
+        }
+    }
+}
+
+private struct ConversationListRow: View {
+    let conversation: ConversationSummary
+    let isSelected: Bool
+    let isAlternate: Bool
+    let isExpanded: Bool
+    let isLoading: Bool
+    let canExpand: Bool
+    let onSelect: () -> Void
+    let onToggleExpand: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 0) {
+            // Leading chevron — own button so tapping it expands without
+            // also switching the reader to this conversation. Tap the
+            // body of the row to switch; tap the chevron to peek at
+            // its prompts in place.
+            if canExpand {
+                Button(action: onToggleExpand) {
+                    Image(systemName: "chevron.right")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                        .frame(width: 16, height: 16)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .padding(.leading, 6)
+                .padding(.trailing, 2)
+            } else {
+                Color.clear.frame(width: 24, height: 1)
+            }
+
+            Button(action: onSelect) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(conversation.displayTitle)
+                        .font(.subheadline)
+                        .foregroundStyle(.primary)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                    if isLoading {
+                        ProgressView().controlSize(.small)
+                    } else if isSelected {
+                        Image(systemName: "checkmark")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.trailing, 12)
+                .padding(.vertical, 6)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(rowBackground)
+        .onHover { isHovering = $0 }
+    }
+
+    /// Same layering as `PromptOutlineRow.rowBackground` — gray
+    /// highlight on the active conversation so the two pulldowns
+    /// read as the same kind of pulldown.
+    private var rowBackground: Color {
+        if isSelected {
+            return Color.secondary.opacity(0.22)
+        }
+        if isHovering {
+            return Color.secondary.opacity(0.12)
+        }
+        if isAlternate {
+            return Color.secondary.opacity(0.06)
+        }
+        return .clear
+    }
+}
+
+/// Nested prompt row rendered under an expanded conversation row.
+/// Indented to read as a child of its parent conversation, with the
+/// same gray "you are here" highlight as the prompt-side popover so
+/// the two pulldowns share their selection-state vocabulary.
+private struct ConversationPromptChildRow: View {
+    let prompt: ConversationPromptOutlineItem
+    let isSelected: Bool
+    let onSelect: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: onSelect) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("\(prompt.index).")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .frame(width: 24, alignment: .trailing)
+
+                Text(prompt.label)
+                    .font(.caption)
+                    .foregroundStyle(.primary)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                if isSelected {
+                    Image(systemName: "checkmark")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            // Leading inset so the prompt list sits visibly under
+            // (and to the right of) its parent conversation row's
+            // expand chevron — reads as a tree branch.
+            .padding(.leading, 36)
+            .padding(.trailing, 12)
+            .padding(.vertical, 4)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(rowBackground)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovering = $0 }
+    }
+
+    private var rowBackground: Color {
+        if isSelected {
+            return Color.secondary.opacity(0.22)
+        }
+        if isHovering {
+            return Color.secondary.opacity(0.10)
+        }
+        return .clear
+    }
+}
+
+/// Custom popover for the prompt-half pulldown. Used instead of an
+/// NSMenu so each row can render its prompt label as a 2-line block
+/// (NSMenu items are single-line) and so the currently-active prompt
+/// can carry a stronger highlight + checkmark than NSMenu's bare
+/// "checked" state.
 private struct PromptOutlinePopover: View {
     let prompts: [ConversationPromptOutlineItem]
     let selectedPromptID: String?
@@ -526,19 +747,39 @@ private struct PromptOutlinePopover: View {
     private let popoverMaxHeight: CGFloat = 440
 
     var body: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 0) {
-                // `enumerated()` for the visual row index — we can't
-                // just use `prompt.index` because that's the underlying
-                // message index (which skips non-user messages and
-                // therefore can't drive a clean zebra pattern).
-                ForEach(Array(prompts.enumerated()), id: \.element.id) { offset, prompt in
-                    PromptOutlineRow(
-                        prompt: prompt,
-                        isSelected: selectedPromptID == prompt.id,
-                        isAlternate: offset.isMultiple(of: 2),
-                        onSelect: { onSelect(prompt.id) }
-                    )
+        // `ScrollViewReader` so we can re-anchor to the current
+        // prompt every time the popover opens. Without this, opening
+        // the pulldown for a 100-prompt conversation parks the user
+        // at row 1 with no signal that their current row is way
+        // further down — they have to manually scroll to find it.
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    // `enumerated()` for the visual row index — we can't
+                    // just use `prompt.index` because that's the underlying
+                    // message index (which skips non-user messages and
+                    // therefore can't drive a clean zebra pattern).
+                    ForEach(Array(prompts.enumerated()), id: \.element.id) { offset, prompt in
+                        PromptOutlineRow(
+                            prompt: prompt,
+                            isSelected: selectedPromptID == prompt.id,
+                            isAlternate: offset.isMultiple(of: 2),
+                            onSelect: { onSelect(prompt.id) }
+                        )
+                        .id(prompt.id)
+                    }
+                }
+            }
+            .onAppear {
+                // Defer one runloop turn so LazyVStack has a chance to
+                // measure the rows; calling `scrollTo` synchronously
+                // inside `onAppear` sometimes lands on the wrong row
+                // because the lazy children haven't been instantiated
+                // yet. `.center` anchor matches the viewer-mode pane's
+                // selection-tracking scroll.
+                guard let selectedPromptID else { return }
+                DispatchQueue.main.async {
+                    proxy.scrollTo(selectedPromptID, anchor: .center)
                 }
             }
         }
@@ -595,11 +836,13 @@ private struct PromptOutlineRow: View {
     }
 
     /// Layering: selection tint > hover tint > zebra stripe > clear.
-    /// The selection tint is strong enough to read at a glance even on
-    /// top of the stripe it would otherwise inherit.
+    /// The selection tint uses gray (not accent) per user request — the
+    /// pulldown reads as a "where am I in the list" affordance, not a
+    /// state toggle, so the muted gray fits its semantic load better
+    /// and matches the title-side `ConversationListPopover`.
     private var rowBackground: Color {
         if isSelected {
-            return Color.accentColor.opacity(0.18)
+            return Color.secondary.opacity(0.22)
         }
         if isHovering {
             return Color.secondary.opacity(0.12)
@@ -615,67 +858,68 @@ private struct PromptOutlineRow: View {
 /// root-level Viewer-Mode toolbar reuses it — in Viewer Mode the export
 /// action moves from the right-pane header bar into the window-
 /// spanning top toolbar, but the styling stays identical.
+///
+/// Wraps `ShareLink` rather than presenting a save panel, so the user
+/// gets the full system share sheet (AirDrop, Mail, Messages, Notes,
+/// Save to Files, and any installed extensions) — matching the behavior
+/// of the right-pane share button. The chip styling is preserved by
+/// handing `ShareLink` a custom label and stripping its default button
+/// chrome with `.buttonStyle(.plain)`.
 struct WorkspaceFloatingExportButton: View {
     let detail: ConversationDetail?
 
+    @State private var shareURL: URL?
+
     var body: some View {
+        Group {
+            if let detail, let shareURL {
+                ShareLink(
+                    item: shareURL,
+                    preview: SharePreview(
+                        detail.summary.title ?? "Conversation",
+                        image: Image(systemName: "doc.text")
+                    )
+                ) {
+                    chipLabel
+                }
+                .buttonStyle(.plain)
+                .help("Share conversation")
+            } else {
+                // Disabled-looking placeholder while the markdown temp
+                // file is being written, or when there's no conversation
+                // loaded. Same geometry as the live button so the
+                // toolbar doesn't jump on first render.
+                Button {} label: {
+                    chipLabel
+                }
+                .buttonStyle(.plain)
+                .disabled(true)
+                .opacity(detail == nil ? 0.4 : 0.6)
+                .help(detail == nil ? "Export as Markdown" : "Preparing…")
+            }
+        }
+        .task(id: detail?.summary.id) {
+            guard let detail else {
+                shareURL = nil
+                return
+            }
+            shareURL = await MarkdownExporter.writeTempShareFile(for: detail)
+        }
+    }
+
+    @ViewBuilder
+    private var chipLabel: some View {
         #if os(macOS)
         // Glass chip — matches the sort / date / outline controls so the
         // three panes' top bars read as one family of translucent
-        // buttons. Previously this wore a hand-rolled 30×30 Circle with
-        // its own stroke, which clashed with everything else.
-        Button {
-            guard let detail else { return }
-            export(detail)
-        } label: {
-            Image(systemName: "square.and.arrow.up")
-                // Shared with the calendar + viewer-mode glyphs at
-                // `.title3` (~20pt) — one typography step above `.body`
-                // so the icon-only chips carry visible presence against
-                // the 30pt chip height and the text-bearing sort pill.
-                .font(.title3.weight(.semibold))
-                // Rounded-square icon chip — matches the calendar button
-                // and Apple's titlebar sidebar-toggle shape. Capsule was
-                // wrong here: the capsule's wide radius on a 38pt-wide
-                // single-glyph chip made it read nearly circular, which
-                // broke the icon-button convention.
-                .headerIconChipStyle()
-        }
-        .buttonStyle(.plain)
-        .help("Export as Markdown")
-        .disabled(detail == nil)
-        .opacity(detail == nil ? 0.4 : 1)
+        // buttons. `.title3` (~20pt) icon size is shared with the
+        // calendar + viewer-mode glyphs so the icon-only chips carry
+        // visible presence against the 30pt chip height.
+        Image(systemName: "square.and.arrow.up")
+            .font(.title3.weight(.semibold))
+            .headerIconChipStyle()
         #else
-        if let detail {
-            ShareLink(item: MarkdownExporter.export(detail)) {
-                Image(systemName: "square.and.arrow.up")
-            }
-        } else {
-            Image(systemName: "square.and.arrow.up")
-                .foregroundStyle(.tertiary)
-        }
+        Image(systemName: "square.and.arrow.up")
         #endif
     }
-
-    #if os(macOS)
-    private func export(_ detail: ConversationDetail) {
-        let markdown = MarkdownExporter.export(detail)
-        let panel = NSSavePanel()
-        panel.allowedContentTypes = [.plainText]
-        panel.nameFieldStringValue = sanitizeFilename(detail.summary.title ?? "conversation") + ".md"
-
-        panel.begin { response in
-            guard response == .OK, let url = panel.url else {
-                return
-            }
-
-            try? markdown.write(to: url, atomically: true, encoding: .utf8)
-        }
-    }
-
-    private func sanitizeFilename(_ name: String) -> String {
-        let illegal = CharacterSet(charactersIn: "/:\\")
-        return name.components(separatedBy: illegal).joined(separator: "_")
-    }
-    #endif
 }

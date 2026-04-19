@@ -20,22 +20,35 @@ struct MacOSRootView: View {
     /// collapsed — otherwise the macOS traffic-light buttons overlap the
     /// content column's leading toolbar.
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
-    /// Measured height of the floating middle-pane header bar. Drives the
-    /// List's top `contentMargins` so rows can scroll under the bar and get
-    /// blurred by its vibrancy material. Variable because the bar grows a
-    /// second row when active-filter chips are present.
-    @State private var libraryHeaderBarHeight: CGFloat = WorkspaceLayoutMetrics.headerBarContentRowHeight
-    /// Whether Viewer Mode is currently active. Flipped from the right-pane
-    /// toolbar's `ViewerModeToggleButton`. When on: left sidebar auto-
-    /// collapses, the middle-pane toolbar disappears, and the middle pane
-    /// swaps to `ViewerModePane` tracking the active reader tab. The mode
-    /// is deliberately volatile (no persistence) — it's a focus-mode, not
-    /// a preference.
-    @State private var isViewerModeActive: Bool = false
-    /// Snapshot of `columnVisibility` taken right before entering Viewer
-    /// Mode, so exiting can restore the user's prior sidebar state. Users
-    /// who were already in `.doubleColumn` don't get yanked back to `.all`
-    /// on exit — they return to exactly what they had.
+    /// Measured height of the single window-spanning top bar. Drives the
+    /// top `.safeAreaInset` on every pane underneath so rows can scroll
+    /// under the bar and get blurred by its vibrancy material. Variable
+    /// because the bar grows a footer row when source-file filter chips
+    /// are present.
+    @State private var unifiedHeaderBarHeight: CGFloat = WorkspaceLayoutMetrics.headerBarContentRowHeight
+    /// Measured height of the sidebar's chrome strip overlay (search +
+    /// sort/date + chip flow). Variable because the search field's
+    /// glass container expands when active-filter chips wrap. Drives
+    /// the sidebar's `safeAreaInset` so the first scrolling row always
+    /// sits flush below the strip.
+    @State private var sidebarHeaderHeight: CGFloat = WorkspaceLayoutMetrics.headerBarContentRowHeight
+        + WorkspaceLayoutMetrics.sidebarControlsRowHeight
+    /// Single source of truth for the workspace layout. Replaces the
+    /// three mutually-exclusive `is*Active: Bool` flags this view used
+    /// to carry separately (`isViewerModeActive` / `isFocusViewerActive`
+    /// / `isTableMiddlePaneModeActive`). Having them as one enum prevents
+    /// contradictory combinations at the type level and collapses what
+    /// used to be three cascading `onChange` hooks into a single
+    /// transition handler keyed on `viewMode`. See `MiddlePaneMode` for the
+    /// cascade ordering the toolbar picker and horizontal swipe both
+    /// walk. Deliberately volatile (no persistence) — focus-mode is
+    /// not a preference.
+    @State private var viewMode: MiddlePaneMode = .default
+    /// Snapshot of `columnVisibility` taken right before entering a
+    /// reading layout (viewer or focus), so exiting can restore the
+    /// user's prior sidebar state. Users who were already in
+    /// `.doubleColumn` don't get yanked back to `.all` on exit — they
+    /// return to exactly what they had.
     @State private var columnVisibilityBeforeViewerMode: NavigationSplitViewVisibility = .all
     // `selectedPromptID` used to live here as `@State`, but writing to it
     // from the reader's scroll-position observer forced `MacOSRootView` to
@@ -97,6 +110,13 @@ struct MacOSRootView: View {
         .animation(.easeInOut(duration: 0.18), value: isJSONDropTargeted)
         .animation(.easeInOut(duration: 0.2), value: importToast?.id)
         .focusedSceneValue(\.libraryViewModel, libraryViewModel)
+        // Make the Library view-model and archive events visible to the
+        // right-pane tag editor (`ConversationTagsEditor`) without
+        // threading them through ConversationDetailView's API. The
+        // detail view stays platform-shared and ignorant of the macOS
+        // tag editor; the editor just reads from the env on appear.
+        .environment(libraryViewModel)
+        .environment(archiveEvents)
         .task {
             await libraryViewModel.loadIfNeeded()
         }
@@ -127,45 +147,76 @@ struct MacOSRootView: View {
                 title: summary.displayTitle
             )
         }
-        // Viewer Mode toggle plumbing. Activating the mode collapses the
-        // sidebar and kicks off a detail fetch for the conversation
-        // currently in the reader; deactivating restores the snapshot
-        // `columnVisibility` and drops the cached viewer state so the VM
-        // doesn't retain a reference to a conversation that's no longer
-        // being shown.
-        .onChange(of: isViewerModeActive) { _, active in
-            if active {
+        // MiddlePaneMode transitions. Every cross-mode piece of plumbing hangs
+        // off this one handler now: snapshotting sidebar state on entry
+        // into a reading layout, restoring it on exit, kicking off the
+        // viewer-pane detail fetch, and dropping cached viewer data when
+        // we leave reading. Because `MiddlePaneMode` is a single enum, the
+        // mutual-exclusion rules the old three-boolean world had to
+        // enforce via three separate `onChange` hooks disappear — the
+        // type itself guarantees we can't be in "table and viewer at
+        // once".
+        .onChange(of: viewMode) { old, new in
+            let wasReading = old == .viewer || old == .hidden
+            let isReading = new == .viewer || new == .hidden
+            if !wasReading && isReading {
                 columnVisibilityBeforeViewerMode = columnVisibility
                 columnVisibility = .doubleColumn
                 if let id = tabManager.activeTab?.conversationID {
                     Task { await libraryViewModel.loadViewerConversation(id: id) }
                 }
-            } else {
+            } else if wasReading && !isReading {
                 columnVisibility = columnVisibilityBeforeViewerMode
                 libraryViewModel.clearViewerData()
             }
+            // Entering `.viewer` — the middle pane is now the normal
+            // card list (same control as default mode) but it should
+            // auto-scroll to the currently-open conversation so the
+            // user's active card sits at the top of the visible list.
+            // Reveal handles paging in additional rows if the target
+            // id has fallen off the currently-loaded window.
+            if old != .viewer && new == .viewer,
+               let id = tabManager.activeTab?.conversationID {
+                Task { await libraryViewModel.revealConversation(id: id) }
+            }
         }
-        // Clamp column visibility while Viewer Mode is active. macOS's
-        // built-in sidebar-toggle shortcut (⌘⌃S) and some internal
-        // `NavigationSplitView` rebuild paths can flip `columnVisibility`
-        // back to `.all` mid-session even though the toggle button itself
-        // is removed via `ConditionalSidebarToggleRemoval`. When that
-        // happens the sidebar reappears over the Viewer-Mode toolbar
-        // (user-visible symptom: "左サイドバーの開閉ボタンが重なってでる")
-        // and there's no obvious path back. Snap it back to `.doubleColumn`
-        // in the next runloop turn so the mode stays internally consistent.
+        // Clamp column visibility in modes where the sidebar is NOT
+        // user-controllable (viewer / focus). macOS's built-in sidebar-
+        // toggle shortcut (⌘⌃S) and some internal `NavigationSplitView`
+        // rebuild paths can flip `columnVisibility` back to `.all` mid-
+        // session even though the toggle button itself is removed via
+        // `ConditionalSidebarToggleRemoval`. When that happens the
+        // sidebar reappears over the Viewer-Mode toolbar (user-visible
+        // symptom: "左サイドバーの開閉ボタンが重なってでる") and there's
+        // no obvious path back. Snap it back to `.doubleColumn` on the
+        // next runloop turn so the mode stays internally consistent.
+        //
+        // Focus sub-mode reuses `.doubleColumn` here — it hides the
+        // middle column via `navigationSplitViewColumnWidth(0,0,0)` on
+        // the content pane rather than via `columnVisibility`, because
+        // macOS's 3-column NavigationSplitView doesn't reliably honor
+        // `.detailOnly` (SwiftUI bounces it back to `.all`, which makes
+        // the sidebar flicker back in).
         .onChange(of: columnVisibility) { _, newValue in
-            guard isViewerModeActive, newValue != .doubleColumn else { return }
+            guard !viewMode.isSidebarControllable,
+                  newValue != .doubleColumn else { return }
             Task { @MainActor in
                 columnVisibility = .doubleColumn
             }
         }
-        // While in Viewer Mode, keep the middle-pane outline in sync with
-        // whichever tab is active in the reader. (Outside Viewer Mode this
-        // is a no-op — the list doesn't read `viewer*` state.)
+        // While in a reading mode, keep the middle-pane outline in sync
+        // with whichever tab is active in the reader. (Outside reading
+        // modes this is a no-op — the list doesn't read `viewer*` state.)
         .onChange(of: tabManager.activeTab?.conversationID) { _, newID in
-            guard isViewerModeActive, let newID else { return }
+            guard viewMode == .viewer || viewMode == .hidden,
+                  let newID else { return }
             Task { await libraryViewModel.loadViewerConversation(id: newID) }
+            // Viewer mode: keep the middle-pane list pinned to whichever
+            // tab the reader is currently showing, so switching tabs via
+            // keyboard / prompt popover scrolls the card list along too.
+            if viewMode == .viewer {
+                Task { await libraryViewModel.revealConversation(id: newID) }
+            }
         }
         // Tab-switch reset for `selectedPromptID` now lives inside
         // `ReaderTabManager.openConversation(…)` itself, so no onChange
@@ -324,48 +375,93 @@ struct MacOSRootView: View {
         } content: {
             libraryContentPane
                 .ignoresSafeArea(.container, edges: .top)
+                // In focus sub-mode the middle column collapses to zero
+                // width so only the detail pane remains visible. macOS's
+                // `NavigationSplitViewVisibility.detailOnly` does NOT
+                // reliably hide the middle column of a 3-column split
+                // view (it fights back and the sidebar reappears), so
+                // we drive the collapse via column width instead — the
+                // column technically still exists, but occupies 0pt and
+                // is therefore invisible.
+                //
+                // Table mode: the content column hosts the full-width
+                // spreadsheet and the detail column is collapsed to 0 —
+                // but without lifting the default `contentMaxWidth` cap
+                // (560pt) the middle pane refuses to expand beyond that,
+                // leaving a huge dead strip between the table and the
+                // right window edge. Lift min/ideal/max to generous
+                // values in this mode so the table absorbs all available
+                // horizontal space.
                 .navigationSplitViewColumnWidth(
-                    min: WorkspaceLayoutMetrics.contentMinWidth,
-                    ideal: WorkspaceLayoutMetrics.contentIdealWidth,
-                    max: WorkspaceLayoutMetrics.contentMaxWidth
+                    min: viewMode == .hidden ? 0
+                        : viewMode == .table ? WorkspaceLayoutMetrics.contentMinWidth
+                        : WorkspaceLayoutMetrics.contentMinWidth,
+                    ideal: viewMode == .hidden ? 0
+                        : viewMode == .table ? 1200
+                        : WorkspaceLayoutMetrics.contentIdealWidth,
+                    max: viewMode == .hidden ? 0
+                        : viewMode == .table ? .infinity
+                        : WorkspaceLayoutMetrics.contentMaxWidth
                 )
         } detail: {
             rightPane
                 .ignoresSafeArea(.container, edges: .top)
+                // Table mode: collapse the reader pane to zero width so
+                // the middle (table) pane absorbs the full remaining
+                // space. Same column-width trick used for focus mode on
+                // the content column above — macOS 3-column
+                // `NavigationSplitView` is unreliable at hiding a
+                // column via `columnVisibility`, but 0-width works.
+                // Non-table values fall back to generous bounds that
+                // mirror the system default (no explicit constraint).
+                .navigationSplitViewColumnWidth(
+                    min: viewMode == .table ? 0 : 320,
+                    ideal: viewMode == .table ? 0 : 720,
+                    max: viewMode == .table ? 0 : .infinity
+                )
         }
         // Hide the NavigationSplitView's built-in sidebar-toggle button
-        // while Viewer Mode is active. The user explicitly asked for this
-        // — there's no intended path to re-expand the sidebar during a
-        // reading session, and letting the toggle sit in the titlebar
-        // only invites accidental mode-break clicks. Applied as a
-        // conditional modifier so the toggle comes back on its own when
-        // the user exits Viewer Mode.
-        .modifier(ConditionalSidebarToggleRemoval(isActive: isViewerModeActive))
-        // Window-spanning Viewer-Mode toolbar. Sits on top of both the
-        // middle and right panes so the book toggle + title + prev/next
-        // + export read as ONE toolbar spanning the window rather than
-        // two disconnected bars stuck at each pane's leading edge. A
-        // leading 80pt spacer pushes everything clear of the macOS
-        // traffic-light cluster. In non-Viewer-Mode the overlay is
-        // absent and each pane's own header bar takes over as usual.
+        // whenever the current mode isn't sidebar-controllable (viewer
+        // / focus). The user explicitly asked for this — there's no
+        // intended path to re-expand the sidebar during a reading
+        // session, and letting the toggle sit in the titlebar only
+        // invites accidental mode-break clicks. Applied as a
+        // conditional modifier so the toggle comes back on its own
+        // when the user switches back to `.table` / `.default`.
+        .modifier(ConditionalSidebarToggleRemoval(isActive: !viewMode.isSidebarControllable))
+        // Single window-spanning top bar. Always mounted over all three
+        // columns regardless of mode — the bar's outer shell (height,
+        // padding, divider) never changes so swipe transitions no
+        // longer produce toolbar-rebuild jitter. See
+        // `UnifiedWorkspaceTopBar` for the slot-structure and mode-
+        // specific content switch.
         .overlay(alignment: .top) {
-            if isViewerModeActive {
-                ViewerModeTopToolbar(
-                    tabManager: tabManager,
-                    isViewerModeActive: $isViewerModeActive
-                )
-                // Each pane inside the NavigationSplitView applies its
-                // own `.ignoresSafeArea(.container, edges: .top)` so
-                // content can extend up under the titlebar — but the
-                // NavigationSplitView itself does NOT, so an overlay on
-                // it lands below the titlebar/toolbar region. Without
-                // this the bar floated down around y≈170 (screen
-                // report: "レイアウトが崩れてる"). Telling the overlay
-                // to ignore the top container safe area makes it
-                // render flush to window y=0, lining up with the pane
-                // contents that also ignore safe area.
-                .ignoresSafeArea(.container, edges: .top)
-            }
+            UnifiedWorkspaceTopBar(
+                viewMode: $viewMode,
+                tabManager: tabManager,
+                sidebarIsCollapsed: columnVisibility != .all,
+                onTapTitle: revealActiveConversationInList,
+                conversations: libraryViewModel.conversations,
+                onSelectConversation: { id in
+                    // Same path as a click in the middle-pane list
+                    // (and the table view's open-row handler):
+                    // mutating `selectedConversationId` triggers
+                    // `MacOSRootView.onChange` which resolves the
+                    // summary and asks `tabManager` to open it. Keeps
+                    // the reader-tab lifecycle in one place.
+                    libraryViewModel.selectedConversationId = id
+                },
+                repository: services.conversations
+            )
+            // Same rationale as the pane contents: each column ignores
+            // top safe area so content can extend under the titlebar,
+            // and the NavigationSplitView itself does NOT, so the
+            // overlay has to ignore top safe area explicitly to sit
+            // flush at window y=0.
+            .ignoresSafeArea(.container, edges: .top)
+        }
+        .onPreferenceChange(HeaderBarHeightPreferenceKey.self) { newHeight in
+            unifiedHeaderBarHeight = newHeight
         }
         // Trackpad / mouse swipe → toggle Viewer Mode. Lives on the
         // workspace split view (not on a single pane) so the gesture
@@ -378,99 +474,95 @@ struct MacOSRootView: View {
         // tab is a no-op (same as clicking the disabled button); exits
         // are always allowed regardless.
         .viewerModeSwipeGesture(
-            isActive: $isViewerModeActive,
-            canEnter: tabManager.activeTab != nil
+            viewMode: $viewMode,
+            canEnterViewer: tabManager.activeTab != nil
         )
     }
 
+    /// Unified-bar "tap the title pill" handler. Reveals the active
+    /// conversation card in the middle-pane list (paging in if the id
+    /// has fallen off the currently-loaded window) AND rotates
+    /// `scrollToTopToken` so the right-pane body snaps back to the
+    /// conversation header. Lives here (not deeper) because it touches
+    /// both `libraryViewModel` and `tabManager` — the root is the only
+    /// place that holds references to both.
+    private func revealActiveConversationInList() {
+        guard let id = tabManager.activeTab?.conversationID else { return }
+        Task { await libraryViewModel.revealConversation(id: id) }
+        tabManager.scrollToTopToken = UUID()
+    }
+
     private var libraryContentPane: some View {
-        // Overlay pattern (not safeAreaInset) so the List/ScrollView beneath
-        // fills the pane edge-to-edge and its rows actually slide UNDER the
-        // header bar when scrolled. safeAreaInset would clip the scroll
-        // region flush to the bar's bottom edge — no content behind the bar,
-        // no vibrancy blur to see. The bar's measured height is forwarded
-        // to the List as contentMargins(.top) so the first row isn't
-        // permanently hidden under it.
+        // The window-spanning `UnifiedWorkspaceTopBar` floats above
+        // every pane via an overlay on `workspaceSplitView`, so this
+        // pane has no local header bar anymore. Content still extends
+        // under the bar (each column ignores the top safe area), and
+        // the bar's measured height comes back via
+        // `HeaderBarHeightPreferenceKey` to drive the top inset below.
         Group {
-            if isViewerModeActive {
-                // The root-level Viewer-Mode toolbar lives OVER this
-                // pane (as a sibling overlay on the NavigationSplitView)
-                // so reserve 52pt at the top of the prompt list, same
-                // as the other panes do for their own floating bars.
-                // Otherwise the first prompt row sits permanently hidden
-                // behind the toolbar chips.
+            if viewMode == .table {
+                // Table mode: the middle pane becomes a full-width
+                // spreadsheet of every conversation passing the
+                // current sidebar filters. The right (reader) pane is
+                // collapsed to zero width in the split-view config so
+                // the table owns the full content area.
+                ConversationTableView(
+                    viewModel: libraryViewModel,
+                    tabManager: tabManager,
+                    topContentInset: unifiedHeaderBarHeight,
+                    onExitTableMode: { viewMode = .default }
+                )
+            } else if viewMode == .hidden {
+                // Focus sub-mode: middle column is collapsed via
+                // `columnVisibility = .detailOnly`, but macOS's 3-column
+                // NavigationSplitView can still fleetingly render this
+                // pane during the transition (and, in some build
+                // variants, keeps reserving a narrow strip for it even
+                // after the visibility flip). Rendering `Color.clear`
+                // here guarantees the user never sees a flash of the
+                // old prompt-list content under the new toolbar.
+                Color.clear
+            } else if viewMode == .viewer {
+                // Viewer mode: middle pane swaps the card list for a
+                // flat prompt-directory index of the active reader
+                // tab's conversation. Clicking a row asks the reader
+                // (right pane) to jump to that prompt.
                 ViewerModePane(
                     viewModel: libraryViewModel,
                     tabManager: tabManager,
                     conversationID: tabManager.activeTab?.conversationID,
-                    topContentInset: WorkspaceLayoutMetrics.headerBarContentRowHeight
+                    topContentInset: unifiedHeaderBarHeight
                 )
             } else {
+                // Default mode: standard card list. Active filter
+                // chips no longer render here — they live inside the
+                // sidebar's expanded search container.
                 UnifiedConversationListView(
                     viewModel: libraryViewModel,
-                    topContentInset: libraryHeaderBarHeight,
+                    topContentInset: unifiedHeaderBarHeight,
                     onTapTag: { tag in
                         libraryViewModel.toggleBookmarkTag(tag.name)
                     }
                 )
             }
         }
-        // Fade content passing under the floating toolbar strip so rows
-        // dissolve into the chrome instead of hitting a hard edge.
-        // Applied BEFORE the header overlay so the bar itself is not
-        // faded — only the scrolling content beneath. Viewer Mode used
-        // to skip this (back when the title card lived INSIDE the
-        // pane); now that the title lives in the root-level toolbar
-        // the mask can apply uniformly in both modes.
-        .topFadeMask(height: WorkspaceLayoutMetrics.topFadeHeight)
-        .overlay(alignment: .top) {
-            // Toolbar is suppressed entirely while Viewer Mode is active —
-            // sort / date-filter / active-filter chips don't apply to the
-            // focused reading layout, and hiding the whole bar rather than
-            // disabling controls keeps the mode's chrome truly minimal.
-            if !isViewerModeActive {
-                LibraryListHeaderBar(
-                    viewModel: libraryViewModel,
-                    sidebarIsCollapsed: columnVisibility != .all
-                )
-                .background(
-                    GeometryReader { proxy in
-                        Color.clear
-                            .preference(
-                                key: HeaderBarHeightPreferenceKey.self,
-                                value: proxy.size.height
-                            )
-                    }
-                )
-            }
-        }
-        .onPreferenceChange(HeaderBarHeightPreferenceKey.self) { newHeight in
-            libraryHeaderBarHeight = newHeight
-        }
+        // Fade content passing under the floating toolbar strip AND off
+        // the bottom edge so rows dissolve into the chrome instead of
+        // hitting a hard edge. Skip the edge fades in table mode — the
+        // table's column headers live at the top edge and must render
+        // crisp; a top fade would wash them out. The table renders its
+        // own bottom scroll-overshoot inset internally.
+        .edgeFadeMask(
+            top: viewMode == .table ? 0 : WorkspaceLayoutMetrics.topFadeHeight,
+            bottom: viewMode == .table ? 0 : WorkspaceLayoutMetrics.bottomFadeHeight
+        )
     }
 
     private var rightPane: some View {
         ReaderWorkspaceView(
             tabManager: tabManager,
             repository: services.conversations,
-            isViewerModeActive: $isViewerModeActive,
-            onRevealActiveConversationInList: {
-                // Right-pane title tap → reveal the open card in the
-                // middle-pane list. The list view observes
-                // `pendingListScrollConversationID` via its own
-                // ScrollViewReader. The reader-body half of the
-                // "jump to top" combo is owned by
-                // `ReaderTabManager.scrollToTopToken`, which the
-                // ReaderWorkspaceView rotates in the same tap handler.
-                //
-                // `revealConversation(id:)` handles the case where the
-                // card has fallen off the currently-loaded window
-                // (common after a sort change, since the list is
-                // paged forward only) — it loads additional pages
-                // until the id shows up, then fires the scroll request.
-                guard let id = tabManager.activeTab?.conversationID else { return }
-                Task { await libraryViewModel.revealConversation(id: id) }
-            }
+            topContentInset: unifiedHeaderBarHeight
         )
     }
 
@@ -487,23 +579,53 @@ struct MacOSRootView: View {
             viewModel: libraryViewModel,
             dataSource: services.dataSource
         )
-        // Reserve space so the first row isn't hidden behind the
-        // overlay. The height matches the shared header-bar content
-        // row so all three panes' top bands align at the same y.
+        // Reserve space for the sidebar chrome strip (search field
+        // with embedded chip flow + sort/date row). Driven by the
+        // overlay's measured height so the inset grows when active-
+        // filter chips wrap into multiple rows inside the search
+        // container.
         .safeAreaInset(edge: .top, spacing: 0) {
             Color.clear
-                .frame(height: WorkspaceLayoutMetrics.headerBarContentRowHeight)
+                .frame(height: sidebarHeaderHeight)
                 .allowsHitTesting(false)
         }
         .overlay(alignment: .top) {
-            // Finder-pattern top strip: the band itself is transparent,
-            // only the search field carries glass chrome. Rows in the
-            // ScrollView below pass visibly up to the strip's top edge
-            // instead of hitting an opaque material wall.
-            SidebarSearchBar(viewModel: libraryViewModel)
+            // Finder-pattern top strip: search field (which doubles as
+            // the active-filter chip host) on the row that aligns with
+            // the unified top bar, then the narrow-the-results
+            // controls (sort + date) directly below. Both rows are
+            // sidebar-local — they operate on the middle pane via
+            // `LibraryViewModel`, so they belong with the sidebar's
+            // other filtering chrome.
+            VStack(spacing: 0) {
+                SidebarSearchBar(
+                    viewModel: libraryViewModel,
+                    activeFilterChips: libraryViewModel.activeFilterChips,
+                    onClearChip: libraryViewModel.clearFilterChip
+                )
                 .padding(.horizontal, WorkspaceLayoutMetrics.paneHorizontalPadding)
-                .frame(height: WorkspaceLayoutMetrics.headerBarContentRowHeight)
-                .frame(maxWidth: .infinity)
+                .frame(minHeight: WorkspaceLayoutMetrics.headerBarContentRowHeight)
+
+                HStack(spacing: WorkspaceLayoutMetrics.headerBarInteriorSpacing) {
+                    LibraryListSortMenu(viewModel: libraryViewModel)
+                    HeaderDateRangePicker(viewModel: libraryViewModel)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, WorkspaceLayoutMetrics.paneHorizontalPadding)
+                .frame(height: WorkspaceLayoutMetrics.sidebarControlsRowHeight)
+            }
+            .frame(maxWidth: .infinity)
+            .background(
+                GeometryReader { proxy in
+                    Color.clear.preference(
+                        key: SidebarHeaderHeightPreferenceKey.self,
+                        value: proxy.size.height
+                    )
+                }
+            )
+        }
+        .onPreferenceChange(SidebarHeaderHeightPreferenceKey.self) { newValue in
+            sidebarHeaderHeight = newValue
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .navigationSplitViewColumnWidth(
@@ -1005,6 +1127,11 @@ private struct UnifiedConversationListView: View {
                             }
                         }
                     )
+                    // NOTE: `.equatable()` was tried here for tag-drop perf,
+                    // but it caused intermittent "card click doesn't open"
+                    // — `List` with a `selection:` binding does not play
+                    // well with `EquatableView` wrapping its rows. The
+                    // optimization isn't worth the broken primary action.
                     .tag(conversation.id)
                     .id(conversation.id)
                     .onAppear {
@@ -1030,8 +1157,20 @@ private struct UnifiedConversationListView: View {
                 // row is flush with the bar's bottom edge and never
                 // occluded.
                 .safeAreaInset(edge: .top, spacing: 0) {
+                    // Reserve room for the unified top bar so the
+                    // List's first row sits flush with the bar's
+                    // bottom edge instead of being hidden behind it.
                     Color.clear
                         .frame(height: topContentInset)
+                        .allowsHitTesting(false)
+                }
+                // Mirror the top inset at the bottom so the last row can
+                // scroll UP past the bottom-fade zone and be read at
+                // full opacity. Without this the final card's title
+                // sits permanently under the fade mask.
+                .safeAreaInset(edge: .bottom, spacing: 0) {
+                    Color.clear
+                        .frame(height: WorkspaceLayoutMetrics.bottomFadeHeight)
                         .allowsHitTesting(false)
                 }
                 .overlay(alignment: .bottom) {
@@ -1393,115 +1532,37 @@ private struct SidebarToggleHider: NSViewRepresentable {
     }
 }
 
-/// Window-spanning toolbar that appears only while Viewer Mode is active.
+/// Finder-style segmented picker mounted as an `NSToolbarItem` in the
+/// window title bar (`MacOSRootView.workspaceSplitView`'s `.toolbar`).
+/// Four glyph segments — テーブル / デフォルト / ビューアー / フォーカス —
+/// matching the ordering of `MiddlePaneMode`'s cascade left-to-right so the
+/// control reads the same way the trackpad swipe feels. Always visible
+/// across all four modes; no disabled states — the cascade accepts any
+/// target, and writing a mode with no active conversation just lands
+/// the user in an empty reader pane, same as the swipe path.
 ///
-/// Previously the Viewer-Mode controls (book toggle, title chip,
-/// prev/next, export) lived inside the right pane's `ReaderWorkspaceHeaderBar`,
-/// which made them clump together at the right pane's leading edge and
-/// left a lot of unused space in the middle pane's top strip. The user
-/// asked for one balanced toolbar across the whole window top, so the
-/// controls now render here as an overlay on top of the NavigationSplit-
-/// View (see `MacOSRootView.workspaceSplitView`). The leading 80pt
-/// clear-space matches the `LibraryListHeaderBar` traffic-light dodge
-/// so the book toggle lands right after the macOS traffic-light cluster.
-///
-/// The right pane's own header bar is suppressed while Viewer Mode is
-/// active (`ReaderWorkspaceView.body` guards its overlay on
-/// `!isViewerModeActive`), so there's no double bar.
-private struct ViewerModeTopToolbar: View {
-    @Bindable var tabManager: ReaderTabManager
-    @Binding var isViewerModeActive: Bool
+/// Rendered with `.pickerStyle(.segmented)` so macOS paints the
+/// standard segment chrome + selection highlight — this is the whole
+/// point of the "use Finder's familiar design" user ask, we just lean
+/// on the built-in segmented control rather than rolling our own.
+/// Not private: mounted by `UnifiedWorkspaceTopBar` at the trailing
+/// edge of the window-spanning top bar. The picker occupies a fixed
+/// slot in every view mode so its x-coordinate stays stable as the
+/// user cascades through table → default → viewer → focus.
+struct MiddlePaneModePicker: View {
+    @Binding var selection: MiddlePaneMode
 
     var body: some View {
-        HStack(spacing: WorkspaceLayoutMetrics.headerChipHorizontalPadding) {
-            // Traffic-light clearance. 140pt matches the
-            // `LibraryListHeaderBar` traffic-light + sidebar-toggle
-            // dodge: in theory we removed the sidebar-toggle item
-            // (see `SidebarToggleHider`) and only needed 80pt, but
-            // the removal has been observed to fail when AppKit
-            // replaces the toolbar instance from under us — the
-            // stray toggle glyph ends up right on top of this
-            // button. At 140pt, even if the glyph sneaks back in,
-            // the book (exit) button stays clickable. Harmless
-            // cosmetic cost when the removal works as intended; a
-            // hard-stuck Viewer Mode otherwise.
-            Color.clear.frame(width: 140, height: 1)
-
-            ViewerModeToggleButton(
-                isActive: $isViewerModeActive,
-                isEnabled: tabManager.activeDetail != nil
-            )
-
-            if let summary = tabManager.activeDetail?.summary {
-                ViewerModeTitleChip(summary: summary) {
-                    // Same behavior as the non-viewer-mode title pill in
-                    // `ReaderHeaderTitlePill`: scroll the reader body
-                    // back to the conversation header. The
-                    // `ViewerModePane` middle pane also observes this
-                    // token and resets its prompt-directory scroll so
-                    // both panes snap to top together.
-                    tabManager.scrollToTopToken = UUID()
-                }
-                // Absorb leftover horizontal room so long titles
-                // breathe instead of truncating immediately.
-                .layoutPriority(1)
+        Picker("View Mode", selection: $selection) {
+            ForEach(MiddlePaneMode.allCases) { mode in
+                Image(systemName: mode.systemImage)
+                    .help(mode.displayName)
+                    .tag(mode)
             }
-
-            Spacer(minLength: 0)
-
-            WorkspaceFloatingExportButton(detail: tabManager.activeDetail)
         }
-        .padding(.horizontal, WorkspaceLayoutMetrics.headerBarHorizontalPadding)
-        .frame(height: WorkspaceLayoutMetrics.headerBarContentRowHeight)
-        .frame(maxWidth: .infinity)
-    }
-}
-
-/// Glass-capsule chip showing the current conversation's title + ISO
-/// date. Used in the root-level Viewer-Mode toolbar. Matches the shape
-/// and material of the sort / outline pills so the top strip reads as
-/// one family of chips.
-private struct ViewerModeTitleChip: View {
-    let summary: ConversationSummary
-    /// Fired when the user clicks the chip. Mirrors the non-Viewer-Mode
-    /// `ReaderHeaderTitlePill`: the parent rotates
-    /// `ReaderTabManager.scrollToTopToken` so the right-pane body AND
-    /// the middle-pane prompt directory both snap back to their top.
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 8) {
-                Image(systemName: "arrow.up.to.line")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-
-                Text(summary.displayTitle)
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-
-                if let time = summary.primaryTime {
-                    Text(String(time.prefix(10)))
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .padding(.horizontal, WorkspaceLayoutMetrics.headerChipHorizontalPadding)
-            .frame(height: WorkspaceLayoutMetrics.headerChipHeight)
-            .contentShape(Capsule(style: .continuous))
-        }
-        .buttonStyle(.plain)
-        .background(
-            Capsule(style: .continuous)
-                .fill(.thinMaterial)
-        )
-        .overlay(
-            Capsule(style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
-        )
-        .help("Jump to top")
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .help("ビュー切替")
     }
 }
 

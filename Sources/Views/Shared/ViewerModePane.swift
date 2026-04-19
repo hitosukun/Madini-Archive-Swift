@@ -170,11 +170,11 @@ struct ViewerModePane: View {
     }
 }
 
-/// One entry in the viewer pane's prompt directory listing. Matches the
-/// reader-popover's `PromptOutlineRow` styling when `isSelected` is true
-/// (accent-tinted background + trailing checkmark) so the two views
-/// agree on what "the current prompt" looks like. Outside selection the
-/// row shows only hover feedback + alternating stripes.
+/// One entry in the viewer pane's prompt directory listing. The
+/// row carries an accent-tinted background plus a trailing checkmark
+/// when `isSelected` is true so the user can glance at the pane and
+/// see which prompt the reader is currently parked on. Outside
+/// selection the row shows only hover feedback + alternating stripes.
 private struct ViewerPromptRow: View {
     let prompt: ConversationPromptOutlineItem
     let isAlternate: Bool
@@ -220,9 +220,7 @@ private struct ViewerPromptRow: View {
 
     /// Layering: selection tint > hover tint > zebra stripe > clear.
     /// The selection tint is strong enough to read at a glance even on
-    /// top of the stripe it would otherwise inherit. Matches the reader
-    /// popover's `PromptOutlineRow.rowBackground` layering so both views
-    /// agree on what "the current prompt" looks like.
+    /// top of the stripe it would otherwise inherit.
     private var rowBackground: Color {
         if isSelected {
             return Color.accentColor.opacity(0.18)
