@@ -33,7 +33,6 @@ struct MadiniArchiveApp: App {
         }
         #if os(macOS)
         .defaultSize(width: 1200, height: 800)
-        .windowStyle(.hiddenTitleBar)
         .commands {
             AppCommands()
         }

@@ -6,13 +6,6 @@ import AppKit
 struct ReaderWorkspaceView: View {
     @Bindable var tabManager: ReaderTabManager
     let repository: any ConversationRepository
-    /// Reserved room above the first line of reader content. The
-    /// window-spanning `UnifiedWorkspaceTopBar` floats above this pane
-    /// (mounted at the NavigationSplitView level in `MacOSRootView`) and
-    /// its measured height is passed in here so rows can slide under
-    /// the bar and get blurred by its vibrancy material — the local
-    /// reader-pane header bar that used to live here has been removed.
-    var topContentInset: CGFloat = WorkspaceLayoutMetrics.headerBarContentRowHeight
 
     // `selectedPromptID` lives on `tabManager` (see its doc comment) so
     // the viewer-mode middle pane can observe the same reading position
@@ -118,19 +111,11 @@ struct ReaderWorkspaceView: View {
                 workspaceFocused = true
             }
         }
-        // Inject the measured header-bar height so descendants (notably
-        // `ConversationDetailView`'s inner ScrollView) can reserve
-        // top-of-content room without having the bar take that space out
-        // of their scrollable region. The bar itself is mounted on the
-        // root `workspaceSplitView`, so its height arrives here as a
-        // parameter from `MacOSRootView` instead of being measured in
-        // this view directly.
-        .environment(\.scrollTopContentInset, topContentInset)
-        // Fade message content as it scrolls up under the floating
-        // toolbar strip AND off the bottom edge. Same technique as the
-        // middle pane — see MacOSRootView.libraryContentPane.
+        // Bottom fade only — the top used to fade under the overlay
+        // bar, but with the standard window toolbar the system handles
+        // that edge and a top fade just dims crisp content.
         .edgeFadeMask(
-            top: WorkspaceLayoutMetrics.topFadeHeight,
+            top: 0,
             bottom: WorkspaceLayoutMetrics.bottomFadeHeight
         )
     }
@@ -182,7 +167,10 @@ struct ReaderWorkspaceView: View {
 /// between the two halves so the chip reads as a "Title › Prompt"
 /// breadcrumb rather than two unrelated buttons under one capsule.
 ///
-/// Mounted by `UnifiedWorkspaceTopBar` in every mode (table included).
+/// Mounted into the native window toolbar's `.principal` slot by
+/// `MacOSRootView.workspaceSplitView` so it's present in every mode
+/// (table included) and its x-coordinate doesn't jump as the user
+/// cascades through middle-pane modes.
 struct ReaderHeaderActivityPill: View {
     let activeDetail: ConversationDetail?
     let promptOutline: [ConversationPromptOutlineItem]

@@ -231,12 +231,6 @@ private struct LoadedConversationDetailView: View {
     let detail: ConversationDetail
     let showsSystemChrome: Bool
 
-    /// Reader pane pushes its floating-header-bar height in via environment
-    /// so the ScrollView below can reserve matching top space without
-    /// losing scroll extent. `nil` on iOS / previews — those paths render
-    /// without an overlay bar, so no margin is needed.
-    @Environment(\.scrollTopContentInset) private var scrollTopContentInset
-
     /// Written whenever the scroll-position observer updates
     /// `selectedPromptID`. `.onChange(of: selectedPromptID)` consults
     /// this to decide whether the change came from the user tapping
@@ -349,7 +343,6 @@ private struct LoadedConversationDetailView: View {
                     }
                     .coordinateSpace(name: ScrollCoordinateSpace.conversation)
                     .scrollContentBackground(.hidden)
-                    .contentMargins(.top, scrollTopContentInset ?? 0, for: .scrollContent)
                     // Reserve scroll-overshoot room at the bottom equal to
                     // the bottom-fade height. Without this the last line
                     // of the conversation stops at the fade's midpoint

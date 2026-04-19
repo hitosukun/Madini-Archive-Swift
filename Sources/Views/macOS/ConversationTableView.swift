@@ -37,12 +37,6 @@ import AppKit
 struct ConversationTableView: View {
     @Bindable var viewModel: LibraryViewModel
     let tabManager: ReaderTabManager
-    /// Height of the window-spanning unified top bar that floats above
-    /// this pane. Drives a top `safeAreaInset` so the column headers
-    /// aren't hidden under the bar. Passed in from `MacOSRootView`
-    /// which measures the bar at runtime — the bar grows a footer row
-    /// when source-file filter chips are present.
-    var topContentInset: CGFloat = WorkspaceLayoutMetrics.headerBarContentRowHeight
     /// Called when the user activates a row (double-click or Enter).
     /// The parent (`MacOSRootView`) uses this to flip `viewMode` back
     /// to `.default` so the opened conversation is actually visible in
@@ -124,15 +118,6 @@ struct ConversationTableView: View {
         ScrollViewReader { proxy in
             Table(rows, selection: $selection, sortOrder: $sortOrder) {
                 tableColumns
-            }
-            // Reserve room at the top so the column-header row isn't
-            // hidden under the unified bar. Active-filter chips no longer
-            // render here — they live in the sidebar's expanded search
-            // container and apply globally regardless of middle-pane mode.
-            .safeAreaInset(edge: .top, spacing: 0) {
-                Color.clear
-                    .frame(height: topContentInset)
-                    .allowsHitTesting(false)
             }
             // Horizontal swipe → `MiddlePaneMode` cascade is now handled
             // exclusively by the single `ViewerModeSwipeGesture` installed

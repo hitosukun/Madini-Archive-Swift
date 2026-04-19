@@ -174,53 +174,6 @@ extension View {
     }
 }
 
-/// Communicates the measured height of a floating header bar to the
-/// scrollable content underneath so it can apply the correct top
-/// `contentMargins` inset. Used by both the middle and right panes — the
-/// bar's height is variable (active-filter chip strip adds a second row),
-/// so we measure at layout time instead of hard-coding.
-struct HeaderBarHeightPreferenceKey: PreferenceKey {
-    static var defaultValue: CGFloat = WorkspaceLayoutMetrics.headerBarContentRowHeight
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        // Take the maximum so a taller snapshot wins — prevents a transient
-        // zero from an intermediate layout pass collapsing the inset.
-        value = max(value, nextValue())
-    }
-}
-
-/// Dynamic height of the sidebar's chrome strip overlay (search field
-/// + sort/date controls + active-filter chip flow). The search field
-/// container expands vertically when chips wrap into multiple rows, so
-/// the inset above the scrolling sidebar content can't be a constant.
-/// Measured by the overlay and consumed by the sidebar's
-/// `safeAreaInset` so the first sidebar row always sits flush with the
-/// strip's bottom edge.
-struct SidebarHeaderHeightPreferenceKey: PreferenceKey {
-    static var defaultValue: CGFloat =
-        WorkspaceLayoutMetrics.headerBarContentRowHeight
-        + WorkspaceLayoutMetrics.sidebarControlsRowHeight
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = max(value, nextValue())
-    }
-}
-
-/// Environment value carrying the current pane's floating-header-bar height
-/// into deeply nested scroll views. Used by the reader pane (right column)
-/// so `ConversationDetailView` → `LoadedConversationDetailView` can apply
-/// `.contentMargins(.top, …, for: .scrollContent)` without threading a
-/// parameter through every intermediate initializer. Default is `nil` so
-/// iOS / preview callsites don't accidentally pick up a margin.
-private struct ScrollTopContentInsetKey: EnvironmentKey {
-    static let defaultValue: CGFloat? = nil
-}
-
-extension EnvironmentValues {
-    var scrollTopContentInset: CGFloat? {
-        get { self[ScrollTopContentInsetKey.self] }
-        set { self[ScrollTopContentInsetKey.self] = newValue }
-    }
-}
-
 /// A reusable header bar container used by both the middle and right panes.
 ///
 /// Keeps the visual style (height, background, divider, paddings) consistent

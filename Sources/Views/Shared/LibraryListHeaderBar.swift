@@ -1,9 +1,9 @@
 import SwiftUI
 
-/// Middle-pane sort-order pull-down, extracted from the now-retired
-/// `LibraryListHeaderBar` so `UnifiedWorkspaceTopBar` (the single window-
-/// spanning top strip) can mount it directly without wrapping the whole
-/// legacy bar.
+/// Middle-pane sort-order pull-down. Mounted inside the left sidebar's
+/// narrow-the-results row (under the search field) — sort and date
+/// filters both live with the sidebar because they operate on the
+/// middle-pane-driving `LibraryViewModel`.
 ///
 /// Flat menu (no enclosing Picker) — using `Picker` inside `Menu`
 /// produces a nested "Sort ▸" submenu item, which adds a useless
@@ -70,11 +70,10 @@ struct LibraryListSortMenu: View {
     }
 }
 
-/// Horizontal flow of deletable active-filter pills. Rendered by
-/// `UnifiedWorkspaceTopBar` on its leading slot (primary chips) and
-/// its footer row (source-file chips). Kept as its own `struct` so
-/// both sites share the visual treatment without copy-pasting the
-/// `FilterChipView` + color table.
+/// Horizontal flow of deletable active-filter pills. Rendered by the
+/// sidebar's `SidebarSearchBar` active-filter strip. Kept as its own
+/// `struct` so future sites can reuse the visual treatment without
+/// copy-pasting the `FilterChipView` + color table.
 struct ActiveFilterChipsView: View {
     let chips: [LibraryActiveFilterChip]
     let onClear: (LibraryActiveFilterChip) -> Void

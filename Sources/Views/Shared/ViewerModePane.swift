@@ -31,28 +31,9 @@ struct ViewerModePane: View {
     /// placeholder (the entry button in the reader toolbar is already
     /// disabled in this state so this is mostly defensive).
     let conversationID: String?
-    /// Space reserved at the top so the viewer-mode header card isn't
-    /// hidden under a floating overlay. In practice viewer mode hides the
-    /// middle-pane toolbar entirely, so callers pass `0` — but the
-    /// parameter stays so this pane can be reused in contexts that DO
-    /// float a bar above it without re-plumbing.
-    var topContentInset: CGFloat = 0
 
     var body: some View {
-        // Just the prompt directory now — the conversation title has
-        // moved to the right pane's header bar. If the caller reserved
-        // space above us (`topContentInset` > 0, e.g. a hypothetical
-        // middle-pane toolbar sits above), honor it with a safeAreaInset
-        // so the first row isn't hidden. In the Viewer-Mode path
-        // `topContentInset` is 0 so the list sits flush with the top.
         promptIndex
-            .safeAreaInset(edge: .top, spacing: 0) {
-                if topContentInset > 0 {
-                    Color.clear
-                        .frame(height: topContentInset)
-                        .allowsHitTesting(false)
-                }
-            }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         // Reload the outline whenever the active reader tab changes so
         // the middle pane tracks the reader's current conversation. The

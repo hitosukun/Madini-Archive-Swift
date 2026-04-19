@@ -20,19 +20,6 @@ struct MacOSRootView: View {
     /// collapsed — otherwise the macOS traffic-light buttons overlap the
     /// content column's leading toolbar.
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
-    /// Measured height of the single window-spanning top bar. Drives the
-    /// top `.safeAreaInset` on every pane underneath so rows can scroll
-    /// under the bar and get blurred by its vibrancy material. Variable
-    /// because the bar grows a footer row when source-file filter chips
-    /// are present.
-    @State private var unifiedHeaderBarHeight: CGFloat = WorkspaceLayoutMetrics.headerBarContentRowHeight
-    /// Measured height of the sidebar's chrome strip overlay (search +
-    /// sort/date + chip flow). Variable because the search field's
-    /// glass container expands when active-filter chips wrap. Drives
-    /// the sidebar's `safeAreaInset` so the first scrolling row always
-    /// sits flush below the strip.
-    @State private var sidebarHeaderHeight: CGFloat = WorkspaceLayoutMetrics.headerBarContentRowHeight
-        + WorkspaceLayoutMetrics.sidebarControlsRowHeight
     /// Single source of truth for the workspace layout. Replaces the
     /// three mutually-exclusive `is*Active: Bool` flags this view used
     /// to carry separately (`isViewerModeActive` / `isFocusViewerActive`
@@ -338,7 +325,6 @@ struct MacOSRootView: View {
             librarySidebar
         } content: {
             libraryContentPane
-                .ignoresSafeArea(.container, edges: .top)
                 // In focus sub-mode the middle column collapses to zero
                 // width so only the detail pane remains visible. macOS's
                 // `NavigationSplitViewVisibility.detailOnly` does NOT
@@ -369,7 +355,6 @@ struct MacOSRootView: View {
                 )
         } detail: {
             rightPane
-                .ignoresSafeArea(.container, edges: .top)
                 // Table mode: collapse the reader pane to zero width so
                 // the middle (table) pane absorbs the full remaining
                 // space. Same column-width trick used for focus mode on
@@ -384,39 +369,51 @@ struct MacOSRootView: View {
                     max: viewMode == .table ? 0 : .infinity
                 )
         }
-        // Single window-spanning top bar. Always mounted over all three
-        // columns regardless of mode — the bar's outer shell (height,
-        // padding, divider) never changes so swipe transitions no
-        // longer produce toolbar-rebuild jitter. See
-        // `UnifiedWorkspaceTopBar` for the slot-structure and mode-
-        // specific content switch.
-        .overlay(alignment: .top) {
-            UnifiedWorkspaceTopBar(
-                viewMode: $viewMode,
-                tabManager: tabManager,
-                sidebarIsCollapsed: columnVisibility != .all,
-                conversations: libraryViewModel.conversations,
-                onSelectConversation: { id in
-                    // Same path as a click in the middle-pane list
-                    // (and the table view's open-row handler):
-                    // mutating `selectedConversationId` triggers
-                    // `MacOSRootView.onChange` which resolves the
-                    // summary and asks `tabManager` to open it. Keeps
-                    // the reader-tab lifecycle in one place.
-                    libraryViewModel.selectedConversationId = id
-                },
-                onTitlePulldownOpen: revealActiveConversationInMiddlePane,
-                onDoubleTapBlankArea: scrollAllPanesToTop
-            )
-            // Same rationale as the pane contents: each column ignores
-            // top safe area so content can extend under the titlebar,
-            // and the NavigationSplitView itself does NOT, so the
-            // overlay has to ignore top safe area explicitly to sit
-            // flush at window y=0.
-            .ignoresSafeArea(.container, edges: .top)
-        }
-        .onPreferenceChange(HeaderBarHeightPreferenceKey.self) { newHeight in
-            unifiedHeaderBarHeight = newHeight
+        // Window toolbar — the single home for window-chrome controls.
+        // Mounting into the real `.toolbar { }` (instead of a SwiftUI
+        // overlay over the NavigationSplitView, which we tried earlier)
+        // lets the system handle traffic-light clearance, fullscreen
+        // auto-hide, and safe-area insets automatically. The previous
+        // overlay approach fought AppKit for the titlebar region and
+        // broke on every window-state change — see commit history.
+        //
+        // Responsibility split:
+        //   * `.principal`: navigation bar (title + prompt pulldown).
+        //     Mounted in every mode (including `.table`) so its position
+        //     stays stable across the cascade.
+        //   * `.primaryAction`: share button + middle-pane mode picker.
+        //     Mode picker always-trailing matches Finder/Safari tab-bar
+        //     convention.
+        // Sort menu / date range / search / filter chips all live in
+        // the left sidebar (they control sidebar-driven filtering of
+        // the middle pane — see `project_three_pane_architecture`).
+        .toolbar(id: "workspace") {
+            ToolbarItem(id: "navigation-bar", placement: .principal) {
+                ReaderHeaderActivityPill(
+                    activeDetail: tabManager.activeDetail,
+                    promptOutline: tabManager.promptOutline,
+                    selectedPromptID: tabManager.selectedPromptID,
+                    onSelectPrompt: { id in
+                        tabManager.requestPromptSelection(id)
+                    },
+                    conversations: libraryViewModel.conversations,
+                    onSelectConversation: { id in
+                        // Same path as a click in the middle-pane list:
+                        // mutating `selectedConversationId` triggers
+                        // `MacOSRootView.onChange` which resolves the
+                        // summary and asks `tabManager` to open it. Keeps
+                        // the reader-tab lifecycle in one place.
+                        libraryViewModel.selectedConversationId = id
+                    },
+                    onTitlePulldownOpen: revealActiveConversationInMiddlePane
+                )
+            }
+            ToolbarItem(id: "share", placement: .primaryAction) {
+                WorkspaceFloatingExportButton(detail: tabManager.activeDetail)
+            }
+            ToolbarItem(id: "mode-picker", placement: .primaryAction) {
+                MiddlePaneModePicker(selection: $viewMode)
+            }
         }
         // Trackpad / mouse swipe → toggle Viewer Mode. Lives on the
         // workspace split view (not on a single pane) so the gesture
@@ -451,36 +448,12 @@ struct MacOSRootView: View {
         Task { await libraryViewModel.revealConversation(id: id) }
     }
 
-    /// Double-tap on the unified top bar's blank chrome → snap each
-    /// pane back to the top. Window-chrome convention (matches macOS
-    /// app titlebars / browser tab bars where double-clicking blank
-    /// chrome jumps content to the top).
-    ///
-    /// Coverage today:
-    ///   * Right pane (reader) — via `tabManager.scrollToTopToken`.
-    ///   * Middle pane in Viewer Mode — same token (`ViewerModePane`
-    ///     observes it for its prompt-directory scroll).
-    ///   * Middle pane in default list mode — via
-    ///     `pendingListScrollConversationID`, set to the first card.
-    ///
-    /// Not yet covered: Table mode (SwiftUI `Table` lacks a clean
-    /// programmatic scroll API) and the left sidebar (already
-    /// short enough that scrolling rarely matters). Both can be
-    /// added later without changing this entry point.
-    private func scrollAllPanesToTop() {
-        tabManager.scrollToTopToken = UUID()
-        if let firstID = libraryViewModel.conversations.first?.id {
-            libraryViewModel.pendingListScrollConversationID = firstID
-        }
-    }
-
     private var libraryContentPane: some View {
-        // The window-spanning `UnifiedWorkspaceTopBar` floats above
-        // every pane via an overlay on `workspaceSplitView`, so this
-        // pane has no local header bar anymore. Content still extends
-        // under the bar (each column ignores the top safe area), and
-        // the bar's measured height comes back via
-        // `HeaderBarHeightPreferenceKey` to drive the top inset below.
+        // Window chrome (title pill, share, mode picker) lives in the
+        // real window toolbar (`.toolbar { }` on `workspaceSplitView`),
+        // so this pane no longer needs to reserve room for a floating
+        // overlay. Each sub-view starts flush below the system toolbar
+        // via standard safe-area insets.
         Group {
             if viewMode == .table {
                 // Table mode: the middle pane becomes a full-width
@@ -491,18 +464,14 @@ struct MacOSRootView: View {
                 ConversationTableView(
                     viewModel: libraryViewModel,
                     tabManager: tabManager,
-                    topContentInset: unifiedHeaderBarHeight,
                     onExitTableMode: { viewMode = .default }
                 )
             } else if viewMode == .hidden {
                 // Focus sub-mode: middle column is collapsed via
                 // `columnVisibility = .detailOnly`, but macOS's 3-column
                 // NavigationSplitView can still fleetingly render this
-                // pane during the transition (and, in some build
-                // variants, keeps reserving a narrow strip for it even
-                // after the visibility flip). Rendering `Color.clear`
-                // here guarantees the user never sees a flash of the
-                // old prompt-list content under the new toolbar.
+                // pane during the transition. `Color.clear` guarantees
+                // the user never sees a flash of stale content.
                 Color.clear
             } else if viewMode == .viewer {
                 // Viewer mode: middle pane swaps the card list for a
@@ -512,8 +481,7 @@ struct MacOSRootView: View {
                 ViewerModePane(
                     viewModel: libraryViewModel,
                     tabManager: tabManager,
-                    conversationID: tabManager.activeTab?.conversationID,
-                    topContentInset: unifiedHeaderBarHeight
+                    conversationID: tabManager.activeTab?.conversationID
                 )
             } else {
                 // Default mode: standard card list. Active filter
@@ -521,21 +489,20 @@ struct MacOSRootView: View {
                 // sidebar's expanded search container.
                 UnifiedConversationListView(
                     viewModel: libraryViewModel,
-                    topContentInset: unifiedHeaderBarHeight,
                     onTapTag: { tag in
                         libraryViewModel.toggleBookmarkTag(tag.name)
                     }
                 )
             }
         }
-        // Fade content passing under the floating toolbar strip AND off
-        // the bottom edge so rows dissolve into the chrome instead of
-        // hitting a hard edge. Skip the edge fades in table mode — the
-        // table's column headers live at the top edge and must render
-        // crisp; a top fade would wash them out. The table renders its
-        // own bottom scroll-overshoot inset internally.
+        // Bottom fade only — the previous top fade existed so rows
+        // dissolving into the floating overlay bar read as soft-
+        // landing rather than clipped. With the standard window
+        // toolbar in charge, the system draws its own material backing
+        // and a top fade would just dim content that the toolbar
+        // already separates visually.
         .edgeFadeMask(
-            top: viewMode == .table ? 0 : WorkspaceLayoutMetrics.topFadeHeight,
+            top: 0,
             bottom: viewMode == .table ? 0 : WorkspaceLayoutMetrics.bottomFadeHeight
         )
     }
@@ -543,72 +510,15 @@ struct MacOSRootView: View {
     private var rightPane: some View {
         ReaderWorkspaceView(
             tabManager: tabManager,
-            repository: services.conversations,
-            topContentInset: unifiedHeaderBarHeight
+            repository: services.conversations
         )
     }
 
     private var librarySidebar: some View {
-        // Floating-search-bar layout. Previously the sidebar was a
-        // VStack(search, scroll) which stacked opaque rows and left no
-        // visible window material at the top. Now the ScrollView fills
-        // the column and the search bar rides as a frosted overlay at
-        // the top — same pattern as the middle pane's filter bar and
-        // the right pane's reader toolbar. Rows scroll up under the
-        // search band and blur, which gives the whole sidebar the same
-        // "openness" the other two columns get.
         UnifiedLibrarySidebar(
             viewModel: libraryViewModel,
             dataSource: services.dataSource
         )
-        // Reserve space for the sidebar chrome strip (search field
-        // with embedded chip flow + sort/date row). Driven by the
-        // overlay's measured height so the inset grows when active-
-        // filter chips wrap into multiple rows inside the search
-        // container.
-        .safeAreaInset(edge: .top, spacing: 0) {
-            Color.clear
-                .frame(height: sidebarHeaderHeight)
-                .allowsHitTesting(false)
-        }
-        .overlay(alignment: .top) {
-            // Finder-pattern top strip: search field (which doubles as
-            // the active-filter chip host) on the row that aligns with
-            // the unified top bar, then the narrow-the-results
-            // controls (sort + date) directly below. Both rows are
-            // sidebar-local — they operate on the middle pane via
-            // `LibraryViewModel`, so they belong with the sidebar's
-            // other filtering chrome.
-            VStack(spacing: 0) {
-                SidebarSearchBar(
-                    viewModel: libraryViewModel,
-                    activeFilterChips: libraryViewModel.activeFilterChips,
-                    onClearChip: libraryViewModel.clearFilterChip
-                )
-                .padding(.horizontal, WorkspaceLayoutMetrics.paneHorizontalPadding)
-                .frame(minHeight: WorkspaceLayoutMetrics.headerBarContentRowHeight)
-
-                HStack(spacing: WorkspaceLayoutMetrics.headerBarInteriorSpacing) {
-                    LibraryListSortMenu(viewModel: libraryViewModel)
-                    HeaderDateRangePicker(viewModel: libraryViewModel)
-                    Spacer(minLength: 0)
-                }
-                .padding(.horizontal, WorkspaceLayoutMetrics.paneHorizontalPadding)
-                .frame(height: WorkspaceLayoutMetrics.sidebarControlsRowHeight)
-            }
-            .frame(maxWidth: .infinity)
-            .background(
-                GeometryReader { proxy in
-                    Color.clear.preference(
-                        key: SidebarHeaderHeightPreferenceKey.self,
-                        value: proxy.size.height
-                    )
-                }
-            )
-        }
-        .onPreferenceChange(SidebarHeaderHeightPreferenceKey.self) { newValue in
-            sidebarHeaderHeight = newValue
-        }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .navigationSplitViewColumnWidth(
             min: WorkspaceLayoutMetrics.sidebarMinWidth,
@@ -636,6 +546,33 @@ private struct UnifiedLibrarySidebar: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
+                // Sidebar chrome — search field (which also hosts the
+                // active-filter chip flow) + narrow-the-results row
+                // (sort + date). Renders as the first children of the
+                // ScrollView so the whole strip scrolls with the list
+                // instead of pinning as an overlay. An earlier iteration
+                // floated it as an `.overlay(alignment: .top)` over the
+                // sidebar, but that fought AppKit for titlebar real
+                // estate and produced a "black band covering the
+                // search field" regression when combined with the
+                // window-spanning unified top bar.
+                VStack(alignment: .leading, spacing: 0) {
+                    SidebarSearchBar(
+                        viewModel: viewModel,
+                        activeFilterChips: viewModel.activeFilterChips,
+                        onClearChip: viewModel.clearFilterChip
+                    )
+                    .frame(minHeight: WorkspaceLayoutMetrics.headerBarContentRowHeight)
+
+                    HStack(spacing: WorkspaceLayoutMetrics.headerBarInteriorSpacing) {
+                        LibraryListSortMenu(viewModel: viewModel)
+                        HeaderDateRangePicker(viewModel: viewModel)
+                        Spacer(minLength: 0)
+                    }
+                    .frame(height: WorkspaceLayoutMetrics.sidebarControlsRowHeight)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
                 section(title: "Library") {
                     SidebarSelectionRow(
                         title: "All",
@@ -1058,10 +995,6 @@ private struct RoleGrid: View {
 
 private struct UnifiedConversationListView: View {
     @Bindable var viewModel: LibraryViewModel
-    /// Top content inset — reserves vertical room above the first row so it
-    /// isn't permanently hidden under the floating header bar overlay.
-    /// Passed in from the parent which measures the bar's height at runtime.
-    var topContentInset: CGFloat = WorkspaceLayoutMetrics.headerBarContentRowHeight
     let onTapTag: (TagEntry) -> Void
 
     var body: some View {
@@ -1126,31 +1059,10 @@ private struct UnifiedConversationListView: View {
                         }
                     }
                 }
-                // Hide the List's built-in opaque backdrop so the top header
-                // bar's vibrancy material has something to blur against
-                // (whatever shows through from the pane/window behind it).
+                // Hide the List's built-in opaque backdrop so the pane
+                // window material shows through behind rows.
                 .scrollContentBackground(.hidden)
-                // `.contentMargins(.top, X, for: .scrollContent)` is the
-                // "correct" API for this on ScrollView, but macOS List
-                // reliably IGNORES it and places its first row at the
-                // pane's top edge — exactly behind the overlay header bar,
-                // which is how the user sees cards disappearing under the
-                // bar. `.safeAreaInset(edge: .top)` reserves space through
-                // a path List *does* honor: it shrinks the scroll region
-                // from above and draws the inset content (an invisible
-                // Color.clear) in that reserved band. The header-bar
-                // overlay sits in front of that band, so the List's first
-                // row is flush with the bar's bottom edge and never
-                // occluded.
-                .safeAreaInset(edge: .top, spacing: 0) {
-                    // Reserve room for the unified top bar so the
-                    // List's first row sits flush with the bar's
-                    // bottom edge instead of being hidden behind it.
-                    Color.clear
-                        .frame(height: topContentInset)
-                        .allowsHitTesting(false)
-                }
-                // Mirror the top inset at the bottom so the last row can
+                // Mirror the bottom-fade inset so the last row can
                 // scroll UP past the bottom-fade zone and be read at
                 // full opacity. Without this the final card's title
                 // sits permanently under the fade mask.
@@ -1265,10 +1177,12 @@ private struct SearchSavedFiltersSection: View {
 /// standard segment chrome + selection highlight — this is the whole
 /// point of the "use Finder's familiar design" user ask, we just lean
 /// on the built-in segmented control rather than rolling our own.
-/// Not private: mounted by `UnifiedWorkspaceTopBar` at the trailing
-/// edge of the window-spanning top bar. The picker occupies a fixed
-/// slot in every view mode so its x-coordinate stays stable as the
-/// user cascades through table → default → viewer → focus.
+/// Not private: mounted into the native window toolbar's
+/// `.primaryAction` slot by `MacOSRootView.workspaceSplitView`. The
+/// trailing placement is visible in every mode — including `.table`
+/// (right pane collapsed) and `.hidden` (middle pane collapsed) —
+/// because the window toolbar spans the full width regardless of
+/// column visibility.
 struct MiddlePaneModePicker: View {
     @Binding var selection: MiddlePaneMode
 
