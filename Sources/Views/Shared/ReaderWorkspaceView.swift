@@ -271,11 +271,7 @@ struct ReaderHeaderActivityPill: View {
                 Button {
                     onSelectConversation(summary.id)
                 } label: {
-                    if activeDetail?.summary.id == summary.id {
-                        Label(summary.displayTitle, systemImage: "checkmark")
-                    } else {
-                        Text(summary.displayTitle)
-                    }
+                    threadMenuItemLabel(for: summary)
                 }
             }
         } label: {
@@ -304,11 +300,7 @@ struct ReaderHeaderActivityPill: View {
                 Button {
                     onSelectPrompt(prompt.id)
                 } label: {
-                    if selectedPromptID == prompt.id {
-                        Label(prompt.label, systemImage: "checkmark")
-                    } else {
-                        Text(prompt.label)
-                    }
+                    promptMenuItemLabel(for: prompt)
                 }
             }
         } label: {
@@ -335,6 +327,41 @@ struct ReaderHeaderActivityPill: View {
         Image(systemName: "chevron.right")
             .font(.caption2.weight(.semibold))
             .foregroundStyle(.tertiary)
+    }
+
+    // MARK: - Menu item labels
+    //
+    // Menu-item labels are explicitly frame-pinned to the same width
+    // as the parent segment, so the dropdown width matches the
+    // breadcrumb's visible width. NSMenu sizes itself to the widest
+    // item — capping each item with a fixed frame + tail truncation
+    // caps the whole menu. Japanese titles with wildly varying
+    // widths no longer balloon the dropdown past the pill.
+
+    @ViewBuilder
+    private func threadMenuItemLabel(for summary: ConversationSummary) -> some View {
+        let isActive = activeDetail?.summary.id == summary.id
+        HStack(spacing: 4) {
+            Image(systemName: "checkmark")
+                .opacity(isActive ? 1 : 0)
+            Text(summary.displayTitle)
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+        .frame(width: 130, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func promptMenuItemLabel(for prompt: ConversationPromptOutlineItem) -> some View {
+        let isActive = selectedPromptID == prompt.id
+        HStack(spacing: 4) {
+            Image(systemName: "checkmark")
+                .opacity(isActive ? 1 : 0)
+            Text(prompt.label)
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+        .frame(width: 80, alignment: .leading)
     }
 
     // MARK: - Text helpers
