@@ -414,28 +414,47 @@ private struct ConversationListPopover: View {
             .task {
                 // Reveal the active card in the underlying middle pane
                 // (so the user can see it both inside the pulldown AND
-                // in the list/table behind it).
+                // in the list/table behind it). This may kick off async
+                // pagination, which grows `conversations` a tick later
+                // — the `.onChange` below re-scrolls once that lands.
                 onAppear()
-                // Anchor the popover's own scroll on the active row.
-                // `.onAppear` + `DispatchQueue.main.async` proved
-                // unreliable — SwiftUI's popover content doesn't fully
-                // measure until at least one runloop turn after first
-                // appear, AND `LazyVStack` rows for off-screen children
-                // aren't materialized yet, so `proxy.scrollTo` would
-                // either no-op or land on the wrong row. Sleeping ~80ms
-                // before the call gives both layout and lazy
-                // materialization time to settle; a second pass after
-                // another short sleep covers cases where the first
-                // scroll bounced because rows were still resolving.
-                guard let activeConversationID else { return }
-                try? await Task.sleep(nanoseconds: 80_000_000)
-                proxy.scrollTo(activeConversationID, anchor: .center)
-                try? await Task.sleep(nanoseconds: 80_000_000)
-                proxy.scrollTo(activeConversationID, anchor: .center)
+                await scrollToActive(proxy: proxy)
+            }
+            // Re-anchor whenever the backing array changes size. The
+            // first pulldown open after selecting a new conversation
+            // used to miss the scroll because `onAppear` triggers
+            // pagination that extends `conversations` AFTER our initial
+            // `scrollTo` fires, invalidating the LazyVStack layout.
+            // Firing again on every count change catches the row once
+            // pagination settles.
+            .onChange(of: conversations.count) { _, _ in
+                Task { await scrollToActive(proxy: proxy) }
             }
         }
         .frame(width: popoverWidth)
         .frame(maxHeight: popoverMaxHeight)
+    }
+
+    /// Wait until the active row is actually present in the backing
+    /// array, then scroll to it. We poll at 40ms intervals for up to
+    /// ~400ms because `revealConversation(_:)` paginates asynchronously
+    /// — firing `scrollTo` before the row exists is a no-op, and firing
+    /// right as pagination lands loses the scroll to the layout
+    /// invalidation that follows. Two `scrollTo` calls separated by
+    /// another short sleep cover the case where the first pass bounced
+    /// because `LazyVStack` hadn't materialized the target yet.
+    private func scrollToActive(proxy: ScrollViewProxy) async {
+        guard let activeConversationID else { return }
+        for _ in 0..<10 {
+            if conversations.contains(where: { $0.id == activeConversationID }) {
+                break
+            }
+            try? await Task.sleep(nanoseconds: 40_000_000)
+        }
+        try? await Task.sleep(nanoseconds: 40_000_000)
+        proxy.scrollTo(activeConversationID, anchor: .center)
+        try? await Task.sleep(nanoseconds: 80_000_000)
+        proxy.scrollTo(activeConversationID, anchor: .center)
     }
 }
 

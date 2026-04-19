@@ -144,15 +144,24 @@ struct MacOSRootView: View {
             } else if wasReading && !isReading {
                 libraryViewModel.clearViewerData()
             }
-            // Entering `.viewer` — the middle pane is now the normal
-            // card list (same control as default mode) but it should
-            // auto-scroll to the currently-open conversation so the
-            // user's active card sits at the top of the visible list.
-            // Reveal handles paging in additional rows if the target
-            // id has fallen off the currently-loaded window.
-            if old != .viewer && new == .viewer,
-               let id = tabManager.activeTab?.conversationID {
-                Task { await libraryViewModel.revealConversation(id: id) }
+            // Switching into any list-bearing middle-pane mode should
+            // land the user on the currently-active conversation with
+            // its card already highlighted and scrolled into view. All
+            // three list modes (`.default`, `.table`, `.viewer`) read
+            // `pendingListScrollConversationID` off the view model, so
+            // `revealConversation(id:)` routes to whichever list just
+            // mounted — and pages in the target row if it had fallen
+            // off the currently-loaded window. `.hidden` is skipped
+            // because there's no list to scroll. For `.viewer` the
+            // active id lives on the reader tab; for the other two it
+            // lives on `selectedConversationId`, so we pick whichever
+            // is non-nil (both should usually be set).
+            if old != new && new != .hidden {
+                let activeID = libraryViewModel.selectedConversationId
+                    ?? tabManager.activeTab?.conversationID
+                if let id = activeID {
+                    Task { await libraryViewModel.revealConversation(id: id) }
+                }
             }
         }
         // While in a reading mode, keep the middle-pane outline in sync
