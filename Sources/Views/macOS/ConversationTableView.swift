@@ -173,19 +173,35 @@ struct ConversationTableView: View {
             // `.onChange` above only fires for changes *after* mount;
             // if the reveal token was raised before this view
             // materialized (which is the common race on mode switch)
-            // the scroll request would go unheard. Sleep a bit longer
-            // than the other lists because the bulk load in the
-            // `.task(id:)` below runs concurrently — the row we want
-            // may not be realized yet in the first few ticks.
+            // the scroll request would go unheard.
+            //
+            // Two things must happen before the scroll can land:
+            //   1. The bulk load (`.task(id:)` below) must have paged
+            //      in the target row — the table starts with whatever
+            //      subset the default list had loaded, which may not
+            //      include a row the user scrolled to deep in the set.
+            //   2. NSTableView needs a runloop turn after the row
+            //      appears to realize it under `proxy.scrollTo`.
+            // Poll `conversations` for the id up to ~1.2s, then scroll
+            // twice with a gap. A pure sleep-then-scroll missed rows
+            // the bulk walk hadn't reached yet.
             .task {
                 let id = viewModel.pendingListScrollConversationID
                     ?? viewModel.selectedConversationId
                 guard let id else { return }
-                try? await Task.sleep(nanoseconds: 120_000_000)
+                for _ in 0..<30 {
+                    if viewModel.conversations.contains(where: { $0.id == id }) {
+                        break
+                    }
+                    try? await Task.sleep(nanoseconds: 40_000_000)
+                }
+                try? await Task.sleep(nanoseconds: 60_000_000)
                 selection = [id]
                 withAnimation(.easeInOut(duration: 0.2)) {
                     proxy.scrollTo(id, anchor: .center)
                 }
+                try? await Task.sleep(nanoseconds: 80_000_000)
+                proxy.scrollTo(id, anchor: .center)
                 if viewModel.pendingListScrollConversationID == id {
                     viewModel.pendingListScrollConversationID = nil
                 }
