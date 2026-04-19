@@ -219,6 +219,16 @@ struct ReaderHeaderActivityPill: View {
         // call site's `onTitlePulldownOpen` hook is still accepted
         // for source compatibility but no longer fires — there is no
         // reliable Menu-open hook without dropping into AppKit.
+        //
+        // Width behavior: no `.fixedSize()` on the segments, so
+        // SwiftUI can compress the breadcrumb when the window is
+        // narrow. Each segment has a 40pt floor (so a segment never
+        // shrinks to zero and vanishes) and a 160pt ceiling (where
+        // truncation kicks in). Thread has higher `layoutPriority`
+        // than prompt, so the primary axis is the last thing to
+        // compress. The counter sits outside the capsule and is
+        // allowed to be pushed out of view entirely on very narrow
+        // windows — that's fine, it's ancillary.
         HStack(spacing: 8) {
             HStack(spacing: 2) {
                 threadMenu
@@ -269,14 +279,14 @@ struct ReaderHeaderActivityPill: View {
                 .foregroundStyle(activeDetail == nil ? .secondary : .primary)
                 .lineLimit(1)
                 .truncationMode(.tail)
-                .frame(maxWidth: 180, alignment: .leading)
+                .frame(minWidth: 40, maxWidth: 160, alignment: .leading)
                 .padding(.horizontal, 6)
                 .frame(height: 22)
                 .contentShape(Rectangle())
         }
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
-        .fixedSize()
+        .layoutPriority(2)
         .disabled(activeDetail == nil && conversations.isEmpty)
         .help("会話を切り替え")
     }
@@ -302,14 +312,14 @@ struct ReaderHeaderActivityPill: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .truncationMode(.tail)
-                .frame(maxWidth: 180, alignment: .leading)
+                .frame(minWidth: 40, maxWidth: 160, alignment: .leading)
                 .padding(.horizontal, 6)
                 .frame(height: 22)
                 .contentShape(Rectangle())
         }
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
-        .fixedSize()
+        .layoutPriority(1)
         .disabled(promptOutline.isEmpty)
         .help("プロンプトを切り替え")
     }
