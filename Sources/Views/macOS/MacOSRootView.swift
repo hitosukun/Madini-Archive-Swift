@@ -440,15 +440,16 @@ struct MacOSRootView: View {
                 MiddlePaneModePicker(selection: $viewMode)
             }
         }
-        // `.toolbarBackground(.automatic, for: .windowToolbar)`
-        // intentionally omitted for this diagnostic pass. Hypothesis:
-        // the dark strip at the sidebar's top edge (reported on
-        // maximize) is the window toolbar's own background layer, not
-        // app padding. With no explicit toolbarBackground call the
-        // window falls back to SwiftUI's implicit chrome — if the
-        // strip changes / disappears, we treat it as the chrome layer
-        // and address it by fitting the sidebar's top to it (not by
-        // trying to hide the chrome or by touching NSWindow).
+        // Pin to SwiftUI's default unified-toolbar rendering. Dropping
+        // this call did not change the dark strip at the sidebar's
+        // top edge (diagnostic confirmed), so the strip is the
+        // standard titlebar / toolbar chrome — not something we're
+        // painting. Keeping `.automatic` here makes the rendering
+        // explicit so the chrome doesn't drift under SDK updates.
+        // Visual integration with the strip is handled on the
+        // sidebar side (see `UnifiedLibrarySidebar.body`), not by
+        // trying to hide the chrome or modify NSWindow.
+        .toolbarBackground(.automatic, for: .windowToolbar)
         // Trackpad / mouse swipe → toggle Viewer Mode. Lives on the
         // workspace split view (not on a single pane) so the gesture
         // works regardless of which pane the user happens to be over,
@@ -580,6 +581,20 @@ private struct UnifiedLibrarySidebar: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
+                // Intentional breathing strip below the window
+                // toolbar's bottom edge. The toolbar paints its own
+                // background layer (a darker band on maximize,
+                // confirmed via a diagnostic toggle of
+                // `.toolbarBackground`) — we can't remove it without
+                // touching NSWindow, which is off-limits. So we lean
+                // into it: this spacer gives the sidebar a visual
+                // header lane that reads as continuous with the
+                // toolbar chrome, so the first real row (search bar)
+                // doesn't crash into the band. 12pt here + the 12pt
+                // outer top padding below = ~24pt of clearance total,
+                // roughly matching Finder's sidebar-to-toolbar gap.
+                Color.clear
+                    .frame(height: 12)
                 // Sidebar chrome — search field (which also hosts the
                 // active-filter chip flow) + narrow-the-results row
                 // (sort + date). Renders as the first children of the
@@ -725,16 +740,7 @@ private struct UnifiedLibrarySidebar: View {
                     }
                 }
             }
-            // Asymmetric padding: a little extra breathing room at
-            // the top so the first row (search field) doesn't crash
-            // into the toolbar's bottom separator line. The split is
-            // deliberately small (18 vs 12) — we don't want the
-            // sidebar to start looking "indented from the top" like
-            // a sheet, just enough gap that the toolbar chrome reads
-            // as a distinct strip above the content.
-            .padding(.horizontal, 12)
-            .padding(.top, 18)
-            .padding(.bottom, 12)
+            .padding(12)
         }
         // Drop the ScrollView's own opaque backdrop so the translucent
         // window material we install via `TranslucentWindowBackground`
