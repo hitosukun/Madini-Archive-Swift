@@ -194,179 +194,132 @@ struct ReaderHeaderActivityPill: View {
     /// the pulldown without ever tapping a row.
     let onTitlePulldownOpen: () -> Void
 
-    @State private var isOutlinePresented = false
-    @State private var isTitlePresented = false
-
     var body: some View {
-        // Height pinned to 26pt (not the app-wide
-        // `headerChipHeight = 30`) so the pill sits inside the
-        // toolbar at the same vertical density as the neighbouring
-        // `NSSegmentedControl` (`.regular` control size ≈ 24pt) and
-        // the share button (system toolbar button ≈ 24pt). Keeping
-        // the chip style on the sidebar controls at 30 — they live
-        // in a taller band and want the extra breathing room.
-        // Capsule background deliberately soft: `.ultraThinMaterial`
-        // + a very low-opacity stroke. The pill sits inside the
-        // window toolbar's own material, so a strong fill made it
-        // read as "a pill on top of another pill" (user feedback:
-        // principal item looked wrapped in a second chrome layer).
-        // Weakening the fill and stroke lets the toolbar's own
-        // material show through, so the nav bar feels embedded in
-        // the toolbar rather than layered over it.
-        HStack(spacing: 0) {
-            titleHalf
-            divider
-            promptHalf
-        }
-        .frame(height: 24)
-        .background(
-            Capsule(style: .continuous)
-                .fill(.ultraThinMaterial)
-                .opacity(0.7)
-        )
-        .overlay(
-            Capsule(style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.04), lineWidth: 0.5)
-        )
-    }
-
-    // MARK: - Title half (left)
-    //
-    // Custom popover (`ConversationListPopover`) instead of an
-    // NSMenu. Earlier iterations used `Menu` for the Xcode-jump-bar
-    // cascade-out submenu effect, but two requirements pushed us back
-    // to a popover:
-    //
-    //   1. Open the pulldown anchored on the active conversation, with
-    //      that row highlighted in gray and visible without scrolling.
-    //      `Menu`/NSMenu always opens at the top of its item list with
-    //      no programmatic scroll API — there's no way to seed a
-    //      "current selection" the way a popover + ScrollViewReader can.
-    //   2. Match the prompt-side popover's visual language (gray
-    //      highlight on the current row, multi-line titles, zebra
-    //      stripes). `Menu` items are NSMenu-backed, single-line, with
-    //      a fixed checked-state glyph that doesn't read as the same
-    //      "current row" affordance.
-    //
-    // The popover lists every conversation in the current middle-pane
-    // filter; the active one carries the gray highlight + checkmark.
-    // The top "現在の会話を中央リストで見る" row preserves the legacy
-    // `onTapTitle` muscle memory.
-
-    @ViewBuilder
-    private var titleHalf: some View {
-        Button {
-            guard activeDetail != nil || !conversations.isEmpty else { return }
-            isTitlePresented.toggle()
-        } label: {
-            HStack(spacing: 8) {
-                Image(systemName: "list.bullet.indent")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-
-                Text(titleText)
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(activeDetail == nil ? .secondary : .primary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    // Fixed cap so a long title can't push the prompt
-                    // half off the trailing edge of the bar.
-                    .frame(maxWidth: 180, alignment: .leading)
+        // Xcode-style cascade breadcrumb: [thread Menu] > [prompt Menu]
+        // in a soft capsule, with the positional counter pulled OUT
+        // of the capsule and rendered as a separate trailing sibling.
+        //
+        // Information hierarchy: the pill carries the navigation path
+        // (thread > prompt), nothing else. Meta like "1 / 5" doesn't
+        // belong in the path — it's state about the current prompt,
+        // not a step of the breadcrumb — so it sits outside the
+        // capsule where the eye can separate "where am I" from "how
+        // far in am I".
+        //
+        // Visual weight: thread is the primary axis (heavier font,
+        // primary color), prompt is subordinate (regular weight,
+        // secondary color). Reads "thread → prompt" rather than two
+        // equal-rank hops.
+        //
+        // Menus (not popovers): the user explicitly asked for the
+        // Xcode jump-bar cascade feel. An earlier iteration used
+        // custom popovers to support "scroll to active row + gray
+        // highlight on current"; that affordance is lost with NSMenu
+        // (single-line items, opens at top with no scroll API). The
+        // call site's `onTitlePulldownOpen` hook is still accepted
+        // for source compatibility but no longer fires — there is no
+        // reliable Menu-open hook without dropping into AppKit.
+        HStack(spacing: 8) {
+            HStack(spacing: 2) {
+                threadMenu
+                chevron
+                promptMenu
             }
-            .padding(.leading, WorkspaceLayoutMetrics.headerChipHorizontalPadding)
-            .padding(.trailing, 10)
+            .padding(.horizontal, 4)
             .frame(height: 24)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .disabled(activeDetail == nil && conversations.isEmpty)
-        .popover(isPresented: $isTitlePresented, arrowEdge: .bottom) {
-            ConversationListPopover(
-                conversations: conversations,
-                activeConversationID: activeDetail?.summary.id,
-                onSelect: { id in
-                    onSelectConversation(id)
-                    isTitlePresented = false
-                },
-                onAppear: onTitlePulldownOpen
+            .background(
+                Capsule(style: .continuous)
+                    .fill(.ultraThinMaterial)
+                    .opacity(0.5)
             )
-        }
-        .help("会話・プロンプトに移動")
-    }
+            .overlay(
+                Capsule(style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.03), lineWidth: 0.5)
+            )
 
-    // MARK: - Prompt half (right)
-    //
-    // Layout reads left-to-right as `[prompt label] [N/M] [chev]`.
-    // The counter sits AFTER the prompt label so it's visually anchored
-    // to the prompt side and not crowding the title divider — an
-    // earlier ordering put `[N/M]` first, immediately right of the
-    // chip's central `>` separator, which made the count read as
-    // metadata about the title (the user reported it as "プロンプト
-    // 数の表記がタイトル側に近くてわかりにくい").
-    //
-    // Stays a `Button` + `.popover` (not a `Menu` like the title
-    // half) so the popover's multi-line prompt-label rendering and
-    // checkmark-on-current-prompt highlight survive — NSMenu items
-    // are single-line only and that lost too much of the prompt text
-    // for long prompts.
-
-    @ViewBuilder
-    private var promptHalf: some View {
-        Button {
-            guard !promptOutline.isEmpty else { return }
-            isOutlinePresented.toggle()
-        } label: {
-            HStack(spacing: 8) {
-                Text(currentPromptTitle)
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(promptOutline.isEmpty ? .secondary : .primary)
-                    .lineLimit(1)
-                    // Fixed width so the trailing counter + chevron
-                    // stay at a consistent x-coordinate regardless of
-                    // current prompt title.
-                    .frame(width: 180, alignment: .leading)
-
-                // Tabular digits so the counter column doesn't shift
-                // width as the numerator grows from 1 → 10 → 100.
+            if !promptOutline.isEmpty {
+                // Positional meta, outside the breadcrumb capsule.
+                // Tabular digits keep the column width stable as the
+                // numerator grows past single digits.
                 Text(promptCounterText)
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
-                    .frame(minWidth: 42, alignment: .trailing)
-
-                Image(systemName: "chevron.down")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.secondary)
             }
-            .padding(.leading, 10)
-            .padding(.trailing, WorkspaceLayoutMetrics.headerChipHorizontalPadding)
-            .frame(height: 24)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .disabled(promptOutline.isEmpty)
-        .popover(isPresented: $isOutlinePresented, arrowEdge: .bottom) {
-            PromptOutlinePopover(
-                prompts: promptOutline,
-                selectedPromptID: selectedPromptID,
-                onSelect: { id in
-                    onSelectPrompt(id)
-                    isOutlinePresented = false
-                }
-            )
         }
     }
 
-    // MARK: - Divider
+    // MARK: - Thread segment (primary axis)
 
-    /// Breadcrumb chevron between the two halves, so the chip reads
-    /// as a "Title › Prompt" path rather than two adjacent buttons.
-    /// Same direction and weight as Finder's path bar / Xcode's
-    /// jump-bar separators.
-    private var divider: some View {
+    private var threadMenu: some View {
+        Menu {
+            ForEach(conversations) { summary in
+                Button {
+                    onSelectConversation(summary.id)
+                } label: {
+                    if activeDetail?.summary.id == summary.id {
+                        Label(summary.displayTitle, systemImage: "checkmark")
+                    } else {
+                        Text(summary.displayTitle)
+                    }
+                }
+            }
+        } label: {
+            Text(titleText)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(activeDetail == nil ? .secondary : .primary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: 180, alignment: .leading)
+                .padding(.horizontal, 6)
+                .frame(height: 22)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .disabled(activeDetail == nil && conversations.isEmpty)
+        .help("会話を切り替え")
+    }
+
+    // MARK: - Prompt segment (subordinate)
+
+    private var promptMenu: some View {
+        Menu {
+            ForEach(promptOutline) { prompt in
+                Button {
+                    onSelectPrompt(prompt.id)
+                } label: {
+                    if selectedPromptID == prompt.id {
+                        Label(prompt.label, systemImage: "checkmark")
+                    } else {
+                        Text(prompt.label)
+                    }
+                }
+            }
+        } label: {
+            Text(currentPromptTitle)
+                .font(.subheadline.weight(.regular))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: 180, alignment: .leading)
+                .padding(.horizontal, 6)
+                .frame(height: 22)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .disabled(promptOutline.isEmpty)
+        .help("プロンプトを切り替え")
+    }
+
+    // MARK: - Chevron divider
+
+    private var chevron: some View {
         Image(systemName: "chevron.right")
             .font(.caption2.weight(.semibold))
             .foregroundStyle(.tertiary)
-            .padding(.horizontal, 2)
     }
 
     // MARK: - Text helpers
