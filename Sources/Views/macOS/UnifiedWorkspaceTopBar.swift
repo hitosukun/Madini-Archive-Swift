@@ -44,11 +44,6 @@ struct UnifiedWorkspaceTopBar: View {
     /// to `ReaderHeaderActivityPill` and called from the pulldown's
     /// peer rows.
     let onSelectConversation: (String) -> Void
-    /// Repository forwarded into the title pulldown so non-active
-    /// rows can lazy-load their prompt outlines on expand. Optional
-    /// — preview-style mounts that don't have a real repo can pass
-    /// `nil` and the pulldown drops to a flat list.
-    let repository: (any ConversationRepository)?
     /// Double-tap on the bar's blank area → scroll panes back to the
     /// top. Window chrome convention (matches macOS app titlebars and
     /// browser tab bars where double-clicking blank chrome jumps to
@@ -98,8 +93,7 @@ struct UnifiedWorkspaceTopBar: View {
                     },
                     onTapTitle: onTapTitle,
                     conversations: conversations,
-                    onSelectConversation: onSelectConversation,
-                    repository: repository
+                    onSelectConversation: onSelectConversation
                 )
             }
 

@@ -201,13 +201,6 @@ struct ReaderHeaderActivityPill: View {
     /// to `selectedConversationId =` which fans out via
     /// `MacOSRootView.onChange` into the tab-manager open path.
     let onSelectConversation: (String) -> Void
-    /// Repository forwarded into the title popover so it can lazy-load
-    /// prompt outlines for non-active conversations when the user
-    /// expands their row. Optional because not every callsite has a
-    /// repository handy yet (the older two-pane preview-style mounts);
-    /// when nil, per-row expansion is disabled and the popover degrades
-    /// to a flat conversation list.
-    let repository: (any ConversationRepository)?
 
     @State private var isOutlinePresented = false
     @State private var isTitlePresented = false
@@ -283,22 +276,12 @@ struct ReaderHeaderActivityPill: View {
             ConversationListPopover(
                 conversations: conversations,
                 activeConversationID: activeDetail?.summary.id,
-                activePromptOutline: promptOutline,
-                selectedPromptID: selectedPromptID,
-                repository: repository,
                 onTapTitle: {
                     onTapTitle()
                     isTitlePresented = false
                 },
                 onSelect: { id in
                     onSelectConversation(id)
-                    isTitlePresented = false
-                },
-                onSelectPromptInConversation: { conversationID, promptID in
-                    if conversationID != activeDetail?.summary.id {
-                        onSelectConversation(conversationID)
-                    }
-                    onSelectPrompt(promptID)
                     isTitlePresented = false
                 }
             )
@@ -419,35 +402,8 @@ struct ReaderHeaderActivityPill: View {
 private struct ConversationListPopover: View {
     let conversations: [ConversationSummary]
     let activeConversationID: String?
-    /// Already-loaded outline for the active conversation. Reused as-is
-    /// when the user expands the active row (no fetch needed) so the
-    /// only DB hits the popover triggers are for non-active rows.
-    let activePromptOutline: [ConversationPromptOutlineItem]
-    let selectedPromptID: String?
-    /// Optional repository — when nil, per-row expansion is disabled
-    /// and the popover degrades gracefully to a flat conversation list.
-    let repository: (any ConversationRepository)?
     let onTapTitle: () -> Void
     let onSelect: (String) -> Void
-    /// Switch to (conversationID) and jump to (promptID) inside it.
-    /// Caller is responsible for the open-then-jump ordering — the
-    /// popover just hands back a (conv, prompt) pair when the user
-    /// taps a nested prompt row.
-    let onSelectPromptInConversation: (String, String) -> Void
-
-    /// Per-row expansion state. Defaults to expanded for the active
-    /// conversation since the user almost always wants to see "where
-    /// am I" without an extra click.
-    @State private var expandedConversationIDs: Set<String> = []
-    /// Lazy cache of fetched outlines keyed by conversation id. The
-    /// active conversation is served from `activePromptOutline` and
-    /// never enters this cache (one source of truth per state slot).
-    @State private var outlineCache: [String: [ConversationPromptOutlineItem]] = [:]
-    /// Conversations currently being fetched. Drives the per-row
-    /// progress spinner without re-rendering the whole popover when a
-    /// fetch flips between in-flight and done.
-    @State private var loadingConversationIDs: Set<String> = []
-    @State private var didSeedActiveExpansion = false
 
     private let popoverWidth: CGFloat = 360
     private let popoverMaxHeight: CGFloat = 440
@@ -471,36 +427,17 @@ private struct ConversationListPopover: View {
                     Divider()
 
                     ForEach(Array(conversations.enumerated()), id: \.element.id) { offset, conversation in
-                        VStack(alignment: .leading, spacing: 0) {
-                            ConversationListRow(
-                                conversation: conversation,
-                                isSelected: conversation.id == activeConversationID,
-                                isAlternate: offset.isMultiple(of: 2),
-                                isExpanded: expandedConversationIDs.contains(conversation.id),
-                                isLoading: loadingConversationIDs.contains(conversation.id),
-                                canExpand: repository != nil,
-                                onSelect: { onSelect(conversation.id) },
-                                onToggleExpand: { toggleExpansion(for: conversation.id) }
-                            )
-                            .id(conversation.id)
-
-                            if expandedConversationIDs.contains(conversation.id) {
-                                expandedPrompts(for: conversation)
-                            }
-                        }
+                        ConversationListRow(
+                            conversation: conversation,
+                            isSelected: conversation.id == activeConversationID,
+                            isAlternate: offset.isMultiple(of: 2),
+                            onSelect: { onSelect(conversation.id) }
+                        )
+                        .id(conversation.id)
                     }
                 }
             }
             .onAppear {
-                // Seed the active conversation as expanded on first
-                // open so "where am I in this thread" reads at a
-                // glance. Guarded by `didSeedActiveExpansion` so a
-                // re-open after a manual collapse respects the user's
-                // last toggle.
-                if !didSeedActiveExpansion, let activeConversationID {
-                    expandedConversationIDs.insert(activeConversationID)
-                    didSeedActiveExpansion = true
-                }
                 // Same deferral as `PromptOutlinePopover.onAppear` —
                 // `LazyVStack` rows aren't materialized synchronously on
                 // first display, so an immediate `scrollTo` can land on
@@ -515,142 +452,39 @@ private struct ConversationListPopover: View {
         .frame(width: popoverWidth)
         .frame(maxHeight: popoverMaxHeight)
     }
-
-    @ViewBuilder
-    private func expandedPrompts(for conversation: ConversationSummary) -> some View {
-        let prompts = outline(for: conversation.id)
-        if let prompts {
-            if prompts.isEmpty {
-                Text("プロンプトなし")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .padding(.leading, 36)
-                    .padding(.vertical, 4)
-            } else {
-                ForEach(prompts) { prompt in
-                    ConversationPromptChildRow(
-                        prompt: prompt,
-                        isSelected: conversation.id == activeConversationID
-                            && prompt.id == selectedPromptID,
-                        onSelect: {
-                            onSelectPromptInConversation(conversation.id, prompt.id)
-                        }
-                    )
-                }
-            }
-        } else if loadingConversationIDs.contains(conversation.id) {
-            HStack(spacing: 6) {
-                ProgressView().controlSize(.small)
-                Text("プロンプトを読み込み中…")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .padding(.leading, 36)
-            .padding(.vertical, 4)
-        }
-    }
-
-    /// Returns the cached outline if available — checks the active
-    /// conversation's pre-loaded outline first, then the lazy cache.
-    private func outline(for conversationID: String) -> [ConversationPromptOutlineItem]? {
-        if conversationID == activeConversationID {
-            return activePromptOutline
-        }
-        return outlineCache[conversationID]
-    }
-
-    private func toggleExpansion(for conversationID: String) {
-        if expandedConversationIDs.contains(conversationID) {
-            expandedConversationIDs.remove(conversationID)
-            return
-        }
-        expandedConversationIDs.insert(conversationID)
-        // Active conversation is served from `activePromptOutline` —
-        // no fetch needed.
-        guard conversationID != activeConversationID,
-              outlineCache[conversationID] == nil,
-              !loadingConversationIDs.contains(conversationID),
-              let repository else {
-            return
-        }
-        loadingConversationIDs.insert(conversationID)
-        Task {
-            // Best-effort fetch. Failure quietly leaves the cache
-            // empty and the row collapsed-equivalent — the user can
-            // re-expand to retry. We don't surface error UI here
-            // because the popover's job is navigation, not error
-            // reporting; persistent failures should show up in the
-            // app's main error channel anyway.
-            let detail = try? await repository.fetchDetail(id: conversationID)
-            await MainActor.run {
-                loadingConversationIDs.remove(conversationID)
-                if let detail {
-                    outlineCache[conversationID] = ConversationDetailView.promptOutline(for: detail)
-                }
-            }
-        }
-    }
 }
 
 private struct ConversationListRow: View {
     let conversation: ConversationSummary
     let isSelected: Bool
     let isAlternate: Bool
-    let isExpanded: Bool
-    let isLoading: Bool
-    let canExpand: Bool
     let onSelect: () -> Void
-    let onToggleExpand: () -> Void
 
     @State private var isHovering = false
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 0) {
-            // Leading chevron — own button so tapping it expands without
-            // also switching the reader to this conversation. Tap the
-            // body of the row to switch; tap the chevron to peek at
-            // its prompts in place.
-            if canExpand {
-                Button(action: onToggleExpand) {
-                    Image(systemName: "chevron.right")
-                        .font(.caption2.weight(.semibold))
+        Button(action: onSelect) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(conversation.displayTitle)
+                    .font(.subheadline)
+                    .foregroundStyle(.primary)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                if isSelected {
+                    Image(systemName: "checkmark")
+                        .font(.caption.weight(.semibold))
                         .foregroundStyle(.secondary)
-                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
-                        .frame(width: 16, height: 16)
-                        .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
-                .padding(.leading, 6)
-                .padding(.trailing, 2)
-            } else {
-                Color.clear.frame(width: 24, height: 1)
             }
-
-            Button(action: onSelect) {
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(conversation.displayTitle)
-                        .font(.subheadline)
-                        .foregroundStyle(.primary)
-                        .lineLimit(2)
-                        .multilineTextAlignment(.leading)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-
-                    if isLoading {
-                        ProgressView().controlSize(.small)
-                    } else if isSelected {
-                        Image(systemName: "checkmark")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                .padding(.trailing, 12)
-                .padding(.vertical, 6)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(rowBackground)
+            .contentShape(Rectangle())
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(rowBackground)
+        .buttonStyle(.plain)
         .onHover { isHovering = $0 }
     }
 
@@ -666,63 +500,6 @@ private struct ConversationListRow: View {
         }
         if isAlternate {
             return Color.secondary.opacity(0.06)
-        }
-        return .clear
-    }
-}
-
-/// Nested prompt row rendered under an expanded conversation row.
-/// Indented to read as a child of its parent conversation, with the
-/// same gray "you are here" highlight as the prompt-side popover so
-/// the two pulldowns share their selection-state vocabulary.
-private struct ConversationPromptChildRow: View {
-    let prompt: ConversationPromptOutlineItem
-    let isSelected: Bool
-    let onSelect: () -> Void
-
-    @State private var isHovering = false
-
-    var body: some View {
-        Button(action: onSelect) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text("\(prompt.index).")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .frame(width: 24, alignment: .trailing)
-
-                Text(prompt.label)
-                    .font(.caption)
-                    .foregroundStyle(.primary)
-                    .lineLimit(2)
-                    .multilineTextAlignment(.leading)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-
-                if isSelected {
-                    Image(systemName: "checkmark")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                }
-            }
-            // Leading inset so the prompt list sits visibly under
-            // (and to the right of) its parent conversation row's
-            // expand chevron — reads as a tree branch.
-            .padding(.leading, 36)
-            .padding(.trailing, 12)
-            .padding(.vertical, 4)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(rowBackground)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .onHover { isHovering = $0 }
-    }
-
-    private var rowBackground: Color {
-        if isSelected {
-            return Color.secondary.opacity(0.22)
-        }
-        if isHovering {
-            return Color.secondary.opacity(0.10)
         }
         return .clear
     }

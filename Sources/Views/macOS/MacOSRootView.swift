@@ -451,7 +451,6 @@ struct MacOSRootView: View {
                     // the reader-tab lifecycle in one place.
                     libraryViewModel.selectedConversationId = id
                 },
-                repository: services.conversations,
                 onDoubleTapBlankArea: scrollAllPanesToTop
             )
             // Same rationale as the pane contents: each column ignores
