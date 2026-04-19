@@ -8,9 +8,10 @@ import SwiftUI
 ///
 ///   1. Traffic-light / sidebar-toggle clearance (leading spacer)
 ///   2. Flexible spacer
-///   3. `ReaderHeaderActivityPill` — the combined title + prompt-outline
-///      capsule. Shown in `.default` / `.viewer` / `.hidden`; hidden in
-///      `.table` (nothing to read from).
+///   3. **Navigation bar** — `ReaderHeaderActivityPill`, the combined
+///      title + prompt-outline capsule. Stays mounted in every mode
+///      (including `.table`) so its x-coordinate doesn't jump as the
+///      user cascades through modes.
 ///   4. `WorkspaceFloatingExportButton` (share) — always visible
 ///   5. `MiddlePaneModePicker` — always trailing, fixed size
 ///
@@ -20,9 +21,9 @@ import SwiftUI
 /// this bar. Active filter chips also live in the sidebar (inside the
 /// expanded search area). The source-origin pill and tag editor are
 /// per-conversation reader concerns and live in the right pane's
-/// `ConversationHeaderView`. This top bar is reserved for the activity
-/// pill, share, and segment picker — Finder-/Safari-style window
-/// chrome that we may extend with navigation affordances later.
+/// `ConversationHeaderView`. This top bar is reserved for the navigation
+/// bar, share, and segment picker — Finder-/Safari-style window chrome
+/// that we may extend with further navigation affordances later.
 struct UnifiedWorkspaceTopBar: View {
     @Binding var viewMode: MiddlePaneMode
     @Bindable var tabManager: ReaderTabManager
@@ -80,22 +81,25 @@ struct UnifiedWorkspaceTopBar: View {
 
             Spacer(minLength: 8)
 
-            // Title + prompt combined pill. Suppressed in `.table`
-            // because the table IS the browse surface — there's no
-            // single "active conversation" to title.
-            if viewMode != .table {
-                ReaderHeaderActivityPill(
-                    activeDetail: tabManager.activeDetail,
-                    promptOutline: tabManager.promptOutline,
-                    selectedPromptID: tabManager.selectedPromptID,
-                    onSelectPrompt: { id in
-                        tabManager.requestPromptSelection(id)
-                    },
-                    onTapTitle: onTapTitle,
-                    conversations: conversations,
-                    onSelectConversation: onSelectConversation
-                )
-            }
+            // Navigation bar — title + prompt combined pill. Mounted in
+            // every mode (table included) so its x-coordinate is stable
+            // across mode switches and the user always has a way to
+            // navigate to a peer conversation / prompt without leaving
+            // the current pane layout. When no conversation is open the
+            // pill renders a disabled placeholder; when one is open in
+            // table mode the right pane is collapsed but the pill still
+            // reflects (and lets the user change) the active tab.
+            ReaderHeaderActivityPill(
+                activeDetail: tabManager.activeDetail,
+                promptOutline: tabManager.promptOutline,
+                selectedPromptID: tabManager.selectedPromptID,
+                onSelectPrompt: { id in
+                    tabManager.requestPromptSelection(id)
+                },
+                onTapTitle: onTapTitle,
+                conversations: conversations,
+                onSelectConversation: onSelectConversation
+            )
 
             // Share button — always present. In table mode there's no
             // `activeDetail`, so the button renders in its disabled

@@ -61,17 +61,6 @@ enum MiddlePaneMode: String, CaseIterable, Identifiable, Hashable {
         }
     }
 
-    /// Whether the user is allowed to toggle the sidebar in this mode.
-    /// Viewer and Hidden are deliberately immersive: the sidebar toggle
-    /// in the title bar is hidden and any stray ⌘⌃S is clamped back to
-    /// `.doubleColumn` so the user never ends up fighting the chrome.
-    var isSidebarControllable: Bool {
-        switch self {
-        case .table, .default: return true
-        case .viewer, .hidden: return false
-        }
-    }
-
     /// Cascade neighbor one step toward the hidden / single-pane end
     /// (LEFT swipe on a natural-scrolling trackpad). Returns `self` at
     /// the end of the cascade so an over-swipe is idempotent rather

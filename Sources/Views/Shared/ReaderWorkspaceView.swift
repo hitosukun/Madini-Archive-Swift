@@ -157,34 +157,32 @@ struct ReaderWorkspaceView: View {
 
 }
 
-/// Single connected capsule combining the conversation-title anchor
-/// and the prompt-outline pull-down. Previously these rendered as two
-/// separate pills sitting side by side in the unified top bar; the
-/// user asked for them merged into one window so the "what am I
-/// reading / where am I in it" read as a single piece of chrome.
+/// **The navigation bar.** Single connected capsule combining the
+/// conversation-title pulldown and the prompt-outline pulldown — the
+/// two halves are referred to together as "the navigation bar"
+/// throughout the app. Previously rendered as two separate pills; the
+/// user asked them merged into one window so "what am I reading /
+/// where am I in it" reads as a single piece of chrome.
 ///
 /// Layout, left to right:
 ///
 ///   [ ↑ Title ] │ [ N/M PromptTitle ⌄ ]
 ///
-/// Left half = title pulldown. `Menu` listing the conversations
-/// currently rendered by the middle pane; the active conversation
-/// nests its prompt outline as a cascading submenu (Xcode jump-bar
-/// style). Top item preserves the legacy `onTapTitle` action so the
-/// muscle memory still works.
+/// Left half = title pulldown. Custom popover (`ConversationListPopover`)
+/// listing the conversations currently rendered by the middle pane,
+/// opened anchored on the active row. Top item preserves the legacy
+/// `onTapTitle` action so the muscle memory still works.
 ///
 /// Right half = prompt pulldown. Custom popover (`PromptOutlinePopover`)
-/// rather than an NSMenu, kept as a popover after a brief detour to
-/// `Menu` because NSMenu's single-line text rendering truncated long
-/// prompt labels too aggressively — the user reads each row's label
-/// to pick a prompt, so legibility wins over visual symmetry with
-/// the title-side `Menu`.
+/// rather than an NSMenu, because NSMenu's single-line text rendering
+/// truncated long prompt labels too aggressively — the user reads each
+/// row's label to pick a prompt, so legibility matters.
 ///
 /// Single capsule, single thin-material fill. A `>` chevron sits
 /// between the two halves so the chip reads as a "Title › Prompt"
 /// breadcrumb rather than two unrelated buttons under one capsule.
 ///
-/// Reused by `UnifiedWorkspaceTopBar` in every non-table mode.
+/// Mounted by `UnifiedWorkspaceTopBar` in every mode (table included).
 struct ReaderHeaderActivityPill: View {
     let activeDetail: ConversationDetail?
     let promptOutline: [ConversationPromptOutlineItem]

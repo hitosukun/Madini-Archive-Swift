@@ -44,12 +44,6 @@ struct MacOSRootView: View {
     /// walk. Deliberately volatile (no persistence) — focus-mode is
     /// not a preference.
     @State private var viewMode: MiddlePaneMode = .default
-    /// Snapshot of `columnVisibility` taken right before entering a
-    /// reading layout (viewer or focus), so exiting can restore the
-    /// user's prior sidebar state. Users who were already in
-    /// `.doubleColumn` don't get yanked back to `.all` on exit — they
-    /// return to exactly what they had.
-    @State private var columnVisibilityBeforeViewerMode: NavigationSplitViewVisibility = .all
     // `selectedPromptID` used to live here as `@State`, but writing to it
     // from the reader's scroll-position observer forced `MacOSRootView` to
     // re-render every scroll tick, which cascaded into content-margin
@@ -147,26 +141,20 @@ struct MacOSRootView: View {
                 title: summary.displayTitle
             )
         }
-        // MiddlePaneMode transitions. Every cross-mode piece of plumbing hangs
-        // off this one handler now: snapshotting sidebar state on entry
-        // into a reading layout, restoring it on exit, kicking off the
-        // viewer-pane detail fetch, and dropping cached viewer data when
-        // we leave reading. Because `MiddlePaneMode` is a single enum, the
-        // mutual-exclusion rules the old three-boolean world had to
-        // enforce via three separate `onChange` hooks disappear — the
-        // type itself guarantees we can't be in "table and viewer at
-        // once".
+        // MiddlePaneMode transitions. The sidebar is freely user-
+        // controllable in every mode now (per user request: "左サイド
+        // バーはいつでも表示と非表示を切り替えていい"), so this handler
+        // no longer touches `columnVisibility` — it just kicks off /
+        // tears down the viewer-pane detail fetch and triggers the
+        // reveal-active-card scroll on entry into Viewer Mode.
         .onChange(of: viewMode) { old, new in
             let wasReading = old == .viewer || old == .hidden
             let isReading = new == .viewer || new == .hidden
             if !wasReading && isReading {
-                columnVisibilityBeforeViewerMode = columnVisibility
-                columnVisibility = .doubleColumn
                 if let id = tabManager.activeTab?.conversationID {
                     Task { await libraryViewModel.loadViewerConversation(id: id) }
                 }
             } else if wasReading && !isReading {
-                columnVisibility = columnVisibilityBeforeViewerMode
                 libraryViewModel.clearViewerData()
             }
             // Entering `.viewer` — the middle pane is now the normal
@@ -178,30 +166,6 @@ struct MacOSRootView: View {
             if old != .viewer && new == .viewer,
                let id = tabManager.activeTab?.conversationID {
                 Task { await libraryViewModel.revealConversation(id: id) }
-            }
-        }
-        // Clamp column visibility in modes where the sidebar is NOT
-        // user-controllable (viewer / focus). macOS's built-in sidebar-
-        // toggle shortcut (⌘⌃S) and some internal `NavigationSplitView`
-        // rebuild paths can flip `columnVisibility` back to `.all` mid-
-        // session even though the toggle button itself is removed via
-        // `ConditionalSidebarToggleRemoval`. When that happens the
-        // sidebar reappears over the Viewer-Mode toolbar (user-visible
-        // symptom: "左サイドバーの開閉ボタンが重なってでる") and there's
-        // no obvious path back. Snap it back to `.doubleColumn` on the
-        // next runloop turn so the mode stays internally consistent.
-        //
-        // Focus sub-mode reuses `.doubleColumn` here — it hides the
-        // middle column via `navigationSplitViewColumnWidth(0,0,0)` on
-        // the content pane rather than via `columnVisibility`, because
-        // macOS's 3-column NavigationSplitView doesn't reliably honor
-        // `.detailOnly` (SwiftUI bounces it back to `.all`, which makes
-        // the sidebar flicker back in).
-        .onChange(of: columnVisibility) { _, newValue in
-            guard !viewMode.isSidebarControllable,
-                  newValue != .doubleColumn else { return }
-            Task { @MainActor in
-                columnVisibility = .doubleColumn
             }
         }
         // While in a reading mode, keep the middle-pane outline in sync
@@ -420,15 +384,6 @@ struct MacOSRootView: View {
                     max: viewMode == .table ? 0 : .infinity
                 )
         }
-        // Hide the NavigationSplitView's built-in sidebar-toggle button
-        // whenever the current mode isn't sidebar-controllable (viewer
-        // / focus). The user explicitly asked for this — there's no
-        // intended path to re-expand the sidebar during a reading
-        // session, and letting the toggle sit in the titlebar only
-        // invites accidental mode-break clicks. Applied as a
-        // conditional modifier so the toggle comes back on its own
-        // when the user switches back to `.table` / `.default`.
-        .modifier(ConditionalSidebarToggleRemoval(isActive: !viewMode.isSidebarControllable))
         // Single window-spanning top bar. Always mounted over all three
         // columns regardless of mode — the bar's outer shell (height,
         // padding, divider) never changes so swipe transitions no
@@ -1286,272 +1241,6 @@ private struct SearchSavedFiltersSection: View {
 
     private func summaryText(for filters: ArchiveSearchFilter) -> String {
         filters.summaryText
-    }
-}
-
-/// Hides (and restores) the NavigationSplitView's built-in sidebar-
-/// toggle button in the window titlebar while `isActive` is true.
-///
-/// We reach down to AppKit because SwiftUI's `.toolbar(removing:
-/// .sidebarToggle)` doesn't visibly remove the item on the current SDK —
-/// the button stays drawn in the titlebar even when the modifier is
-/// applied. The root cause appears to be that `NavigationSplitView`
-/// synthesises the toggle as an `NSToolbarItem` outside the SwiftUI
-/// toolbar graph that `.toolbar(removing:)` operates on, so the removal
-/// modifier has nothing to target.
-///
-/// The workaround: walk the hosting `NSWindow`'s toolbar items and
-/// hide/show the one whose identifier is `.toggleSidebar` each time
-/// `isActive` flips. Done as an invisible `NSViewRepresentable` in a
-/// background so we can reach the window the SwiftUI view is hosted in
-/// (only available after layout), without disturbing hit-testing.
-///
-/// Why it matters for Viewer Mode: the mode pins `columnVisibility` to
-/// `.doubleColumn` and the user has no legitimate need to re-expand the
-/// sidebar mid-session. Letting the toggle sit in the titlebar only
-/// invites accidental mode-break clicks. When the user exits Viewer
-/// Mode, `isActive` flips false and the toggle is unhidden.
-private struct ConditionalSidebarToggleRemoval: ViewModifier {
-    let isActive: Bool
-
-    func body(content: Content) -> some View {
-        content.background(SidebarToggleHider(isHidden: isActive))
-    }
-}
-
-private struct SidebarToggleHider: NSViewRepresentable {
-    let isHidden: Bool
-
-    final class Coordinator {
-        /// Remembered insertion index of the sidebar-toggle item at the
-        /// moment we FIRST removed it, so we can put it back at the
-        /// same position when `isHidden` flips false. Stored per-
-        /// instance because toolbar layouts vary (e.g. future titlebar
-        /// additions) and we don't want to assume index 0.
-        var removedIndex: Int?
-        /// Identifier of the item we removed — re-insertion takes an
-        /// identifier, not the item object. Cached instead of hard-
-        /// coding `.toggleSidebar` so the "some macOS builds use a
-        /// different id" fallback path still round-trips correctly.
-        var removedIdentifier: NSToolbarItem.Identifier?
-        /// Are we currently in the hidden state? Kept as a mirror of
-        /// the latest `isHidden` prop so the KVO observer below can
-        /// decide whether to re-remove the item when SwiftUI re-adds
-        /// it without needing to round-trip through the View struct.
-        var wantsHidden: Bool = false
-        /// KVO observation on `NSToolbar.items`. SwiftUI re-synthesises
-        /// the sidebar toggle on its own whenever the split view
-        /// rebuilds its toolbar (which happens on unrelated state
-        /// changes), and `updateNSView` doesn't always fire afterwards
-        /// — so the toggle would creep back in even though our view
-        /// thinks it's hidden. The KVO fires every time the item array
-        /// actually changes, letting us re-remove the toggle the
-        /// moment it reappears.
-        var itemsObservation: NSKeyValueObservation?
-        /// The toolbar instance the `itemsObservation` above is
-        /// currently attached to. Kept as a weak reference because the
-        /// toolbar is owned by AppKit. We compare against
-        /// `nsView.window?.toolbar` on each access — if SwiftUI has
-        /// replaced the toolbar (which CAN happen during key-window
-        /// transitions or split-view rebuilds), the old KVO is
-        /// silently dead and has to be re-attached to the fresh
-        /// instance. Without this check the sidebar-toggle glyph
-        /// creeps back into the titlebar during Viewer Mode — exactly
-        /// the "戻れなくなった" lockout bug.
-        weak var observedToolbar: NSToolbar?
-        /// Window the notification observer below is scoped to.
-        weak var observedWindow: NSWindow?
-        /// `NSWindow.didBecomeKeyNotification` subscription token.
-        /// Re-fires a hide pass whenever the window gains key focus,
-        /// which is the most reliable macOS signal that AppKit has
-        /// just rebuilt the toolbar (common on focus-stealing modal
-        /// transitions, ⌘-Tab round-trips, and the Dock-click pattern
-        /// that put the user in this reproducer).
-        var windowKeyObserver: NSObjectProtocol?
-    }
-
-    func makeCoordinator() -> Coordinator { Coordinator() }
-
-    func makeNSView(context: Context) -> NSView {
-        // Zero-size, non-interactive — just a carrier for `updateNSView`
-        // callbacks so we can reach `nsView.window` once the host is
-        // mounted. The view itself never draws.
-        NSView(frame: .zero)
-    }
-
-    static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
-        // Tear down KVO + notification observers when the view leaves
-        // the hierarchy so we don't leak either onto a now-orphaned
-        // toolbar/window.
-        coordinator.itemsObservation?.invalidate()
-        coordinator.itemsObservation = nil
-        coordinator.observedToolbar = nil
-        if let observer = coordinator.windowKeyObserver {
-            NotificationCenter.default.removeObserver(observer)
-        }
-        coordinator.windowKeyObserver = nil
-        coordinator.observedWindow = nil
-    }
-
-    func updateNSView(_ nsView: NSView, context: Context) {
-        let targetHidden = isHidden
-        let coordinator = context.coordinator
-        coordinator.wantsHidden = targetHidden
-        // Defer to next runloop turn: `nsView.window` is often still nil
-        // on the very first update after the host mounts, and we also
-        // don't want to mutate the toolbar inside a SwiftUI layout pass.
-        DispatchQueue.main.async {
-            Self.ensureObservers(coordinator: coordinator, nsView: nsView)
-            Self.applyHiddenState(
-                targetHidden: targetHidden,
-                coordinator: coordinator,
-                nsView: nsView
-            )
-        }
-    }
-
-    /// Install (or re-install) the two observers the coordinator needs
-    /// to keep the sidebar-toggle item gone:
-    ///
-    /// 1. KVO on the CURRENT `NSToolbar.items` — fires when items
-    ///    array mutates (AppKit inserts toggle on rebuild).
-    /// 2. Notification on the CURRENT `NSWindow` for
-    ///    `didBecomeKeyNotification` — fires when the window is
-    ///    re-focused, which is the only reliable signal we have for
-    ///    "AppKit just rebuilt the titlebar and may have brought the
-    ///    toggle back with it".
-    ///
-    /// Both observers are torn down + re-attached if the toolbar or
-    /// window identity changes since last check. Without the identity
-    /// check, KVO can silently watch a dead toolbar instance and the
-    /// new one goes unobserved — which is the original lockout bug.
-    private static func ensureObservers(
-        coordinator: Coordinator,
-        nsView: NSView
-    ) {
-        guard let window = nsView.window else { return }
-
-        // Re-scope the window-became-key observer if the hosting
-        // window changed (e.g. the app was restored into a new scene).
-        if coordinator.observedWindow !== window {
-            if let old = coordinator.windowKeyObserver {
-                NotificationCenter.default.removeObserver(old)
-            }
-            coordinator.observedWindow = window
-            coordinator.windowKeyObserver = NotificationCenter.default.addObserver(
-                forName: NSWindow.didBecomeKeyNotification,
-                object: window,
-                queue: .main
-            ) { [weak coordinator, weak window] _ in
-                guard let coordinator, coordinator.wantsHidden,
-                      let toolbar = window?.toolbar else { return }
-                // The window-key transition is the most common path
-                // that brings the toggle back. Re-verify observers in
-                // case the toolbar instance flipped under us too, and
-                // then force-remove.
-                rebindItemsObservationIfNeeded(
-                    coordinator: coordinator,
-                    toolbar: toolbar
-                )
-                removeSidebarToggleIfPresent(from: toolbar, coordinator: coordinator)
-            }
-        }
-
-        if let toolbar = window.toolbar {
-            rebindItemsObservationIfNeeded(
-                coordinator: coordinator,
-                toolbar: toolbar
-            )
-        }
-    }
-
-    /// Rebind the `items` KVO to the supplied toolbar if it isn't
-    /// already attached to THAT specific instance. No-op when already
-    /// bound. The identity check is critical — a stale observation on
-    /// a replaced toolbar never fires, and the new toolbar goes
-    /// unwatched forever.
-    private static func rebindItemsObservationIfNeeded(
-        coordinator: Coordinator,
-        toolbar: NSToolbar
-    ) {
-        if coordinator.observedToolbar === toolbar,
-           coordinator.itemsObservation != nil {
-            return
-        }
-        coordinator.itemsObservation?.invalidate()
-        coordinator.observedToolbar = toolbar
-        coordinator.itemsObservation = toolbar.observe(\.items, options: [.new]) { [weak coordinator] observedToolbar, _ in
-            guard let coordinator, coordinator.wantsHidden else { return }
-            removeSidebarToggleIfPresent(
-                from: observedToolbar,
-                coordinator: coordinator
-            )
-        }
-    }
-
-    private static func applyHiddenState(
-        targetHidden: Bool,
-        coordinator: Coordinator,
-        nsView: NSView
-    ) {
-        guard let toolbar = nsView.window?.toolbar else { return }
-        if targetHidden {
-            removeSidebarToggleIfPresent(
-                from: toolbar,
-                coordinator: coordinator
-            )
-        } else {
-            restoreSidebarToggleIfNeeded(
-                to: toolbar,
-                coordinator: coordinator
-            )
-        }
-    }
-
-    /// Locate the sidebar-toggle item and remove it. Idempotent: if the
-    /// item is already gone this is a no-op, which is exactly the
-    /// behavior we want when SwiftUI momentarily re-adds and then
-    /// re-removes the item itself (the KVO callback fires twice but
-    /// only the first finds something to remove).
-    private static func removeSidebarToggleIfPresent(
-        from toolbar: NSToolbar,
-        coordinator: Coordinator
-    ) {
-        let index = toolbar.items.firstIndex { item in
-            let id = item.itemIdentifier
-            return id == .toggleSidebar
-                || id.rawValue.lowercased().contains("togglesidebar")
-        }
-        guard let index else { return }
-        // Cache the original position + identifier only on the very
-        // first removal, so re-removals (from the KVO path) don't
-        // clobber what we'll need at restore time.
-        if coordinator.removedIdentifier == nil {
-            coordinator.removedIndex = index
-            coordinator.removedIdentifier = toolbar.items[index].itemIdentifier
-        }
-        toolbar.removeItem(at: index)
-    }
-
-    /// Put the toggle back at its original index when Viewer Mode exits.
-    /// Guards against the "already present" case — SwiftUI sometimes
-    /// re-synthesises the toggle on its own during the exit transition,
-    /// and inserting a duplicate throws NSInternalInconsistencyException
-    /// ("Duplicate items of this type are not allowed") which crashes
-    /// the app.
-    private static func restoreSidebarToggleIfNeeded(
-        to toolbar: NSToolbar,
-        coordinator: Coordinator
-    ) {
-        guard let identifier = coordinator.removedIdentifier else { return }
-        defer {
-            coordinator.removedIdentifier = nil
-            coordinator.removedIndex = nil
-        }
-        let alreadyPresent = toolbar.items.contains { $0.itemIdentifier == identifier }
-        guard !alreadyPresent else { return }
-        let index = min(coordinator.removedIndex ?? 0, toolbar.items.count)
-        toolbar.insertItem(withItemIdentifier: identifier, at: index)
     }
 }
 
