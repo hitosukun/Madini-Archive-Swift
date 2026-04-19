@@ -49,6 +49,12 @@ struct UnifiedWorkspaceTopBar: View {
     /// — preview-style mounts that don't have a real repo can pass
     /// `nil` and the pulldown drops to a flat list.
     let repository: (any ConversationRepository)?
+    /// Double-tap on the bar's blank area → scroll panes back to the
+    /// top. Window chrome convention (matches macOS app titlebars and
+    /// browser tab bars where double-clicking blank chrome jumps to
+    /// the top of content). Parent owns the per-pane scroll plumbing
+    /// since the bar itself doesn't hold scroll state.
+    let onDoubleTapBlankArea: () -> Void
 
     var body: some View {
         HStack(spacing: WorkspaceLayoutMetrics.headerBarInteriorSpacing) {
@@ -113,6 +119,21 @@ struct UnifiedWorkspaceTopBar: View {
         .padding(.horizontal, WorkspaceLayoutMetrics.headerBarHorizontalPadding)
         .frame(height: WorkspaceLayoutMetrics.headerBarContentRowHeight)
         .frame(maxWidth: .infinity)
+        // Tap-target layer behind the interactive controls. The chip,
+        // share button, and mode picker sit visually in front and
+        // continue to absorb their own clicks; double-taps on the
+        // blank gutters between them (and to either side) fall through
+        // to this background and trigger the scroll-to-top action.
+        // `.contentShape(Rectangle())` is what makes a transparent
+        // background hit-testable in SwiftUI — without it taps pass
+        // straight through to whatever is below.
+        .background(
+            Color.clear
+                .contentShape(Rectangle())
+                .onTapGesture(count: 2) {
+                    onDoubleTapBlankArea()
+                }
+        )
         // Measure bar height so each pane underneath can apply the
         // correct `.safeAreaInset` above its first row of content.
         .background(

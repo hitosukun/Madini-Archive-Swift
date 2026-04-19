@@ -451,7 +451,8 @@ struct MacOSRootView: View {
                     // the reader-tab lifecycle in one place.
                     libraryViewModel.selectedConversationId = id
                 },
-                repository: services.conversations
+                repository: services.conversations,
+                onDoubleTapBlankArea: scrollAllPanesToTop
             )
             // Same rationale as the pane contents: each column ignores
             // top safe area so content can extend under the titlebar,
@@ -490,6 +491,29 @@ struct MacOSRootView: View {
         guard let id = tabManager.activeTab?.conversationID else { return }
         Task { await libraryViewModel.revealConversation(id: id) }
         tabManager.scrollToTopToken = UUID()
+    }
+
+    /// Double-tap on the unified top bar's blank chrome → snap each
+    /// pane back to the top. Window-chrome convention (matches macOS
+    /// app titlebars / browser tab bars where double-clicking blank
+    /// chrome jumps content to the top).
+    ///
+    /// Coverage today:
+    ///   * Right pane (reader) — via `tabManager.scrollToTopToken`.
+    ///   * Middle pane in Viewer Mode — same token (`ViewerModePane`
+    ///     observes it for its prompt-directory scroll).
+    ///   * Middle pane in default list mode — via
+    ///     `pendingListScrollConversationID`, set to the first card.
+    ///
+    /// Not yet covered: Table mode (SwiftUI `Table` lacks a clean
+    /// programmatic scroll API) and the left sidebar (already
+    /// short enough that scrolling rarely matters). Both can be
+    /// added later without changing this entry point.
+    private func scrollAllPanesToTop() {
+        tabManager.scrollToTopToken = UUID()
+        if let firstID = libraryViewModel.conversations.first?.id {
+            libraryViewModel.pendingListScrollConversationID = firstID
+        }
     }
 
     private var libraryContentPane: some View {
