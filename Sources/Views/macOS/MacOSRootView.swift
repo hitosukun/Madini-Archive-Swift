@@ -717,7 +717,16 @@ private struct UnifiedLibrarySidebar: View {
                     }
                 }
             }
-            .padding(12)
+            // Asymmetric padding: a little extra breathing room at
+            // the top so the first row (search field) doesn't crash
+            // into the toolbar's bottom separator line. The split is
+            // deliberately small (18 vs 12) — we don't want the
+            // sidebar to start looking "indented from the top" like
+            // a sheet, just enough gap that the toolbar chrome reads
+            // as a distinct strip above the content.
+            .padding(.horizontal, 12)
+            .padding(.top, 18)
+            .padding(.bottom, 12)
         }
         // Drop the ScrollView's own opaque backdrop so the translucent
         // window material we install via `TranslucentWindowBackground`

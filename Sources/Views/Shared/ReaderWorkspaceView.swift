@@ -205,19 +205,28 @@ struct ReaderHeaderActivityPill: View {
         // the share button (system toolbar button ≈ 24pt). Keeping
         // the chip style on the sidebar controls at 30 — they live
         // in a taller band and want the extra breathing room.
+        // Capsule background deliberately soft: `.ultraThinMaterial`
+        // + a very low-opacity stroke. The pill sits inside the
+        // window toolbar's own material, so a strong fill made it
+        // read as "a pill on top of another pill" (user feedback:
+        // principal item looked wrapped in a second chrome layer).
+        // Weakening the fill and stroke lets the toolbar's own
+        // material show through, so the nav bar feels embedded in
+        // the toolbar rather than layered over it.
         HStack(spacing: 0) {
             titleHalf
             divider
             promptHalf
         }
-        .frame(height: 26)
+        .frame(height: 24)
         .background(
             Capsule(style: .continuous)
-                .fill(.thinMaterial)
+                .fill(.ultraThinMaterial)
+                .opacity(0.7)
         )
         .overlay(
             Capsule(style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+                .strokeBorder(Color.primary.opacity(0.04), lineWidth: 0.5)
         )
     }
 
@@ -266,7 +275,7 @@ struct ReaderHeaderActivityPill: View {
             }
             .padding(.leading, WorkspaceLayoutMetrics.headerChipHorizontalPadding)
             .padding(.trailing, 10)
-            .frame(height: 26)
+            .frame(height: 24)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -330,7 +339,7 @@ struct ReaderHeaderActivityPill: View {
             }
             .padding(.leading, 10)
             .padding(.trailing, WorkspaceLayoutMetrics.headerChipHorizontalPadding)
-            .frame(height: 26)
+            .frame(height: 24)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
