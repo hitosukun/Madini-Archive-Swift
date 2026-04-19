@@ -175,16 +175,25 @@ struct ConversationTableView: View {
             // materialized (which is the common race on mode switch)
             // the scroll request would go unheard.
             //
-            // Two things must happen before the scroll can land:
+            // Three things must happen before the scroll can land:
             //   1. The bulk load (`.task(id:)` below) must have paged
             //      in the target row — the table starts with whatever
             //      subset the default list had loaded, which may not
             //      include a row the user scrolled to deep in the set.
-            //   2. NSTableView needs a runloop turn after the row
-            //      appears to realize it under `proxy.scrollTo`.
-            // Poll `conversations` for the id up to ~1.2s, then scroll
-            // twice with a gap. A pure sleep-then-scroll missed rows
-            // the bulk walk hadn't reached yet.
+            //   2. NSTableView must have laid out its initial rows.
+            //      On first mount this is several hundred ms on large
+            //      sets because the Table ingests the whole `rows`
+            //      array up front.
+            //   3. `proxy.scrollTo` has to run on a tick where the
+            //      target id has a realized row — pre-layout calls
+            //      are silently dropped.
+            // Poll for row presence, then fan out the scroll attempt
+            // across a widening schedule (80ms, 200ms, 500ms). Each
+            // retry sets selection again so the highlight lands even
+            // if only the later attempt wins. One call would be
+            // enough if layout timing were predictable, but it isn't
+            // — cheaper to fire three times than to pick a magic
+            // number and have it fail on slower hardware.
             .task {
                 let id = viewModel.pendingListScrollConversationID
                     ?? viewModel.selectedConversationId
@@ -195,13 +204,11 @@ struct ConversationTableView: View {
                     }
                     try? await Task.sleep(nanoseconds: 40_000_000)
                 }
-                try? await Task.sleep(nanoseconds: 60_000_000)
-                selection = [id]
-                withAnimation(.easeInOut(duration: 0.2)) {
+                for delayMs: UInt64 in [80, 200, 500] {
+                    try? await Task.sleep(nanoseconds: delayMs * 1_000_000)
+                    selection = [id]
                     proxy.scrollTo(id, anchor: .center)
                 }
-                try? await Task.sleep(nanoseconds: 80_000_000)
-                proxy.scrollTo(id, anchor: .center)
                 if viewModel.pendingListScrollConversationID == id {
                     viewModel.pendingListScrollConversationID = nil
                 }
