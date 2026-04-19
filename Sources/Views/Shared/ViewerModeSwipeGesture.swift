@@ -55,12 +55,14 @@ import AppKit
 /// they could never satisfy the dominance check; gating up front keeps
 /// the per-event gesture accounting clean.
 ///
-/// We fire AT MOST once per gesture (between `.began` and `.ended`),
-/// and once we fire we keep returning `nil` from the monitor for the
-/// rest of that gesture's events. Returning `nil` swallows the event
-/// before it reaches any underlying scroll view — without that the
-/// same swipe would also horizontally slide a code block while
-/// flipping the mode, which reads as "the gesture broke the page".
+/// We arm AT MOST one mode step per gesture (between `.began` and
+/// `.ended`), and once armed we keep returning `nil` from the monitor
+/// for the rest of that gesture's events. The actual mode write is
+/// deferred until `.ended` / `.cancelled`, which avoids asking
+/// `NavigationSplitView` to rebuild its column constraints while the
+/// trackpad swipe is still in flight — that mid-gesture rebuild was
+/// producing transient AppKit unsatisfiable-constraint logs when a
+/// mode collapsed a pane to zero width.
 ///
 /// **Why a SINGLE monitor now.** The previous iteration anchored a
 /// second monitor inside `ConversationTableView` to try to work around
@@ -181,12 +183,18 @@ private struct SwipeScrollMonitor: NSViewRepresentable {
         var canEnterViewer: Bool
         private var monitor: Any?
 
-        // Per-gesture accumulator. Reset on `.began`; fires at most
-        // once per gesture; locked-out for the remainder of the
-        // gesture once fired (see `handle(_:)`).
+        // Per-gesture accumulator. Reset on `.began`; arms at most
+        // one step per gesture; locked-out for the remainder of the
+        // gesture once armed (see `handle(_:)`).
         private var accumulatedDX: CGFloat = 0
         private var accumulatedDY: CGFloat = 0
-        private var hasFiredThisGesture = false
+        private var hasArmedThisGesture = false
+        private var pendingStep: PendingStep?
+
+        private enum PendingStep {
+            case towardFocus
+            case towardOverview
+        }
 
         init(binding: Binding<MiddlePaneMode>, canEnterViewer: Bool) {
             self.binding = binding
@@ -218,19 +226,30 @@ private struct SwipeScrollMonitor: NSViewRepresentable {
             case .began:
                 accumulatedDX = event.scrollingDeltaX
                 accumulatedDY = event.scrollingDeltaY
-                hasFiredThisGesture = false
+                hasArmedThisGesture = false
+                pendingStep = nil
             case .changed:
                 accumulatedDX += event.scrollingDeltaX
                 accumulatedDY += event.scrollingDeltaY
             case .ended, .cancelled:
-                let wasFired = hasFiredThisGesture
+                let armedStep = pendingStep
                 accumulatedDX = 0
                 accumulatedDY = 0
-                hasFiredThisGesture = false
-                // Eat the terminating event too if we fired earlier
+                hasArmedThisGesture = false
+                pendingStep = nil
+                // Apply the queued step only after the gesture has
+                // fully finished so AppKit isn't reconciling split-view
+                // constraints while the swipe is still active.
+                if let armedStep {
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self else { return }
+                        self.apply(step: armedStep)
+                    }
+                }
+                // Eat the terminating event too if we armed earlier
                 // in this gesture so a momentum tail can't slide a
                 // ScrollView immediately after the toggle.
-                return wasFired ? nil : event
+                return armedStep == nil ? event : nil
             default:
                 // Momentum and other phases — ignore for the gesture
                 // accumulator. Returning the event lets normal scroll
@@ -238,8 +257,8 @@ private struct SwipeScrollMonitor: NSViewRepresentable {
                 return event
             }
 
-            if hasFiredThisGesture {
-                // Already stepped mid-gesture: keep eating the rest
+            if hasArmedThisGesture {
+                // Already queued a step for this gesture: keep eating the rest
                 // so the underlying ScrollView doesn't ALSO slide
                 // horizontally during the same hand motion.
                 return nil
@@ -261,29 +280,28 @@ private struct SwipeScrollMonitor: NSViewRepresentable {
             // Users who flipped natural scrolling off get the inverted
             // mapping for free, which still matches their finger
             // direction relative to the rest of their UI.
-            let towardHidden = accumulatedDX < 0
-            hasFiredThisGesture = true
-
-            // The monitor closure runs on the main thread already, but
-            // mutating a SwiftUI Binding from inside an event handler
-            // can re-enter the SwiftUI graph mid-flush. Defer the
-            // write a tick so it lands on a clean runloop turn — same
-            // pattern `MacOSRootView` uses for its column-visibility
-            // clamp (`onChange(of: columnVisibility)`).
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                let current = self.binding.wrappedValue
-                let next = towardHidden
-                    ? current.stepTowardFocus(canEnterViewer: self.canEnterViewer)
-                    : current.stepTowardOverview()
-                if next != current {
-                    self.binding.wrappedValue = next
-                }
-            }
+            pendingStep = accumulatedDX < 0 ? .towardFocus : .towardOverview
+            hasArmedThisGesture = true
 
             // Swallow this event so the same swipe can't also drive a
             // horizontal ScrollView underneath us.
             return nil
+        }
+
+        private func apply(step: PendingStep) {
+            let current = binding.wrappedValue
+            let next = switch step {
+            case .towardFocus:
+                current.stepTowardFocus(canEnterViewer: canEnterViewer)
+            case .towardOverview:
+                current.stepTowardOverview()
+            }
+            guard next != current else { return }
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                binding.wrappedValue = next
+            }
         }
     }
 }

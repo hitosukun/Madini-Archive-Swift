@@ -51,22 +51,9 @@ struct MadiniArchiveApp: App {
 struct RootView: View {
     @EnvironmentObject private var services: AppServices
 
-    /// Diagnostic toggle: when `true`, the macOS window renders a
-    /// bare-bones `NavigationSplitView` with no toolbar or environment
-    /// injection, used to isolate whether top-chrome issues originate
-    /// inside `MacOSRootView` or upstream. Flip to `true` again if a
-    /// future chrome regression needs isolating; otherwise leave at
-    /// `false` for normal use. No iOS equivalent — this is a
-    /// window-chrome probe.
-    private static let useMinimalDebugRoot = false
-
     var body: some View {
         #if os(macOS)
-        if Self.useMinimalDebugRoot {
-            MacOSDebugMinimalView()
-        } else {
-            MacOSRootView(services: services)
-        }
+        MacOSRootView(services: services)
         #else
         IOSRootView(services: services)
         #endif

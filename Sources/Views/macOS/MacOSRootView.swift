@@ -4,6 +4,8 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct MacOSRootView: View {
+    private static let collapsedSplitColumnWidth: CGFloat = 1
+
     let services: AppServices
     @State private var libraryViewModel: LibraryViewModel
     @State private var tabManager = ReaderTabManager()
@@ -356,17 +358,19 @@ struct MacOSRootView: View {
             librarySidebar
         } content: {
             libraryContentPane
-                // In focus sub-mode the middle column collapses to zero
-                // width so only the detail pane remains visible. macOS's
-                // `NavigationSplitViewVisibility.detailOnly` does NOT
-                // reliably hide the middle column of a 3-column split
-                // view (it fights back and the sidebar reappears), so
-                // we drive the collapse via column width instead — the
-                // column technically still exists, but occupies 0pt and
-                // is therefore invisible.
+                // In focus sub-mode the middle column collapses to a
+                // near-zero sliver so only the detail pane remains
+                // visible. We intentionally use `1pt`, not `0pt`:
+                // asking AppKit to animate a split item between
+                // "collapsed to zero" and a normal width can leave the
+                // old `NSSplitViewItem.MaxSize == 0` constraint alive
+                // for one pass while the new minimum-width constraint is
+                // already installed, producing the red unsatisfiable-
+                // constraint logs seen during swipe transitions.
                 //
                 // Table mode: the content column hosts the full-width
-                // spreadsheet and the detail column is collapsed to 0 —
+                // spreadsheet and the detail column is collapsed to the
+                // same near-zero sliver —
                 // but without lifting the default `contentMaxWidth` cap
                 // (560pt) the middle pane refuses to expand beyond that,
                 // leaving a huge dead strip between the table and the
@@ -374,30 +378,30 @@ struct MacOSRootView: View {
                 // values in this mode so the table absorbs all available
                 // horizontal space.
                 .navigationSplitViewColumnWidth(
-                    min: viewMode == .focus ? 0
-                        : viewMode == .table ? WorkspaceLayoutMetrics.contentMinWidth
-                        : WorkspaceLayoutMetrics.contentMinWidth,
-                    ideal: viewMode == .focus ? 0
+                    min: Self.collapsedSplitColumnWidth,
+                    ideal: viewMode == .focus ? Self.collapsedSplitColumnWidth
                         : viewMode == .table ? 1200
                         : WorkspaceLayoutMetrics.contentIdealWidth,
-                    max: viewMode == .focus ? 0
+                    max: viewMode == .focus ? Self.collapsedSplitColumnWidth
                         : viewMode == .table ? .infinity
                         : WorkspaceLayoutMetrics.contentMaxWidth
                 )
         } detail: {
             rightPane
-                // Table mode: collapse the reader pane to zero width so
+                // Table mode: collapse the reader pane to the same
+                // near-zero sliver so
                 // the middle (table) pane absorbs the full remaining
                 // space. Same column-width trick used for focus mode on
                 // the content column above — macOS 3-column
                 // `NavigationSplitView` is unreliable at hiding a
-                // column via `columnVisibility`, but 0-width works.
-                // Non-table values fall back to generous bounds that
-                // mirror the system default (no explicit constraint).
+                // column via `columnVisibility`, but a 1pt width avoids
+                // the transient `MaxSize == 0` conflicts AppKit emits on
+                // swipe-driven transitions. Non-table values fall back
+                // to generous bounds that mirror the system default.
                 .navigationSplitViewColumnWidth(
-                    min: viewMode == .table ? 0 : 320,
-                    ideal: viewMode == .table ? 0 : 720,
-                    max: viewMode == .table ? 0 : .infinity
+                    min: Self.collapsedSplitColumnWidth,
+                    ideal: viewMode == .table ? Self.collapsedSplitColumnWidth : 720,
+                    max: viewMode == .table ? Self.collapsedSplitColumnWidth : .infinity
                 )
         }
         // Window toolbar — the single home for window-chrome controls.
@@ -466,18 +470,9 @@ struct MacOSRootView: View {
         )
     }
 
-    /// Reveal the currently-active conversation in whichever middle-pane
-    /// representation is mounted (default card list OR table view). Fires
-    /// when the title pulldown opens, so the underlying pane scrolls to
-    /// the same row the pulldown highlights — the user sees "you are
-    /// here" in both surfaces simultaneously.
-    ///
-    /// Both panes observe `pendingListScrollConversationID`:
-    ///   * Default list: scrolls the `List` to the matching row.
-    ///   * Table: sets `selection = [id]`, which auto-scrolls the row
-    ///     into view AND carries the table-row selection highlight.
-    /// `revealConversation(id:)` also pages in additional rows if the
-    /// target id has fallen off the currently-loaded window.
+    /// Reveal the currently-open conversation in the middle pane right
+    /// as the title popover opens so the popover's current row and the
+    /// underlying list/table stay visually aligned.
     private func revealActiveConversationInMiddlePane() {
         guard let id = tabManager.activeTab?.conversationID else { return }
         Task { await libraryViewModel.revealConversation(id: id) }

@@ -151,17 +151,7 @@ struct ReaderWorkspaceView: View {
 ///
 /// Layout, left to right:
 ///
-///   [ ↑ Title ] │ [ N/M PromptTitle ⌄ ]
-///
-/// Left half = title pulldown. Custom popover (`ConversationListPopover`)
-/// listing the conversations currently rendered by the middle pane,
-/// opened anchored on the active row. Top item preserves the legacy
-/// `onTapTitle` action so the muscle memory still works.
-///
-/// Right half = prompt pulldown. Custom popover (`PromptOutlinePopover`)
-/// rather than an NSMenu, because NSMenu's single-line text rendering
-/// truncated long prompt labels too aggressively — the user reads each
-/// row's label to pick a prompt, so legibility matters.
+///   [ Title ] > [ Prompt ]   N / M
 ///
 /// Single capsule, single thin-material fill. A `>` chevron sits
 /// between the two halves so the chip reads as a "Title › Prompt"
@@ -172,6 +162,21 @@ struct ReaderWorkspaceView: View {
 /// (table included) and its x-coordinate doesn't jump as the user
 /// cascades through middle-pane modes.
 struct ReaderHeaderActivityPill: View {
+    private static let titleSegmentMinWidth: CGFloat = 170
+    private static let titleSegmentIdealWidth: CGFloat = 220
+    private static let titleSegmentMaxWidth: CGFloat = 300
+    private static let promptSegmentMinWidth: CGFloat = 170
+    private static let promptSegmentIdealWidth: CGFloat = 230
+    private static let promptSegmentMaxWidth: CGFloat = 320
+    private static let pillMinWidth: CGFloat = 358
+    private static let pillIdealWidth: CGFloat = 472
+    private static let pillMaxWidth: CGFloat = 626
+    private static let segmentHeight: CGFloat = 22
+    private static let titlePopoverMinWidth: CGFloat = 300
+    private static let titlePopoverMaxWidth: CGFloat = 420
+    private static let promptPopoverMinWidth: CGFloat = 280
+    private static let promptPopoverMaxWidth: CGFloat = 380
+
     let activeDetail: ConversationDetail?
     let promptOutline: [ConversationPromptOutlineItem]
     let selectedPromptID: String?
@@ -186,16 +191,18 @@ struct ReaderHeaderActivityPill: View {
     /// to `selectedConversationId =` which fans out via
     /// `MacOSRootView.onChange` into the tab-manager open path.
     let onSelectConversation: (String) -> Void
-    /// Fires when the title pulldown is opened. The parent uses this to
-    /// reveal the active conversation in the underlying middle pane —
-    /// scroll the card list to it, or select + scroll the table to it.
-    /// Driven from the popover's `.task`, not the button's tap action,
-    /// so single-shot reveals fire even if the user closes and reopens
-    /// the pulldown without ever tapping a row.
+    /// When the title pulldown opens, the parent can reveal the active
+    /// conversation in the middle pane so the popover and the
+    /// underlying list stay aligned.
     let onTitlePulldownOpen: () -> Void
 
+    @State private var isThreadPopoverPresented = false
+    @State private var isPromptPopoverPresented = false
+    @State private var measuredThreadSegmentWidth: CGFloat = Self.titleSegmentIdealWidth
+    @State private var measuredPromptSegmentWidth: CGFloat = Self.promptSegmentIdealWidth
+
     var body: some View {
-        // Xcode-style cascade breadcrumb: [thread Menu] > [prompt Menu]
+        // Xcode-style cascade breadcrumb: [thread popover] > [prompt popover]
         // in a soft capsule, with the positional counter pulled OUT
         // of the capsule and rendered as a separate trailing sibling.
         //
@@ -211,29 +218,11 @@ struct ReaderHeaderActivityPill: View {
         // secondary color). Reads "thread → prompt" rather than two
         // equal-rank hops.
         //
-        // Menus (not popovers): the user explicitly asked for the
-        // Xcode jump-bar cascade feel. An earlier iteration used
-        // custom popovers to support "scroll to active row + gray
-        // highlight on current"; that affordance is lost with NSMenu
-        // (single-line items, opens at top with no scroll API). The
-        // call site's `onTitlePulldownOpen` hook is still accepted
-        // for source compatibility but no longer fires — there is no
-        // reliable Menu-open hook without dropping into AppKit.
-        //
-        // Width behavior: each segment is pinned by an outer
-        // `.frame(width:)` on the Menu itself (thread 130pt,
-        // prompt 80pt). The fixed width has to go on the Menu,
-        // not on the Text label inside the Menu's label closure —
-        // `.menuStyle(.borderlessButton)` reads the label's natural
-        // content size for its own layout and ignores width frames
-        // set deeper in the label's view tree, so a `.frame(width:)`
-        // on the Text (or even a prior `.fixedSize()` on the Menu)
-        // let long prompts blow the pill out to their full natural
-        // width. Pinning the Menu itself is authoritative: the label
-        // then fills that fixed width and truncates with `.tail`.
-        // Total pill footprint is ~220pt; stays visible at every
-        // usable window size. The counter sibling is unconstrained
-        // and may be clipped on very narrow windows.
+        // Each segment is a full-width button inside the capsule so the
+        // hit target is the bar interior, not just the rendered text.
+        // The popovers are also pinned to the exact same width as
+        // their source segment so opening them does not suddenly widen
+        // the navigation chrome.
         HStack(spacing: 8) {
             HStack(spacing: 2) {
                 threadMenu
@@ -251,6 +240,11 @@ struct ReaderHeaderActivityPill: View {
                 Capsule(style: .continuous)
                     .strokeBorder(Color.primary.opacity(0.03), lineWidth: 0.5)
             )
+            .frame(
+                minWidth: Self.pillMinWidth,
+                idealWidth: Self.pillIdealWidth,
+                maxWidth: Self.pillMaxWidth
+            )
 
             if !promptOutline.isEmpty {
                 // Positional meta, outside the breadcrumb capsule.
@@ -266,59 +260,100 @@ struct ReaderHeaderActivityPill: View {
     // MARK: - Thread segment (primary axis)
 
     private var threadMenu: some View {
-        Menu {
-            ForEach(conversations) { summary in
-                Button {
-                    onSelectConversation(summary.id)
-                } label: {
-                    threadMenuItemLabel(for: summary)
-                }
-            }
+        Button {
+            guard activeDetail != nil || !conversations.isEmpty else { return }
+            isPromptPopoverPresented = false
+            isThreadPopoverPresented.toggle()
         } label: {
-            Text(titleText)
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(activeDetail == nil ? .secondary : .primary)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 6)
-                .frame(height: 22)
-                .contentShape(Rectangle())
+            segmentLabel(
+                text: titleText,
+                foregroundStyle: activeDetail == nil ? .secondary : .primary,
+                weight: .semibold
+            )
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .frame(width: 130)
+        .buttonStyle(.plain)
+        .frame(
+            minWidth: Self.titleSegmentMinWidth,
+            idealWidth: Self.titleSegmentIdealWidth,
+            maxWidth: Self.titleSegmentMaxWidth,
+            minHeight: Self.segmentHeight,
+            maxHeight: Self.segmentHeight
+        )
+        .background(widthReader(ThreadSegmentWidthPreferenceKey.self))
+        .onPreferenceChange(ThreadSegmentWidthPreferenceKey.self) { newWidth in
+            measuredThreadSegmentWidth = clamped(
+                newWidth,
+                min: Self.titleSegmentMinWidth,
+                max: Self.titleSegmentMaxWidth
+            )
+        }
         .disabled(activeDetail == nil && conversations.isEmpty)
         .help("会話を切り替え")
+        .popover(isPresented: $isThreadPopoverPresented, arrowEdge: .bottom) {
+            ConversationListPopover(
+                conversations: conversations,
+                activeConversationID: activeDetail?.summary.id,
+                rowWidth: popoverWidth(
+                    for: measuredThreadSegmentWidth,
+                    min: Self.titlePopoverMinWidth,
+                    max: Self.titlePopoverMaxWidth
+                ),
+                onSelect: { id in
+                    onSelectConversation(id)
+                    isThreadPopoverPresented = false
+                },
+                onOpen: onTitlePulldownOpen
+            )
+        }
     }
 
     // MARK: - Prompt segment (subordinate)
 
     private var promptMenu: some View {
-        Menu {
-            ForEach(promptOutline) { prompt in
-                Button {
-                    onSelectPrompt(prompt.id)
-                } label: {
-                    promptMenuItemLabel(for: prompt)
-                }
-            }
+        Button {
+            guard !promptOutline.isEmpty else { return }
+            isThreadPopoverPresented = false
+            isPromptPopoverPresented.toggle()
         } label: {
-            Text(currentPromptTitle)
-                .font(.subheadline.weight(.regular))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 6)
-                .frame(height: 22)
-                .contentShape(Rectangle())
+            segmentLabel(
+                text: currentPromptTitle,
+                foregroundStyle: .secondary,
+                weight: .regular
+            )
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .frame(width: 80)
+        .buttonStyle(.plain)
+        .frame(
+            minWidth: Self.promptSegmentMinWidth,
+            idealWidth: Self.promptSegmentIdealWidth,
+            maxWidth: Self.promptSegmentMaxWidth,
+            minHeight: Self.segmentHeight,
+            maxHeight: Self.segmentHeight
+        )
+        .background(widthReader(PromptSegmentWidthPreferenceKey.self))
+        .onPreferenceChange(PromptSegmentWidthPreferenceKey.self) { newWidth in
+            measuredPromptSegmentWidth = clamped(
+                newWidth,
+                min: Self.promptSegmentMinWidth,
+                max: Self.promptSegmentMaxWidth
+            )
+        }
         .disabled(promptOutline.isEmpty)
         .help("プロンプトを切り替え")
+        .popover(isPresented: $isPromptPopoverPresented, arrowEdge: .bottom) {
+            PromptOutlinePopover(
+                prompts: promptOutline,
+                selectedPromptID: selectedPromptID,
+                rowWidth: popoverWidth(
+                    for: measuredPromptSegmentWidth,
+                    min: Self.promptPopoverMinWidth,
+                    max: Self.promptPopoverMaxWidth
+                ),
+                onSelect: { id in
+                    onSelectPrompt(id)
+                    isPromptPopoverPresented = false
+                }
+            )
+        }
     }
 
     // MARK: - Chevron divider
@@ -329,39 +364,37 @@ struct ReaderHeaderActivityPill: View {
             .foregroundStyle(.tertiary)
     }
 
-    // MARK: - Menu item labels
-    //
-    // Menu-item labels are explicitly frame-pinned to the same width
-    // as the parent segment, so the dropdown width matches the
-    // breadcrumb's visible width. NSMenu sizes itself to the widest
-    // item — capping each item with a fixed frame + tail truncation
-    // caps the whole menu. Japanese titles with wildly varying
-    // widths no longer balloon the dropdown past the pill.
-
-    @ViewBuilder
-    private func threadMenuItemLabel(for summary: ConversationSummary) -> some View {
-        let isActive = activeDetail?.summary.id == summary.id
-        HStack(spacing: 4) {
-            Image(systemName: "checkmark")
-                .opacity(isActive ? 1 : 0)
-            Text(summary.displayTitle)
+    private func segmentLabel(
+        text: String,
+        foregroundStyle: HierarchicalShapeStyle,
+        weight: Font.Weight
+    ) -> some View {
+        HStack(spacing: 0) {
+            Text(text)
+                .font(.subheadline.weight(weight))
+                .foregroundStyle(foregroundStyle)
                 .lineLimit(1)
                 .truncationMode(.tail)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Spacer(minLength: 0)
         }
-        .frame(width: 130, alignment: .leading)
+        .padding(.horizontal, 6)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
     }
 
-    @ViewBuilder
-    private func promptMenuItemLabel(for prompt: ConversationPromptOutlineItem) -> some View {
-        let isActive = selectedPromptID == prompt.id
-        HStack(spacing: 4) {
-            Image(systemName: "checkmark")
-                .opacity(isActive ? 1 : 0)
-            Text(prompt.label)
-                .lineLimit(1)
-                .truncationMode(.tail)
+    private func widthReader<Key: PreferenceKey>(_ key: Key.Type) -> some View where Key.Value == CGFloat {
+        GeometryReader { proxy in
+            Color.clear.preference(key: key, value: proxy.size.width)
         }
-        .frame(width: 80, alignment: .leading)
+    }
+
+    private func clamped(_ value: CGFloat, min: CGFloat, max: CGFloat) -> CGFloat {
+        Swift.max(min, Swift.min(max, value))
+    }
+
+    private func popoverWidth(for segmentWidth: CGFloat, min: CGFloat, max: CGFloat) -> CGFloat {
+        clamped(segmentWidth + 56, min: min, max: max)
     }
 
     // MARK: - Text helpers
@@ -385,26 +418,29 @@ struct ReaderHeaderActivityPill: View {
     }
 }
 
-/// Custom popover for the title-half pulldown. Replaced an earlier
-/// `Menu`-based jump bar so the pulldown can:
-///
-///   * Open with the active conversation centered and gray-highlighted
-///     (NSMenu has no programmatic scroll API). The auto-scroll on
-///     appear replaces what used to be an explicit "現在の会話を中央
-///     リストで見る" header row — opening the pulldown is now itself
-///     the affordance for "show me where I am".
-///   * Render multi-line conversation titles (NSMenu items are
-///     single-line and truncate aggressively).
-///   * Share visual language with the prompt-side `PromptOutlinePopover`
-///     — both pulldowns now read as the same kind of "where am I in
-///     this list" affordance.
+private struct ThreadSegmentWidthPreferenceKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
+private struct PromptSegmentWidthPreferenceKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
 private struct ConversationListPopover: View {
     let conversations: [ConversationSummary]
     let activeConversationID: String?
+    let rowWidth: CGFloat
     let onSelect: (String) -> Void
-    let onAppear: () -> Void
+    let onOpen: () -> Void
 
-    private let popoverWidth: CGFloat = 360
     private let popoverMaxHeight: CGFloat = 440
 
     var body: some View {
@@ -414,6 +450,7 @@ private struct ConversationListPopover: View {
                     ForEach(Array(conversations.enumerated()), id: \.element.id) { offset, conversation in
                         ConversationListRow(
                             conversation: conversation,
+                            rowWidth: rowWidth,
                             isSelected: conversation.id == activeConversationID,
                             isAlternate: offset.isMultiple(of: 2),
                             onSelect: { onSelect(conversation.id) }
@@ -423,37 +460,17 @@ private struct ConversationListPopover: View {
                 }
             }
             .task {
-                // Reveal the active card in the underlying middle pane
-                // (so the user can see it both inside the pulldown AND
-                // in the list/table behind it). This may kick off async
-                // pagination, which grows `conversations` a tick later
-                // — the `.onChange` below re-scrolls once that lands.
-                onAppear()
+                onOpen()
                 await scrollToActive(proxy: proxy)
             }
-            // Re-anchor whenever the backing array changes size. The
-            // first pulldown open after selecting a new conversation
-            // used to miss the scroll because `onAppear` triggers
-            // pagination that extends `conversations` AFTER our initial
-            // `scrollTo` fires, invalidating the LazyVStack layout.
-            // Firing again on every count change catches the row once
-            // pagination settles.
             .onChange(of: conversations.count) { _, _ in
                 Task { await scrollToActive(proxy: proxy) }
             }
         }
-        .frame(width: popoverWidth)
+        .frame(width: rowWidth)
         .frame(maxHeight: popoverMaxHeight)
     }
 
-    /// Wait until the active row is actually present in the backing
-    /// array, then scroll to it. We poll at 40ms intervals for up to
-    /// ~400ms because `revealConversation(_:)` paginates asynchronously
-    /// — firing `scrollTo` before the row exists is a no-op, and firing
-    /// right as pagination lands loses the scroll to the layout
-    /// invalidation that follows. Two `scrollTo` calls separated by
-    /// another short sleep cover the case where the first pass bounced
-    /// because `LazyVStack` hadn't materialized the target yet.
     private func scrollToActive(proxy: ScrollViewProxy) async {
         guard let activeConversationID else { return }
         for _ in 0..<10 {
@@ -471,6 +488,7 @@ private struct ConversationListPopover: View {
 
 private struct ConversationListRow: View {
     let conversation: ConversationSummary
+    let rowWidth: CGFloat
     let isSelected: Bool
     let isAlternate: Bool
     let onSelect: () -> Void
@@ -479,33 +497,22 @@ private struct ConversationListRow: View {
 
     var body: some View {
         Button(action: onSelect) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(conversation.displayTitle)
-                    .font(.subheadline)
-                    .foregroundStyle(.primary)
-                    .lineLimit(2)
-                    .multilineTextAlignment(.leading)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-
-                if isSelected {
-                    Image(systemName: "checkmark")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(rowBackground)
-            .contentShape(Rectangle())
+            Text(conversation.displayTitle)
+                .font(.subheadline)
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
+                .frame(width: rowWidth, alignment: .leading)
+                .background(rowBackground)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .onHover { isHovering = $0 }
     }
 
-    /// Same layering as `PromptOutlineRow.rowBackground` — gray
-    /// highlight on the active conversation so the two pulldowns
-    /// read as the same kind of pulldown.
     private var rowBackground: Color {
         if isSelected {
             return Color.secondary.opacity(0.22)
@@ -520,40 +527,22 @@ private struct ConversationListRow: View {
     }
 }
 
-/// Custom popover for the prompt-half pulldown. Used instead of an
-/// NSMenu so each row can render its prompt label as a 2-line block
-/// (NSMenu items are single-line) and so the currently-active prompt
-/// can carry a stronger highlight + checkmark than NSMenu's bare
-/// "checked" state.
 private struct PromptOutlinePopover: View {
     let prompts: [ConversationPromptOutlineItem]
     let selectedPromptID: String?
+    let rowWidth: CGFloat
     let onSelect: (String) -> Void
 
-    /// Rough budget for the popover: wide enough for a reasonable
-    /// title excerpt without dominating the window, tall enough to
-    /// show ~12 rows before the user has to scroll. We constrain the
-    /// height because SwiftUI popovers otherwise grow to fit every
-    /// row, which gets awkward for 100-prompt conversations.
-    private let popoverWidth: CGFloat = 360
     private let popoverMaxHeight: CGFloat = 440
 
     var body: some View {
-        // `ScrollViewReader` so we can re-anchor to the current
-        // prompt every time the popover opens. Without this, opening
-        // the pulldown for a 100-prompt conversation parks the user
-        // at row 1 with no signal that their current row is way
-        // further down — they have to manually scroll to find it.
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    // `enumerated()` for the visual row index — we can't
-                    // just use `prompt.index` because that's the underlying
-                    // message index (which skips non-user messages and
-                    // therefore can't drive a clean zebra pattern).
                     ForEach(Array(prompts.enumerated()), id: \.element.id) { offset, prompt in
                         PromptOutlineRow(
                             prompt: prompt,
+                            rowWidth: rowWidth,
                             isSelected: selectedPromptID == prompt.id,
                             isAlternate: offset.isMultiple(of: 2),
                             onSelect: { onSelect(prompt.id) }
@@ -563,31 +552,21 @@ private struct PromptOutlinePopover: View {
                 }
             }
             .onAppear {
-                // Defer one runloop turn so LazyVStack has a chance to
-                // measure the rows; calling `scrollTo` synchronously
-                // inside `onAppear` sometimes lands on the wrong row
-                // because the lazy children haven't been instantiated
-                // yet. `.center` anchor matches the viewer-mode pane's
-                // selection-tracking scroll.
                 guard let selectedPromptID else { return }
                 DispatchQueue.main.async {
                     proxy.scrollTo(selectedPromptID, anchor: .center)
                 }
             }
         }
-        .frame(width: popoverWidth)
+        .frame(width: rowWidth)
         .frame(maxHeight: popoverMaxHeight)
     }
 }
 
 private struct PromptOutlineRow: View {
     let prompt: ConversationPromptOutlineItem
+    let rowWidth: CGFloat
     let isSelected: Bool
-    /// `true` for every other row — drives the zebra background. Done
-    /// by visual position, not by `prompt.index`, so the stripe pattern
-    /// stays tight even when the underlying message indices are
-    /// non-contiguous (user prompts are interleaved with assistant +
-    /// system messages in the source conversation).
     let isAlternate: Bool
     let onSelect: () -> Void
 
@@ -595,43 +574,22 @@ private struct PromptOutlineRow: View {
 
     var body: some View {
         Button(action: onSelect) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                // Fixed-width index column so wrapped titles hang off a
-                // consistent left margin instead of reflowing under the
-                // number (which looked ragged for 2- vs 3-digit indices).
-                Text("\(prompt.index).")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .frame(width: 28, alignment: .trailing)
-
-                Text(prompt.label)
-                    .font(.subheadline)
-                    .foregroundStyle(.primary)
-                    .lineLimit(2)
-                    .multilineTextAlignment(.leading)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-
-                if isSelected {
-                    Image(systemName: "checkmark")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(Color.accentColor)
-                }
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(rowBackground)
-            .contentShape(Rectangle())
+            Text(prompt.label)
+                .font(.subheadline)
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
+                .frame(width: rowWidth, alignment: .leading)
+                .background(rowBackground)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .onHover { isHovering = $0 }
     }
 
-    /// Layering: selection tint > hover tint > zebra stripe > clear.
-    /// The selection tint uses gray (not accent) per user request — the
-    /// pulldown reads as a "where am I in the list" affordance, not a
-    /// state toggle, so the muted gray fits its semantic load better
-    /// and matches the title-side `ConversationListPopover`.
     private var rowBackground: Color {
         if isSelected {
             return Color.secondary.opacity(0.22)
