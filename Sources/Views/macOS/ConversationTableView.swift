@@ -112,98 +112,117 @@ struct ConversationTableView: View {
         // TableColumnBuilder property with an explicit return type
         // gives the compiler a concrete boundary to solve against,
         // which sidesteps the timeout.
-        Table(rows, selection: $selection, sortOrder: $sortOrder) {
-            tableColumns
-        }
-        // Reserve room at the top so the column-header row isn't
-        // hidden under the unified bar. Active-filter chips no longer
-        // render here — they live in the sidebar's expanded search
-        // container and apply globally regardless of middle-pane mode.
-        .safeAreaInset(edge: .top, spacing: 0) {
-            Color.clear
-                .frame(height: topContentInset)
-                .allowsHitTesting(false)
-        }
-        // Horizontal swipe → `MiddlePaneMode` cascade is now handled
-        // exclusively by the single `ViewerModeSwipeGesture` installed
-        // on `MacOSRootView.workspaceSplitView`. The earlier
-        // dedicated-to-the-table second monitor was removed because
-        // running two monitors over the same event produced double
-        // transitions (the "swipe on left pane skips default and
-        // jumps to viewer" report). `NSEvent.addLocalMonitorForEvents`
-        // runs before the responder chain so Table's internal
-        // `NSScrollView` doesn't swallow the event — one monitor at
-        // the workspace level is enough.
-        .contextMenu(forSelectionType: String.self) { ids in
-            if let id = ids.first {
-                Button("開く") { openConversation(id: id) }
+        // Wrap the Table in a `ScrollViewReader` so the title-pulldown
+        // reveal hook below can drive `proxy.scrollTo(id)`. SwiftUI
+        // `Table` does NOT auto-scroll when its `selection` binding
+        // changes programmatically (only on user click), so the older
+        // "just set `selection = [id]`" approach highlighted the row
+        // off-screen and never moved the scrollview to it. The proxy
+        // path works because Table forwards `scrollTo` through its
+        // underlying `NSScrollView` when the target id matches a row's
+        // `Identifiable.id`.
+        ScrollViewReader { proxy in
+            Table(rows, selection: $selection, sortOrder: $sortOrder) {
+                tableColumns
             }
-        } primaryAction: { ids in
-            // Double-click (or Enter) fires the primaryAction closure.
-            // Open the first selected row and exit table mode so the
-            // opened conversation is actually visible in the reader.
-            if let id = ids.first {
-                openConversation(id: id)
+            // Reserve room at the top so the column-header row isn't
+            // hidden under the unified bar. Active-filter chips no longer
+            // render here — they live in the sidebar's expanded search
+            // container and apply globally regardless of middle-pane mode.
+            .safeAreaInset(edge: .top, spacing: 0) {
+                Color.clear
+                    .frame(height: topContentInset)
+                    .allowsHitTesting(false)
             }
-        }
-        .onAppear { syncSortOrderFromStorage() }
-        .onChange(of: sortOrder) { _, newValue in
-            persistSortOrder(newValue)
-        }
-        // Title-pulldown "reveal active conversation" hook. The default
-        // card list observes the same `pendingListScrollConversationID`
-        // and calls `proxy.scrollTo(id)`; SwiftUI `Table` doesn't expose
-        // a scroll proxy, but updating the `selection` set to the
-        // target id has the same user-visible effect — Table auto-
-        // scrolls the selected row into view and the row gets the
-        // standard selection highlight, which also carries the "you are
-        // here" semantics. Clear the pending id on a follow-up runloop
-        // turn so re-firing the same id still triggers the observer.
-        .onChange(of: viewModel.pendingListScrollConversationID) { _, newValue in
-            guard let id = newValue else { return }
-            selection = [id]
-            Task { @MainActor in
-                viewModel.pendingListScrollConversationID = nil
+            // Horizontal swipe → `MiddlePaneMode` cascade is now handled
+            // exclusively by the single `ViewerModeSwipeGesture` installed
+            // on `MacOSRootView.workspaceSplitView`. The earlier
+            // dedicated-to-the-table second monitor was removed because
+            // running two monitors over the same event produced double
+            // transitions (the "swipe on left pane skips default and
+            // jumps to viewer" report). `NSEvent.addLocalMonitorForEvents`
+            // runs before the responder chain so Table's internal
+            // `NSScrollView` doesn't swallow the event — one monitor at
+            // the workspace level is enough.
+            .contextMenu(forSelectionType: String.self) { ids in
+                if let id = ids.first {
+                    Button("開く") { openConversation(id: id) }
+                }
+            } primaryAction: { ids in
+                // Double-click (or Enter) fires the primaryAction closure.
+                // Open the first selected row and exit table mode so the
+                // opened conversation is actually visible in the reader.
+                if let id = ids.first {
+                    openConversation(id: id)
+                }
             }
-        }
-        // Bulk-load every conversation passing the current filters.
-        // The normal `List` view pages in 100-at-a-time via a tail-cell
-        // `.onAppear` trigger, but SwiftUI `Table` doesn't mount rows
-        // the same way — the scroll trigger never fires — and the user
-        // wants the table to show every row regardless of scrolling.
-        //
-        // Keyed on `(filter, sortKey)` so a sidebar checkbox toggle or
-        // sort-menu change cancels the in-flight bulk walk and starts
-        // a fresh one against the new filter. Without the id key, the
-        // task only fired once on first appear — `LibraryViewModel`'s
-        // debounced `reloadNow()` would replace `conversations` with
-        // just the new filter's first page, and rows that lived past
-        // the first page (e.g. "claude" rows under a recent gpt-4o
-        // top page) never loaded into the table.
-        .task(id: TableLoadKey(filter: viewModel.filter, sortKey: viewModel.sortKey)) {
-            await viewModel.loadAllConversations()
-        }
-        // Guaranteed exit path. The workspace-level
-        // `ViewerModeSwipeGesture` — which exits every other mode —
-        // relies on an `NSEvent.scrollWheel` local monitor, and
-        // SwiftUI's `Table` hands its scroll events to an internal
-        // `NSScrollView` whose handling reaches the monitor
-        // inconsistently; users report "swipe to go back doesn't work
-        // in table mode". Wiring an `onExitCommand` here means the
-        // Escape key is always a reliable way out regardless of
-        // whether the swipe path triggered.
-        .onExitCommand {
-            onExitTableMode()
-        }
-        // Same escape, bound as a keyboard shortcut on an invisible
-        // button so it also works before the Table has keyboard focus
-        // (Escape via `onExitCommand` requires first-responder status).
-        .background(
-            Button(action: onExitTableMode) { EmptyView() }
-                .keyboardShortcut(.escape, modifiers: [])
-                .frame(width: 0, height: 0)
-                .opacity(0)
-        )
+            .onAppear { syncSortOrderFromStorage() }
+            .onChange(of: sortOrder) { _, newValue in
+                persistSortOrder(newValue)
+            }
+            // Title-pulldown "reveal active conversation" hook. The
+            // default card list observes the same key and drives
+            // `proxy.scrollTo(id, anchor: .top)`; here we do both —
+            // update `selection` so the row carries the standard
+            // selection highlight ("you are here"), AND fire
+            // `proxy.scrollTo` so the row is actually in the visible
+            // region. Defer the scroll one runloop turn so Table has
+            // a chance to mount the target row (it's bulk-loaded but
+            // still virtualized — the underlying `NSTableView` only
+            // realizes rows in the viewport plus a small buffer).
+            .onChange(of: viewModel.pendingListScrollConversationID) { _, newValue in
+                guard let id = newValue else { return }
+                selection = [id]
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 30_000_000)
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        proxy.scrollTo(id, anchor: .center)
+                    }
+                    viewModel.pendingListScrollConversationID = nil
+                }
+            }
+            // Bulk-load every conversation passing the current filters.
+            // The normal `List` view pages in 100-at-a-time via a
+            // tail-cell `.onAppear` trigger, but SwiftUI `Table` doesn't
+            // mount rows the same way — the scroll trigger never fires —
+            // and the user wants the table to show every row regardless
+            // of scrolling.
+            //
+            // Keyed on `(filter, sortKey)` so a sidebar checkbox toggle
+            // or sort-menu change cancels the in-flight bulk walk and
+            // starts a fresh one against the new filter. Without the id
+            // key, the task only fired once on first appear —
+            // `LibraryViewModel`'s debounced `reloadNow()` would replace
+            // `conversations` with just the new filter's first page, and
+            // rows that lived past the first page (e.g. "claude" rows
+            // under a recent gpt-4o top page) never loaded into the
+            // table.
+            .task(id: TableLoadKey(filter: viewModel.filter, sortKey: viewModel.sortKey)) {
+                await viewModel.loadAllConversations()
+            }
+            // Guaranteed exit path. The workspace-level
+            // `ViewerModeSwipeGesture` — which exits every other mode —
+            // relies on an `NSEvent.scrollWheel` local monitor, and
+            // SwiftUI's `Table` hands its scroll events to an internal
+            // `NSScrollView` whose handling reaches the monitor
+            // inconsistently; users report "swipe to go back doesn't
+            // work in table mode". Wiring an `onExitCommand` here means
+            // the Escape key is always a reliable way out regardless of
+            // whether the swipe path triggered.
+            .onExitCommand {
+                onExitTableMode()
+            }
+            // Same escape, bound as a keyboard shortcut on an invisible
+            // button so it also works before the Table has keyboard
+            // focus (Escape via `onExitCommand` requires first-responder
+            // status).
+            .background(
+                Button(action: onExitTableMode) { EmptyView() }
+                    .keyboardShortcut(.escape, modifiers: [])
+                    .frame(width: 0, height: 0)
+                    .opacity(0)
+            )
+        } // ScrollViewReader
     }
 
     // MARK: - Columns
