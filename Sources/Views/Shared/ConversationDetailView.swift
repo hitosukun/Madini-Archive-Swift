@@ -4,26 +4,6 @@ import AppKit
 #endif
 
 struct ConversationDetailView: View {
-    private enum RenderSafety {
-        /// Conversation-wide cap above which the whole detail pane flips
-        /// to `.plain`. The original 12_000 was catastrophically low —
-        /// a handful of prompts with modest answers easily crosses it,
-        /// and every such conversation rendered as raw markdown text.
-        /// But the opposite extreme (2_000_000, "basically disabled")
-        /// made opening a heavy conversation painfully slow: even with
-        /// `LazyVStack`, first-screen layout now pays for block parsing
-        /// + `AttributedString(markdown:)` on every visible paragraph
-        /// of every visible bubble, where previously the same
-        /// conversation rendered instantly via a single `Text(verbatim:)`
-        /// per message. 150_000 chars is the middle path — covers the
-        /// long tail of real chat threads (roughly 30 messages of 5k
-        /// chars each) while still auto-collapsing to `.plain` for
-        /// dumped-log-tier transcripts where rendered mode would be
-        /// unusable anyway. User can still opt into rendered via the
-        /// header toggle past this threshold.
-        static let maxRenderedConversationLength = 150_000
-    }
-
     enum DetailDisplayMode: String, CaseIterable, Identifiable {
         case rendered = "Rendered"
         case plain = "Plain"
@@ -116,7 +96,6 @@ struct ConversationDetailView: View {
                 requestedPromptID: externalRequestedPromptID ?? .constant(nil),
                 scrollToTopToken: externalScrollToTopToken ?? .constant(nil),
                 detail: detail,
-                supportsRenderedDisplay: Self.supportsRenderedDisplay(for: detail),
                 showsSystemChrome: showsSystemChrome
             )
         } else if let errorText = viewModel.errorText {
@@ -161,12 +140,6 @@ struct ConversationDetailView: View {
         return false
     }
 
-    static func supportsRenderedDisplay(for detail: ConversationDetail) -> Bool {
-        let totalLength = detail.messages.reduce(into: 0) { partialResult, message in
-            partialResult += message.content.count
-        }
-        return totalLength <= RenderSafety.maxRenderedConversationLength
-    }
 
     static func promptOutline(for detail: ConversationDetail) -> [ConversationPromptOutlineItem] {
         // Straight-line pass over user-authored messages. Earlier iterations
@@ -256,7 +229,6 @@ private struct LoadedConversationDetailView: View {
     @Binding var requestedPromptID: String?
     @Binding var scrollToTopToken: UUID?
     let detail: ConversationDetail
-    let supportsRenderedDisplay: Bool
     let showsSystemChrome: Bool
 
     /// Reader pane pushes its floating-header-bar height in via environment
@@ -321,6 +293,7 @@ private struct LoadedConversationDetailView: View {
                                         model: detail.summary.model
                                     )
                                 )
+                                .equatable()
                                 .id(message.id)
                                 .background(
                                     // User messages publish their top-edge y
@@ -365,11 +338,29 @@ private struct LoadedConversationDetailView: View {
                                 }
                             }
                         }
-                        .padding()
+                        // Slightly wider horizontal gutters than the
+                        // default 16pt so the reader text has a bit
+                        // more breathing room against the pane edges;
+                        // vertical padding stays at the default so the
+                        // top/bottom fade masks still bite into
+                        // content rather than blank margin.
+                        .padding(.horizontal, 24)
+                        .padding(.vertical, 16)
                     }
                     .coordinateSpace(name: ScrollCoordinateSpace.conversation)
                     .scrollContentBackground(.hidden)
                     .contentMargins(.top, scrollTopContentInset ?? 0, for: .scrollContent)
+                    // Reserve scroll-overshoot room at the bottom equal to
+                    // the bottom-fade height. Without this the last line
+                    // of the conversation stops at the fade's midpoint
+                    // and reads as dimmed / unreadable; with it, the
+                    // user can scroll the final line UP past the fade
+                    // zone to read it at full opacity.
+                    .contentMargins(
+                        .bottom,
+                        WorkspaceLayoutMetrics.bottomFadeHeight,
+                        for: .scrollContent
+                    )
                     .onPreferenceChange(PromptTopYPreferenceKey.self) { offsets in
                         // Defer the state write off the current layout pass.
                         // Writing `selectedPromptID` synchronously here would
@@ -499,7 +490,6 @@ private struct LoadedConversationDetailView: View {
                                 Button("Rendered") {
                                     displayMode = .rendered
                                 }
-                                .disabled(!supportsRenderedDisplay)
                                 Button("Plain") {
                                     displayMode = .plain
                                 }
@@ -534,7 +524,7 @@ private struct LoadedConversationDetailView: View {
     }
 
     private var effectiveDisplayMode: ConversationDetailView.DetailDisplayMode {
-        supportsRenderedDisplay ? displayMode : .plain
+        displayMode
     }
 
     private func scrollToSelectedPrompt(
@@ -708,29 +698,25 @@ private struct ConversationHeaderView: View {
     let summary: ConversationSummary
 
     var body: some View {
-        HStack(spacing: 12) {
-            // Pill-ified service/model display. When the conversation is
-            // from a service with a canonical per-thread URL (ChatGPT /
-            // Claude — id must be a real-looking UUID), the pill is
-            // clickable and jumps to the original thread in the default
-            // browser. When it's not (markdown imports, synthetic ids,
-            // unknown services), the pill degrades to plain tinted text
-            // with no button affordance — matches the pre-pill layout.
-            //
-            // Model / source selection rule mirrors the card row + search
-            // row: prefer model when known (so the brand color already
-            // identifies the service), fall back to source otherwise.
-            // Ported from the Python viewer's `getSourceButtonMarkup`
-            // in `viewer.js` (L5336–5358) which constructs the same
-            // three service URLs.
+        HStack(spacing: 8) {
+            Spacer(minLength: 8)
+
+            // Source-origin pill + tag editor sit on the trailing
+            // side of the header row, immediately to the LEFT of the
+            // date timestamp. The user's spec: "右側にある日付の隣に
+            // 並べて" — group them with the date so the eye doesn't
+            // have to traverse the full pane width to find them.
             SourceOriginPill(
                 conversationID: summary.id,
                 source: summary.source,
                 model: summary.model
             )
 
+            #if os(macOS)
+            ConversationTagsEditor(conversationID: summary.id)
+            #endif
+
             if let time = summary.primaryTime {
-                Spacer()
                 Text(time)
                     .font(.callout)
                     .foregroundStyle(.tertiary)
@@ -745,45 +731,57 @@ private struct DetailExportToolbar: ToolbarContent {
     let detail: ConversationDetail
 
     var body: some ToolbarContent {
-        #if os(macOS)
         ToolbarItem {
-            Button {
-                export(detail)
-            } label: {
-                Image(systemName: "square.and.arrow.up")
-            }
-            .help("Export as Markdown")
-        }
-        #else
-        ToolbarItem {
-            ShareLink(item: MarkdownExporter.export(detail)) {
-                Image(systemName: "square.and.arrow.up")
-            }
-        }
-        #endif
-    }
-
-    #if os(macOS)
-    private func export(_ detail: ConversationDetail) {
-        let markdown = MarkdownExporter.export(detail)
-        let panel = NSSavePanel()
-        panel.allowedContentTypes = [.plainText]
-        panel.nameFieldStringValue = sanitizeFilename(detail.summary.title ?? "conversation") + ".md"
-
-        panel.begin { response in
-            guard response == .OK, let url = panel.url else {
-                return
-            }
-
-            try? markdown.write(to: url, atomically: true, encoding: .utf8)
+            ConversationShareButton(detail: detail)
         }
     }
+}
 
-    private func sanitizeFilename(_ name: String) -> String {
-        let illegal = CharacterSet(charactersIn: "/:\\")
-        return name.components(separatedBy: illegal).joined(separator: "_")
+/// Toolbar share button that materializes the conversation as a Markdown
+/// file in the temp directory and hands the URL to `ShareLink`. Using a
+/// file URL (instead of a raw String) lets AppKit/UIKit present the full
+/// `NSSharingServicePicker` menu — AirDrop, Mail, Messages, Notes, Save
+/// to Files / Finder, Copy, and any third-party share extensions the
+/// user has installed — matching the Finder / Safari share affordance.
+///
+/// The file is regenerated whenever the bound conversation changes
+/// (`.task(id: detail.summary.id)`) so stale content is never shared.
+/// We write under a per-conversation subdirectory keyed by ID, keeping
+/// the filename readable (title-based) so share-sheet previews and any
+/// destination that keeps the filename (Files.app, Finder drop) show a
+/// human-meaningful name rather than a UUID.
+private struct ConversationShareButton: View {
+    let detail: ConversationDetail
+
+    @State private var shareURL: URL?
+
+    var body: some View {
+        Group {
+            if let shareURL {
+                ShareLink(
+                    item: shareURL,
+                    preview: SharePreview(
+                        detail.summary.title ?? "Conversation",
+                        image: Image(systemName: "doc.text")
+                    )
+                ) {
+                    Image(systemName: "square.and.arrow.up")
+                }
+                .help("Share conversation")
+            } else {
+                // Placeholder keeps toolbar layout stable while the
+                // markdown file is being written on first appearance.
+                Button {} label: {
+                    Image(systemName: "square.and.arrow.up")
+                }
+                .disabled(true)
+                .help("Preparing…")
+            }
+        }
+        .task(id: detail.summary.id) {
+            shareURL = await MarkdownExporter.writeTempShareFile(for: detail)
+        }
     }
-    #endif
 }
 
 enum MarkdownExporter {
@@ -819,5 +817,34 @@ enum MarkdownExporter {
         }
 
         return lines.joined(separator: "\n")
+    }
+
+    /// Materialize the conversation as a Markdown file in a stable temp
+    /// location so it can be handed to `ShareLink(item: url)` — the URL
+    /// form is what unlocks the full `NSSharingServicePicker` menu
+    /// (AirDrop, Mail, Messages, Notes, Save to Files, extensions…) on
+    /// both macOS and iOS. Shared by the detail-pane toolbar button and
+    /// the floating Viewer-Mode export chip so the two affordances are
+    /// behaviorally identical.
+    static func writeTempShareFile(for detail: ConversationDetail) async -> URL? {
+        let markdown = export(detail)
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("madini-share", isDirectory: true)
+            .appendingPathComponent(detail.summary.id, isDirectory: true)
+        let filename = sanitizeShareFilename(detail.summary.title ?? "conversation") + ".md"
+        let url = base.appendingPathComponent(filename)
+        do {
+            try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+            try markdown.write(to: url, atomically: true, encoding: .utf8)
+            return url
+        } catch {
+            return nil
+        }
+    }
+
+    private static func sanitizeShareFilename(_ name: String) -> String {
+        let illegal = CharacterSet(charactersIn: "/:\\")
+        let cleaned = name.components(separatedBy: illegal).joined(separator: "_")
+        return cleaned.isEmpty ? "conversation" : cleaned
     }
 }

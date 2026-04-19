@@ -108,9 +108,9 @@ enum IdentityPreferenceRole: String, CaseIterable, Identifiable, Sendable {
     var sectionTitle: String {
         switch self {
         case .user:
-            return "User"
+            return "ユーザー"
         case .assistant:
-            return "Assistant"
+            return "アシスタント"
         }
     }
 
@@ -205,6 +205,67 @@ final class IdentityPreferencesStore {
             return preferences.user
         case .assistant:
             return preferences.agent
+        }
+    }
+
+    /// Copy a user-chosen image into Application Support so the avatar
+    /// survives moves of the original file, and point the preference at
+    /// the copy. We write to a UUID-suffixed filename so the image cache
+    /// (`AvatarImageCache`, keyed by absolute path) naturally invalidates
+    /// on replace — overwriting the same path would keep the stale image
+    /// visible until relaunch.
+    @discardableResult
+    func setCustomAvatar(for role: IdentityPreferenceRole, from sourceURL: URL) throws -> URL {
+        AppPaths.ensureUserDataDir()
+        let fm = FileManager.default
+        let dir = AppPaths.userDataDir.appendingPathComponent("avatars", isDirectory: true)
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+
+        let needsRelease = sourceURL.startAccessingSecurityScopedResource()
+        defer { if needsRelease { sourceURL.stopAccessingSecurityScopedResource() } }
+
+        let ext = sourceURL.pathExtension.isEmpty ? "png" : sourceURL.pathExtension
+        let filename = "\(role.rawValue)-\(UUID().uuidString).\(ext)"
+        let dest = dir.appendingPathComponent(filename)
+        try fm.copyItem(at: sourceURL, to: dest)
+
+        // Remove the prior custom file for this role (if any) so the
+        // avatars directory doesn't grow unboundedly with every swap.
+        let previous = profile(for: role).avatar
+        if previous.kind == .customFile, previous.identifier != dest.path {
+            try? fm.removeItem(atPath: previous.identifier)
+        }
+
+        let reference = IdentityAvatarReference.customFile(path: dest.path)
+        switch role {
+        case .user:
+            updateUserAvatar(reference)
+        case .assistant:
+            updateAgentAvatar(reference)
+        }
+        return dest
+    }
+
+    /// Restore the role to its bundled default avatar. Any custom file
+    /// previously imported for this role is deleted from Application
+    /// Support so the user's storage stays tidy.
+    func resetAvatar(for role: IdentityPreferenceRole) {
+        let current = profile(for: role).avatar
+        if current.kind == .customFile {
+            try? FileManager.default.removeItem(atPath: current.identifier)
+        }
+        let fallback: IdentityAvatarReference
+        switch role {
+        case .user:
+            fallback = .defaultAvatar(.user)
+        case .assistant:
+            fallback = .defaultAvatar(.agent)
+        }
+        switch role {
+        case .user:
+            updateUserAvatar(fallback)
+        case .assistant:
+            updateAgentAvatar(fallback)
         }
     }
 

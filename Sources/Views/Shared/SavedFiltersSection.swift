@@ -47,34 +47,48 @@ private struct SavedFilterRow: View {
 
     var body: some View {
         HStack(spacing: 8) {
+            // Leading icon doubles as the pin toggle. Morphs between
+            // states so one glyph-slot carries both meanings:
+            //   - resting unpinned: clock (recent)
+            //   - hovered unpinned: outline star (affordance hint)
+            //   - pinned: filled accent star
+            // Merging the old clock-on-the-left + pin-on-the-right
+            // layout into a single icon removes the "two nearly-
+            // identical icons per row" visual clutter.
+            Button(action: onTogglePin) {
+                Image(systemName: pinIconName)
+                    .foregroundStyle(pinIconColor)
+                    // Fixed width keeps the summary text column from
+                    // sliding horizontally as the glyph morphs between
+                    // clock (narrow) and star (wider).
+                    .frame(width: 14, alignment: .center)
+                    .contentShape(Rectangle())
+                    .animation(.easeOut(duration: 0.12), value: isHovering)
+            }
+            .buttonStyle(.plain)
+            .help(entry.pinned ? "Unpin" : "Pin to top")
+
             Button(action: onSelect) {
                 HStack(spacing: 8) {
-                    Image(systemName: iconName)
-                        .foregroundStyle(entry.pinned ? Color.accentColor : .secondary)
-
                     SavedFilterSummaryView(entry: entry)
-
                     Spacer(minLength: 0)
                 }
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-
-            // Pin toggle: always reserves layout space so hovering does
-            // not shift the row's width. Invisible when the row is
-            // neither pinned nor hovered.
-            Button(action: onTogglePin) {
-                Image(systemName: entry.pinned ? "pin.fill" : "pin")
-                    .foregroundStyle(entry.pinned ? Color.accentColor : .secondary)
-            }
-            .buttonStyle(.plain)
-            .help(entry.pinned ? "Unpin" : "Pin to top")
-            .opacity(entry.pinned || isHovering ? 1 : 0)
-            .allowsHitTesting(entry.pinned || isHovering)
         }
         .font(.body)
         .padding(.horizontal, 6)
-        .padding(.vertical, 4)
+        // Taller hover zone — previously 4pt vertical made hovering
+        // finicky because the row's hit-target shrank to only the
+        // visual content, and the gap between rows left dead bands.
+        // 7pt roughly doubles the vertical catch-area per row.
+        .padding(.vertical, 7)
+        // Apply contentShape BEFORE `.onHover` so the whole padded
+        // rectangle counts as hoverable, not just the visible glyph /
+        // text. Without this the user has to land directly on a child
+        // view for hover to fire.
+        .contentShape(Rectangle())
         .background(
             RoundedRectangle(cornerRadius: 5, style: .continuous)
                 .fill(isHovering ? Color.secondary.opacity(0.08) : Color.clear)
@@ -86,8 +100,14 @@ private struct SavedFilterRow: View {
         }
     }
 
-    private var iconName: String {
-        entry.pinned ? "star.fill" : "clock"
+    private var pinIconName: String {
+        if entry.pinned { return "star.fill" }
+        return isHovering ? "star" : "clock"
+    }
+
+    private var pinIconColor: Color {
+        if entry.pinned { return Color.accentColor }
+        return isHovering ? Color.accentColor.opacity(0.85) : .secondary
     }
 }
 

@@ -1,4 +1,65 @@
 import SwiftUI
+#if os(macOS)
+import AppKit
+#else
+import UIKit
+#endif
+
+/// Process-level avatar image cache.
+///
+/// Without this every body re-eval of `IdentityAvatarView` /
+/// `DefaultIdentityAvatarView` re-loaded the underlying PNG from disk
+/// (`NSImage(contentsOf:)` / `UIImage(contentsOfFile:)`). Inside a
+/// long conversation that meant every visible assistant bubble paid a
+/// disk read on first render AND on every parent state change. Avatar
+/// images don't change while the app runs (they're either bundled
+/// resources or user-picked files referenced by stable path), so a
+/// process-lifetime cache by URL/path is safe and cheap.
+private enum AvatarImageCache {
+    private static let lock = NSLock()
+    private static var cache: [String: Image] = [:]
+
+    static func image(forFile path: String) -> Image? {
+        lock.lock()
+        if let cached = cache[path] {
+            lock.unlock()
+            return cached
+        }
+        lock.unlock()
+        #if os(macOS)
+        guard let raw = NSImage(contentsOfFile: path) else { return nil }
+        let image = Image(nsImage: raw)
+        #else
+        guard let raw = UIImage(contentsOfFile: path) else { return nil }
+        let image = Image(uiImage: raw)
+        #endif
+        lock.lock()
+        cache[path] = image
+        lock.unlock()
+        return image
+    }
+
+    static func image(forBundleResource url: URL) -> Image? {
+        let key = url.path
+        lock.lock()
+        if let cached = cache[key] {
+            lock.unlock()
+            return cached
+        }
+        lock.unlock()
+        #if os(macOS)
+        guard let raw = NSImage(contentsOf: url) else { return nil }
+        let image = Image(nsImage: raw)
+        #else
+        guard let raw = UIImage(contentsOfFile: url.path()) else { return nil }
+        let image = Image(uiImage: raw)
+        #endif
+        lock.lock()
+        cache[key] = image
+        lock.unlock()
+        return image
+    }
+}
 
 struct IdentityAvatarView: View {
     let presentation: MessageIdentityPresentation
@@ -47,17 +108,7 @@ struct IdentityAvatarView: View {
     }
 
     private func loadCustomImage(path: String) -> Image? {
-        #if os(macOS)
-        guard let image = NSImage(contentsOfFile: path) else {
-            return nil
-        }
-        return Image(nsImage: image)
-        #else
-        guard let image = UIImage(contentsOfFile: path) else {
-            return nil
-        }
-        return Image(uiImage: image)
-        #endif
+        AvatarImageCache.image(forFile: path)
     }
 }
 
@@ -116,17 +167,6 @@ private struct DefaultIdentityAvatarView: View {
               let resourceURL = Bundle.module.url(forResource: imageName, withExtension: "png") else {
             return nil
         }
-
-        #if os(macOS)
-        guard let image = NSImage(contentsOf: resourceURL) else {
-            return nil
-        }
-        return Image(nsImage: image)
-        #else
-        guard let image = UIImage(contentsOfFile: resourceURL.path()) else {
-            return nil
-        }
-        return Image(uiImage: image)
-        #endif
+        return AvatarImageCache.image(forBundleResource: resourceURL)
     }
 }

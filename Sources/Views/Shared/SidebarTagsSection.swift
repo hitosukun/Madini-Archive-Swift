@@ -40,6 +40,15 @@ struct SidebarTagsSection: View {
         .onChange(of: libraryViewModel.selectedConversationId) { _, _ in
             Task { await viewModel?.refreshCurrentConversationTags() }
         }
+        // Right-pane tag editor (and any other surface that ends with a
+        // `archiveEvents.didChangeBookmarks()`) edits the tag bindings
+        // directly — we need to refetch the tag list so usage counts and
+        // "attached to selection" check marks reflect the change without
+        // requiring a manual refresh.
+        .task(id: archiveEvents.bookmarkRevision) {
+            await viewModel?.refreshTags()
+            await viewModel?.refreshCurrentConversationTags()
+        }
         .alert(
             "Delete tag?",
             isPresented: Binding(
@@ -160,34 +169,60 @@ private struct SidebarTagRow: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            Button(action: onToggleFilter) {
-                HStack(spacing: 8) {
-                    Image(systemName: leadingIconName)
-                        .foregroundStyle(leadingIconColor)
+            // Tag-name area: doubles as the filter toggle (single tap) and
+            // the drag handle. Was previously wrapped in a `Button`, but
+            // `Button`'s press-gesture greedily captured mouse-down events
+            // before SwiftUI's `.draggable` recognizer could see the
+            // movement — so the user had to mash hard or wait for a long
+            // press before the drag would start, which read as "the tag
+            // won't pick up". Replacing the button with a plain HStack +
+            // `.contentShape` + `.onTapGesture` makes the drag recognizer
+            // the gesture-priority winner: a quick click still fires the
+            // tap, but any movement-after-press flips to a drag instantly.
+            HStack(spacing: 8) {
+                Image(systemName: leadingIconName)
+                    .foregroundStyle(leadingIconColor)
 
-                    if isEditing {
-                        TextField("Tag name", text: $draftName, onCommit: commitRename)
-                            .textFieldStyle(.roundedBorder)
-                    } else {
-                        Text(tag.name)
-                            .foregroundStyle(.primary)
-                            .lineLimit(1)
-                            .onTapGesture(count: 2) {
-                                // Trash is locked; don't let the user rename it via double-tap.
-                                if !tag.isSystem { beginEditing() }
-                            }
-                    }
-
-                    Text("\(tag.usageCount)")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                        .monospacedDigit()
-
-                    Spacer(minLength: 0)
+                if isEditing {
+                    TextField("Tag name", text: $draftName, onCommit: commitRename)
+                        .textFieldStyle(.roundedBorder)
+                } else {
+                    Text(tag.name)
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                        .onTapGesture(count: 2) {
+                            // Trash is locked; don't let the user rename it via double-tap.
+                            if !tag.isSystem { beginEditing() }
+                        }
                 }
-                .contentShape(Rectangle())
+
+                Text("\(tag.usageCount)")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .monospacedDigit()
+
+                Spacer(minLength: 0)
             }
-            .buttonStyle(.plain)
+            .contentShape(Rectangle())
+            .draggable(TagDragPayload(name: tag.name)) {
+                // Neutral drag preview — matches the monochrome treatment of
+                // tag chips elsewhere (card row, saved-filter list). The `#`
+                // prefix + capsule shape already signal "tag" without needing
+                // a colored fill.
+                Text("#\(tag.name)")
+                    .font(.caption.weight(.semibold))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Capsule().fill(.thinMaterial))
+                    .overlay(
+                        Capsule().strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5)
+                    )
+                    .foregroundStyle(.primary)
+            }
+            // Tap-to-toggle-filter sits AFTER `.draggable` so the drag
+            // recognizer registers first; SwiftUI still routes a movement-
+            // free press to this tap handler on release.
+            .onTapGesture { onToggleFilter() }
 
             Button(action: onToggleAttach) {
                 Image(systemName: isAttachedToSelection ? "checkmark.circle.fill" : "plus.circle")
@@ -236,30 +271,20 @@ private struct SidebarTagRow: View {
                 )
         )
         .onHover { isHovering = $0 }
-        .draggable(TagDragPayload(name: tag.name)) {
-            // Neutral drag preview — matches the monochrome treatment of
-            // tag chips elsewhere (card row, saved-filter list). The `#`
-            // prefix + capsule shape already signal "tag" without needing
-            // a colored fill.
-            Text("#\(tag.name)")
-                .font(.caption.weight(.semibold))
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(Capsule().fill(.thinMaterial))
-                .overlay(
-                    Capsule().strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5)
-                )
-                .foregroundStyle(.primary)
-        }
         // Accept dragged conversation card(s) → attach this tag to each.
         // When the drag originated from a multi-selected List row, SwiftUI
         // delivers one payload per selected item, so we forward the full
         // array to the handler rather than just the first element.
+        // (The reverse direction — picking a tag UP from this row — is
+        // handled by `.draggable` on the inner tag-name HStack above, so
+        // it doesn't fight with the +/− attach button or the menu.)
         .dropDestination(for: ConversationDragPayload.self) { payloads, _ in
             guard !payloads.isEmpty else { return false }
             onAttachDroppedConversations(payloads.map { $0.id })
             return true
-        } isTargeted: { isDropTargeted = $0 }
+        } isTargeted: { newValue in
+            if isDropTargeted != newValue { isDropTargeted = newValue }
+        }
     }
 
     /// Leading glyph differentiates Trash (rescue lane) from regular

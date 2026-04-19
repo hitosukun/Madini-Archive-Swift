@@ -11,6 +11,12 @@ enum WorkspaceLayoutMetrics {
     static let sidebarIdealWidth: CGFloat = 300
     static let sidebarMaxWidth: CGFloat = 360
 
+    /// Height of the sidebar's narrow-the-results control row that sits
+    /// directly under the search field (sort menu + date range picker).
+    /// Sized to comfortably hold the standard `headerChipHeight` chip
+    /// family with a small vertical breathing margin on each side.
+    static let sidebarControlsRowHeight: CGFloat = 44
+
     // MARK: - Content (middle) pane
 
     static let contentMinWidth: CGFloat = 320
@@ -38,6 +44,12 @@ enum WorkspaceLayoutMetrics {
     /// row-and-a-half of content so approaching rows dissolve rather
     /// than snap.
     static let topFadeHeight: CGFloat = 92
+
+    /// Height of the bottom-fade mask. Matched to `topFadeHeight` so
+    /// the two edges visually balance — content entering the pane from
+    /// the bottom of the scroll view softens over the same distance as
+    /// it does entering from the top.
+    static let bottomFadeHeight: CGFloat = 92
 
     // MARK: - Pane interior chrome
 
@@ -176,6 +188,22 @@ struct HeaderBarHeightPreferenceKey: PreferenceKey {
     }
 }
 
+/// Dynamic height of the sidebar's chrome strip overlay (search field
+/// + sort/date controls + active-filter chip flow). The search field
+/// container expands vertically when chips wrap into multiple rows, so
+/// the inset above the scrolling sidebar content can't be a constant.
+/// Measured by the overlay and consumed by the sidebar's
+/// `safeAreaInset` so the first sidebar row always sits flush with the
+/// strip's bottom edge.
+struct SidebarHeaderHeightPreferenceKey: PreferenceKey {
+    static var defaultValue: CGFloat =
+        WorkspaceLayoutMetrics.headerBarContentRowHeight
+        + WorkspaceLayoutMetrics.sidebarControlsRowHeight
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 /// Environment value carrying the current pane's floating-header-bar height
 /// into deeply nested scroll views. Used by the reader pane (right column)
 /// so `ConversationDetailView` → `LoadedConversationDetailView` can apply
@@ -256,15 +284,39 @@ extension View {
     /// opacity of the masked view, so transparent at the top = faded-out
     /// content there, opaque below = content visible normally.
     func topFadeMask(height: CGFloat) -> some View {
+        edgeFadeMask(top: height, bottom: 0)
+    }
+
+    /// Fade both the top and bottom edges of this view. Same rationale
+    /// as `topFadeMask` — content scrolling into either edge of a pane
+    /// dissolves rather than hitting a hard line. Pass `0` on either
+    /// side to skip that edge's fade.
+    ///
+    /// The mask is a vertical stack: a top gradient from `.clear` to
+    /// `.black`, a solid black middle, and a bottom gradient from
+    /// `.black` back to `.clear`. A zero-height gradient is a no-op
+    /// (SwiftUI collapses it) so the single implementation covers
+    /// top-only, bottom-only, and both-edges variants.
+    func edgeFadeMask(top: CGFloat, bottom: CGFloat) -> some View {
         self.mask(
             VStack(spacing: 0) {
-                LinearGradient(
-                    colors: [.clear, .black],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-                .frame(height: height)
+                if top > 0 {
+                    LinearGradient(
+                        colors: [.clear, .black],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                    .frame(height: top)
+                }
                 Color.black
+                if bottom > 0 {
+                    LinearGradient(
+                        colors: [.black, .clear],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                    .frame(height: bottom)
+                }
             }
         )
     }

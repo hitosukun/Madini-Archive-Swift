@@ -1,44 +1,60 @@
 import SwiftUI
 
-/// Left-sidebar search field with `#tag` prefix parsing.
+/// Left-sidebar search field with `#tag` prefix parsing, doubling as
+/// the host for the active-filter chip set.
 ///
 /// Plain tokens are forwarded to `LibraryViewModel.searchText` (full-text
 /// search). Tokens starting with `#` are promoted into
-/// `filter.bookmarkTags` and cleared from the visible draft. The active
-/// tag set is surfaced elsewhere (the highlighted rows in the Tags
-/// section and the chip strip in the middle-pane header), so we do NOT
-/// render chips inside the search field itself — they previously made
-/// the field cramped and pushed the input caret around as tags were
-/// added/removed.
+/// `filter.bookmarkTags` and cleared from the visible draft.
+///
+/// **Chips inside the field.** When `activeFilterChips` is non-empty the
+/// glass container expands vertically and renders the chip flow under
+/// the text field — same surface, same chrome. The user spec was that
+/// the search box "ぐいっと広がって" with chips inside, so the field and
+/// its filter state read as one control rather than two stacked rows.
 struct SidebarSearchBar: View {
     @Bindable var viewModel: LibraryViewModel
+    /// Currently-active filter chips supplied by the parent (driven by
+    /// `LibraryViewModel.activeFilterChips`). Empty array hides the
+    /// chip section and keeps the container at single-row height.
+    var activeFilterChips: [LibraryActiveFilterChip] = []
+    /// Per-chip dismissal handler — `LibraryViewModel.clearFilterChip`
+    /// in production. Optional so callers that don't need filter chips
+    /// (preview / iOS) can omit it.
+    var onClearChip: (LibraryActiveFilterChip) -> Void = { _ in }
     @State private var draft: String = ""
 
     var body: some View {
-        HStack(alignment: .center, spacing: 6) {
-            Image(systemName: "magnifyingglass")
-                .font(.body.weight(.semibold))
-                .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .center, spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(.secondary)
 
-            TextField("Search archive  (use #tag)", text: $draft)
-                .textFieldStyle(.plain)
-                .onChange(of: draft) { _, newValue in
-                    commitParsed(newValue)
-                }
-                .onAppear {
-                    draft = viewModel.filter.keyword
-                }
+                TextField("Search archive  (use #tag)", text: $draft)
+                    .textFieldStyle(.plain)
+                    .onChange(of: draft) { _, newValue in
+                        commitParsed(newValue)
+                    }
+                    .onAppear {
+                        draft = viewModel.filter.keyword
+                    }
+            }
+
+            if !activeFilterChips.isEmpty {
+                ActiveFilterChipsView(
+                    chips: activeFilterChips,
+                    onClear: onClearChip
+                )
+            }
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
         // Glass-chip treatment that matches the toolbar chip family
         // (`HeaderChipBackground` in `WorkspaceLayoutMetrics.swift`).
-        // Previously we painted a flat 8% secondary tint, which read as
-        // a plain filled box — fine in isolation but out of step with
-        // the other panes' glass-capsule controls. `.thinMaterial` +
-        // a near-invisible stroke unifies the chip family so the
-        // sidebar search and the middle-pane sort pill look like the
-        // same kind of control.
+        // `.thinMaterial` + a near-invisible stroke unifies the chip
+        // family so the sidebar search and the middle-pane sort pill
+        // look like the same kind of control.
         .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .fill(.thinMaterial)

@@ -87,6 +87,12 @@ struct ConversationRowView: View {
                     lineWidth: 1.5
                 )
         )
+        // Animate ONLY the highlight color/opacity, not anything that
+        // could change layout — the chip-row note above explains why
+        // layout-affecting animation interferes with DnD hit testing.
+        // `value: isDropTargeted` scopes the animation so it doesn't fire
+        // for unrelated body re-evals (tag updates, selection changes).
+        .animation(.easeOut(duration: 0.12), value: isDropTargeted)
         .contentShape(Rectangle())
         .modifier(
             ConversationRowTagDropModifier(
@@ -126,7 +132,15 @@ private struct ConversationRowTagDropModifier: ViewModifier {
                 guard let first = payloads.first else { return false }
                 onAttachTag(first.name)
                 return true
-            } isTargeted: { isTargeted = $0 }
+            } isTargeted: { newValue in
+                // Guard redundant writes — SwiftUI fires this callback on
+                // every cursor-move tick during the drag, often with the
+                // same value as the prior call. Each write re-runs body
+                // and any `.animation(value:)` watchers. With dozens of
+                // visible rows each owning their own `isTargeted` state,
+                // the redundant churn was the bulk of the perceived lag.
+                if isTargeted != newValue { isTargeted = newValue }
+            }
         } else {
             content
         }

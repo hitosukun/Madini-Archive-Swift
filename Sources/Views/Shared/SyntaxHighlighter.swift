@@ -41,6 +41,30 @@ enum SyntaxHighlighter {
     /// AttributedString stays usable in test contexts that don't
     /// thread a size through.
     static func highlight(_ code: String, language: String?, fontSize: CGFloat? = nil) -> AttributedString {
+        // Tokenizing + per-token attribute application costs scale with
+        // code-block size and run on every `CodeBlockView` body
+        // evaluation — including every time a code block scrolls back
+        // into a `LazyVStack` viewport. Memoize per `(language, font,
+        // code)` so the second-and-onward show is a dictionary hit.
+        // Skip the cache for very short snippets where the highlight
+        // itself is cheaper than the cache key allocation.
+        if code.count > 32 {
+            let cacheKey = HighlightCacheKey(
+                code: code,
+                language: language?.lowercased() ?? "",
+                fontSize: fontSize ?? -1
+            )
+            if let hit = highlightCache.value(for: cacheKey) {
+                return hit
+            }
+            let result = computeHighlight(code: code, language: language, fontSize: fontSize)
+            highlightCache.set(result, for: cacheKey)
+            return result
+        }
+        return computeHighlight(code: code, language: language, fontSize: fontSize)
+    }
+
+    private static func computeHighlight(code: String, language: String?, fontSize: CGFloat?) -> AttributedString {
         var attributed = AttributedString(code)
         // Set monospaced font on the entire string up front. The
         // caller could do this themselves, but baking it in here
@@ -86,6 +110,44 @@ enum SyntaxHighlighter {
         let canonical = aliases[raw] ?? raw
         return languageDefinitions[canonical]
     }
+
+    // MARK: - Cache
+
+    private struct HighlightCacheKey: Hashable {
+        let code: String
+        let language: String
+        let fontSize: CGFloat
+    }
+
+    private final class HighlightCache: @unchecked Sendable {
+        private let storage: NSCache<NSString, Box> = {
+            let c = NSCache<NSString, Box>()
+            c.countLimit = 256
+            return c
+        }()
+        private final class Box {
+            let value: AttributedString
+            init(_ v: AttributedString) { self.value = v }
+        }
+
+        private func nsKey(_ key: HighlightCacheKey) -> NSString {
+            // Full source in the key — hashValue alone can collide and a
+            // miscolored code block from a hash hit would be a confusing
+            // bug to track down. NSString bridging is fast on bounded
+            // sizes and the count cap keeps memory finite.
+            "\(key.fontSize)|\(key.language)|\(key.code)" as NSString
+        }
+
+        func value(for key: HighlightCacheKey) -> AttributedString? {
+            storage.object(forKey: nsKey(key))?.value
+        }
+
+        func set(_ value: AttributedString, for key: HighlightCacheKey) {
+            storage.setObject(Box(value), forKey: nsKey(key))
+        }
+    }
+
+    private static let highlightCache = HighlightCache()
 
     private static let aliases: [String: String] = [
         "js": "javascript",

@@ -6,15 +6,40 @@ import UIKit
 #endif
 import SwiftMath
 
-struct MessageBubbleView: View {
+struct MessageBubbleView: View, Equatable {
     enum DisplayMode {
         case rendered
         case plain
     }
 
+    /// SwiftUI re-evaluates `body` whenever any ancestor state changes.
+    /// In a long conversation that means a `selectedPromptID` write from
+    /// the scroll observer (fires on every scroll frame!) used to ripple
+    /// through every visible bubble, re-running paragraph parsing and
+    /// `Text` concatenation. None of this view's input properties depend
+    /// on that selection, so wrap it with `.equatable()` at the call
+    /// site and SwiftUI short-circuits the body re-eval when message +
+    /// displayMode + identity inputs are unchanged. (Environment-driven
+    /// updates — IdentityPreferencesStore mutations — still propagate
+    /// because EquatableView only short-circuits structural input
+    /// changes, not environment changes.)
+    static func == (lhs: MessageBubbleView, rhs: MessageBubbleView) -> Bool {
+        lhs.message == rhs.message
+            && lhs.displayMode == rhs.displayMode
+            && lhs.identityContext == rhs.identityContext
+    }
+
     private enum Layout {
         static let avatarSize: CGFloat = 34
         static let avatarColumnWidth: CGFloat = 42
+        /// Max width the user bubble (accent-tinted prompt) is allowed
+        /// to reach before its text wraps. Keeps long prompts from
+        /// stretching edge-to-edge and makes the bubble read as
+        /// anchored to the avatar on the right rather than as a
+        /// full-width banner. Tuned by eye against iMessage / Slack:
+        /// wide enough for a few-sentence paragraph to sit on one or
+        /// two lines, narrow enough that a ~60-char line still wraps.
+        static let userBubbleMaxWidth: CGFloat = 520
         // Caps were historically 12_000 / 8_000, which were conservative
         // to the point that long-form assistant replies (especially the
         // multi-section explanations ChatGPT / Claude produce) routinely
@@ -70,8 +95,17 @@ struct MessageBubbleView: View {
         //   in). A compact inline byline at the top carries the avatar +
         //   name; content flows out to the full pane width below it.
         if message.isUser {
+            // Leading Spacer + trailing-capped bubble = iMessage-style
+            // right-hugging layout. Short prompts sit compactly next to
+            // the avatar; long prompts wrap at `Layout.userBubbleMaxWidth`
+            // rather than stretching the full pane width, so the bubble
+            // always looks like it's anchored to the avatar instead of
+            // floating as a full-bleed banner.
             HStack(alignment: .top, spacing: 10) {
+                Spacer(minLength: 0)
+
                 userMessageColumn
+                    .frame(maxWidth: Layout.userBubbleMaxWidth, alignment: .trailing)
 
                 avatarButton(size: Layout.avatarSize)
                     .frame(width: Layout.avatarColumnWidth, alignment: .topTrailing)
@@ -108,38 +142,40 @@ struct MessageBubbleView: View {
     }
 
     /// User-side: bubble-framed message column with the trailing-aligned
-    /// byline. This is the historic layout (avatar column lives outside,
-    /// managed by `body`).
+    /// byline. Column alignment is `.trailing` so the byline and the
+    /// bubble hug the right edge (next to the avatar) when the bubble
+    /// is narrower than the column's available width — the body lays
+    /// out this column with a cap of `Layout.userBubbleMaxWidth`, so
+    /// short prompts leave blank space on the LEFT, not distributed on
+    /// both sides.
     private var userMessageColumn: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 8) {
-                Spacer()
+        VStack(alignment: .trailing, spacing: 4) {
+            Text(identityPresentation.displayName)
+                .font(.caption)
+                .fontWeight(.semibold)
+                .foregroundStyle(identityPresentation.accentColor)
 
-                Text(identityPresentation.displayName)
-                    .font(.caption)
-                    .fontWeight(.semibold)
-                    .foregroundStyle(identityPresentation.accentColor)
-            }
-
-            VStack(alignment: .leading, spacing: 10) {
-                // User prompts render verbatim regardless of display mode.
-                // The raw input often contains markdown-significant prefixes
-                // (`# ...`, `- ...`) used as shorthand/outline rather than
-                // as actual document structure — rendering them as H1s and
-                // bullet lists blows the bubble up to several screens tall
-                // and loses the visual parity between "prompt as typed"
-                // and "prompt as shown."
-                Text(verbatim: message.content)
-                    .font(.system(size: Layout.bodyFontSize))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .padding(12)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(bubbleBackground)
-            .clipShape(RoundedRectangle(cornerRadius: 8))
+            // User prompts render verbatim regardless of display mode.
+            // The raw input often contains markdown-significant prefixes
+            // (`# ...`, `- ...`) used as shorthand/outline rather than
+            // as actual document structure — rendering them as H1s and
+            // bullet lists blows the bubble up to several screens tall
+            // and loses the visual parity between "prompt as typed"
+            // and "prompt as shown."
+            //
+            // No `frame(maxWidth: .infinity)` on the Text or its wrapper
+            // — we want the bubble to size to the text's natural wrapped
+            // width (capped by the parent's max-width frame), not to
+            // stretch to fill. That's what lets a short prompt produce
+            // a short bubble.
+            Text(verbatim: message.content)
+                .font(.system(size: Layout.bodyFontSize))
+                .textSelection(.enabled)
+                .multilineTextAlignment(.leading)
+                .padding(12)
+                .background(bubbleBackground)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     /// Assistant-side: no bubble chrome, no dedicated avatar column. A
@@ -176,8 +212,8 @@ struct MessageBubbleView: View {
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 } else {
-                    ForEach(Array(contentBlocks.enumerated()), id: \.offset) { _, block in
-                        renderBlock(block)
+                    ForEach(Array(renderItems.enumerated()), id: \.offset) { _, item in
+                        renderItem(item)
                     }
                 }
             }
@@ -191,6 +227,20 @@ struct MessageBubbleView: View {
     }
 
     // MARK: - Block rendering
+
+    @ViewBuilder
+    private func renderItem(_ item: MessageRenderItem) -> some View {
+        switch item {
+        case .block(let block):
+            renderBlock(block)
+        case .foreignLanguageGroup(let language, let blocks):
+            ForeignLanguageBlockView(language: language, blocks: blocks) { displayBlocks in
+                ForEach(Array(displayBlocks.enumerated()), id: \.offset) { _, block in
+                    renderBlock(block)
+                }
+            }
+        }
+    }
 
     @ViewBuilder
     private func renderBlock(_ block: ContentBlock) -> some View {
@@ -331,6 +381,32 @@ struct MessageBubbleView: View {
         init(_ blocks: [ContentBlock]) { self.blocks = blocks }
     }
 
+    /// Same lifecycle as `contentBlocks`, but folded through
+    /// `ForeignLanguageGrouping` so consecutive foreign-language blocks
+    /// render as one de-emphasized box. Cached separately because the
+    /// grouping pass is itself non-trivial (NL detection per block) and
+    /// `body` is re-evaluated on parent updates.
+    private var renderItems: [MessageRenderItem] {
+        let key = message.id as NSString
+        if let cached = Self.renderItemsCache.object(forKey: key) {
+            return cached.items
+        }
+        let items = ForeignLanguageGrouping.group(contentBlocks)
+        Self.renderItemsCache.setObject(RenderItemsBox(items), forKey: key)
+        return items
+    }
+
+    private static let renderItemsCache: NSCache<NSString, RenderItemsBox> = {
+        let cache = NSCache<NSString, RenderItemsBox>()
+        cache.countLimit = 500
+        return cache
+    }()
+
+    private final class RenderItemsBox {
+        let items: [MessageRenderItem]
+        init(_ items: [MessageRenderItem]) { self.items = items }
+    }
+
     private var canRenderMessage: Bool {
         message.content.count <= Layout.maxRenderedMessageLength
     }
@@ -449,7 +525,41 @@ private enum InlineTextRun {
 /// - `$$` and `\[` are intentionally NOT consumed here; those are
 ///   block-level and handled by the line-oriented parser earlier.
 private enum InlineMathSplitter {
+    /// Process-level cache for splitter output. Splitting is pure w.r.t.
+    /// the input string and produces a small, immutable structure, but
+    /// the work itself (full `Array(text)` conversion + per-character
+    /// scan + buffer accumulation) repeats on every body re-eval of the
+    /// containing message bubble — and on long, math-dense pages
+    /// (eigenvalue / linear-algebra threads) we hit the same paragraphs
+    /// dozens of times per scroll frame. Memoizing turns those into an
+    /// NSCache hit.
+    private final class RunsBox {
+        let runs: [InlineTextRun]
+        init(_ runs: [InlineTextRun]) { self.runs = runs }
+    }
+    private static let cache: NSCache<NSString, RunsBox> = {
+        let c = NSCache<NSString, RunsBox>()
+        c.countLimit = 4096
+        return c
+    }()
+
     static func split(_ text: String) -> [InlineTextRun] {
+        // Skip the cache for tiny inputs — the NSString bridge + NSCache
+        // lookup overhead is comparable to the split itself for short
+        // strings, and they're cheap to redo.
+        if text.count > 24 {
+            let key = text as NSString
+            if let hit = cache.object(forKey: key) {
+                return hit.runs
+            }
+            let computed = computeSplit(text)
+            cache.setObject(RunsBox(computed), forKey: key)
+            return computed
+        }
+        return computeSplit(text)
+    }
+
+    private static func computeSplit(_ text: String) -> [InlineTextRun] {
         let chars = Array(text)
         var runs: [InlineTextRun] = []
         var buffer = ""
@@ -655,6 +765,14 @@ enum TableAlignment {
     }
 
     var frameAlignment: Alignment {
+        switch self {
+        case .leading: return .leading
+        case .center: return .center
+        case .trailing: return .trailing
+        }
+    }
+
+    var gridColumnAlignment: HorizontalAlignment {
         switch self {
         case .leading: return .leading
         case .center: return .center
@@ -1305,60 +1423,57 @@ private struct TableBlockView: View {
     let renderInline: (String) -> Text
 
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: true) {
-            VStack(alignment: .leading, spacing: 0) {
-                headerRow
-                Divider()
-                ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
-                    if index > 0 {
-                        Divider().opacity(0.3)
-                    }
-                    bodyRow(row)
+        // No horizontal ScrollView wrapper — two-finger trackpad swipes
+        // inside a scrollable table would be mis-recognized by the
+        // Viewer-Mode swipe gesture on the workspace split view
+        // (`ViewerModeSwipeGesture`) and flip the mode accidentally.
+        // Same tradeoff the code-block renderer makes one struct up:
+        // wrap cells instead of letting the table scroll sideways.
+        //
+        // `Grid` sizes every column to its widest cell across ALL
+        // rows — header + body — so cell boundaries line up
+        // vertically. Cells use `.fixedSize(horizontal: false,
+        // vertical: true)` inside `cellText`, so when the Grid's
+        // natural width exceeds the bubble's available width, each
+        // cell's text wraps rather than the whole grid overflowing.
+        //
+        // No outer `.frame(maxWidth: .infinity)` — we want the
+        // rounded-rectangle chrome to hug the table's natural width.
+        // On a wide viewer this stops short tables (3 narrow columns
+        // of prices, etc.) from stretching edge-to-edge with blank
+        // filler between columns.
+        Grid(alignment: .topLeading, horizontalSpacing: 0, verticalSpacing: 0) {
+            GridRow {
+                ForEach(Array(headers.enumerated()), id: \.offset) { index, cell in
+                    cellText(cell, alignment: alignment(at: index))
+                        .font(.system(size: fontSize, weight: .semibold))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .gridColumnAlignment(alignment(at: index).gridColumnAlignment)
                 }
             }
-            .padding(.vertical, 2)
+            Divider()
+            ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
+                if index > 0 {
+                    Divider().opacity(0.3)
+                }
+                GridRow {
+                    ForEach(Array(row.enumerated()), id: \.offset) { idx, cell in
+                        cellText(cell, alignment: alignment(at: idx))
+                            .font(.system(size: fontSize))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                    }
+                }
+            }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 2)
         .background(PlatformColors.textBackground.opacity(0.35))
         .clipShape(RoundedRectangle(cornerRadius: 6))
         .overlay(
             RoundedRectangle(cornerRadius: 6)
                 .stroke(Color.gray.opacity(0.2), lineWidth: 1)
         )
-    }
-
-    private var headerRow: some View {
-        HStack(alignment: .top, spacing: 0) {
-            ForEach(Array(headers.enumerated()), id: \.offset) { index, cell in
-                cellText(cell, alignment: alignment(at: index))
-                    .font(.system(size: fontSize, weight: .semibold))
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .frame(minWidth: 80, alignment: alignment(at: index).frameAlignment)
-                if index < headers.count - 1 {
-                    Rectangle()
-                        .fill(Color.gray.opacity(0.2))
-                        .frame(width: 1)
-                }
-            }
-        }
-    }
-
-    private func bodyRow(_ row: [String]) -> some View {
-        HStack(alignment: .top, spacing: 0) {
-            ForEach(Array(row.enumerated()), id: \.offset) { index, cell in
-                cellText(cell, alignment: alignment(at: index))
-                    .font(.system(size: fontSize))
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .frame(minWidth: 80, alignment: alignment(at: index).frameAlignment)
-                if index < row.count - 1 {
-                    Rectangle()
-                        .fill(Color.gray.opacity(0.15))
-                        .frame(width: 1)
-                }
-            }
-        }
     }
 
     private func cellText(_ text: String, alignment: TableAlignment) -> some View {
@@ -1422,19 +1537,20 @@ private struct MathBlockView: View {
             .padding(.bottom, 4)
 
             if canTypeset {
-                // Horizontal scroll as a safety net: a wide matrix /
-                // long equation that still overflows the column
-                // shouldn't clip. The label reports its own intrinsic
-                // size, so short equations just sit at their natural
-                // width without scrolling.
-                ScrollView(.horizontal, showsIndicators: false) {
-                    MathLabelView(
-                        latex: source,
-                        fontSize: fontSize * 1.15
-                    )
-                    .padding(.horizontal, 12)
-                    .padding(.bottom, 10)
-                }
+                // No horizontal ScrollView — same rationale as the code
+                // block and table renderers: two-finger trackpad swipes
+                // inside a scrollable math block would be mis-recognized
+                // by `ViewerModeSwipeGesture` and flip Viewer Mode. Wide
+                // matrices / long equations that exceed the bubble
+                // width will clip at the edge; the raw-source fallback
+                // below is the recovery path (users can still read /
+                // copy via the CopyButton in the header).
+                MathLabelView(
+                    latex: source,
+                    fontSize: fontSize * 1.15
+                )
+                .padding(.horizontal, 12)
+                .padding(.bottom, 10)
             } else {
                 // Parse failed — preserve the source verbatim in a
                 // monospaced source-code style so the user can still
