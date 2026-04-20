@@ -499,23 +499,32 @@ struct MacOSRootView: View {
                 // deprecated `NSToolbarItem.minSize` / `.maxSize`
                 // properties.
                 //
-                // We declare a moderate `idealWidth` on purpose. The
-                // ideal is the size AppKit tries to grant when there's
-                // no pressure — too high (~520) and it pushes the
-                // share/mode-picker buttons off on narrow windows;
-                // too low (~220) and the ViewThatFits ladder picks a
-                // prompt-less tier even at normal window widths,
-                // making the prompt pulldown disappear.
+                // Width hint for NSToolbar:
                 //
-                // Pick a width that comfortably fits the "compact
-                // with prompt visible" tier (thread 120 + chevron +
-                // prompt 70 = ~210pt, plus breathing room for the
-                // sort chip and counter siblings). `minWidth: 60`
-                // still lets the content collapse to an icon-only
-                // sort chip + a thread sliver when the window is
-                // truly narrow; `maxWidth: 720` caps growth on
-                // ultra-wide displays.
-                .frame(minWidth: 60, idealWidth: 380, maxWidth: 720)
+                // * No `idealWidth`. A fixed ideal means AppKit will
+                //   only grant that much — the content can't grow on
+                //   wide windows even when there's slack, so the
+                //   breadcrumb stays stuck on a narrow tier. Letting
+                //   the ideal default to the content's natural size
+                //   (the first tier of `ViewThatFits` ~ 560pt) makes
+                //   AppKit grant a generous allocation when the
+                //   window is wide; `ViewThatFits` then happily
+                //   picks tier 0.
+                //
+                // * `minWidth: 60` is the compression floor — AppKit
+                //   is allowed to squeeze the principal all the way
+                //   down to an icon-only sort chip + a thread sliver
+                //   tier before overflowing the item. Without this
+                //   floor AppKit sends the whole item to the » menu
+                //   the moment the proposed width drops below the
+                //   natural ideal.
+                //
+                // * `maxWidth: .infinity` lets the principal flex
+                //   into whatever toolbar slack remains, which pairs
+                //   with the tier-descending `ViewThatFits` so
+                //   narrower windows cascade through tiers cleanly
+                //   instead of getting shunted to overflow.
+                .frame(minWidth: 60, maxWidth: .infinity)
             }
             ToolbarItem(id: "share", placement: .primaryAction) {
                 WorkspaceFloatingExportButton(detail: tabManager.activeDetail)
