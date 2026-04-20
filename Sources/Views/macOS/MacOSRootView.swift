@@ -83,7 +83,22 @@ struct MacOSRootView: View {
         // `WindowConfigurator` itself is kept for future AppKit
         // tweaks that don't disturb the split view (traffic-light
         // behavior, window appearance, etc.).
-        .background(WindowConfigurator { _ in })
+        //
+        // `titleVisibility = .hidden` suppresses the "MadiniArchive"
+        // title string that macOS otherwise renders between the
+        // traffic-light cluster and the toolbar items. The breadcrumb
+        // (`ReaderHeaderActivityPill`) already communicates "what
+        // you're looking at" at a finer granularity, so the global app
+        // title is redundant and competes with the centered toolbar
+        // cluster for chrome real estate. This is the minimally
+        // invasive NSWindow setting — unlike `titlebarAppearsTransparent`
+        // or `toolbarStyle = .unifiedCompact` (both tried previously,
+        // both broke `NavigationSplitView`'s sidebar layout on the
+        // current SDK), `.titleVisibility` only hides the label and
+        // leaves AppKit's titlebar / toolbar geometry untouched.
+        .background(WindowConfigurator { window in
+            window.titleVisibility = .hidden
+        })
         // Window-level JSON drop handler. Sits ABOVE the in-app tag /
         // conversation drop destinations (which live on specific rows
         // further down the view tree) so an external file drag lands
