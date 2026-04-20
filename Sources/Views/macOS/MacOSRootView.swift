@@ -521,17 +521,22 @@ struct MacOSRootView: View {
                 //   (= tier-0 ~ 560pt + sort chip ~ 80pt) lets AppKit
                 //   grant a roomy allocation when there's slack.
                 //
-                // * `maxWidth: 640` just above the natural tier-0
-                //   size, so AppKit never allocates more than the
-                //   breadcrumb can actually use. Real width arbitration
-                //   happens inside `ReaderHeaderActivityPill` via the
-                //   tier-descending `ViewThatFits` ladder.
+                // * `maxWidth: 420` — tight enough that the primary-
+                //   action cluster (counter + share + mode picker)
+                //   always has room on the trailing side. Earlier we
+                //   ran `maxWidth: 640`, which let the principal claim
+                //   nearly the full content width on mid-size windows;
+                //   AppKit then ran out of budget and overflowed
+                //   `share` and `mode-picker` (confirmed via the
+                //   `[MadiniToolbar]` NSLog diagnostic). 420pt still
+                //   fits the breadcrumb's mid-tier sizes comfortably
+                //   and leaves ~200pt of headroom on a 1280pt window.
                 //
                 // * `minWidth: 60` is the compression floor — below
                 //   that AppKit sends the item to the » overflow menu
                 //   (`ViewThatFits` already descends to a thread-only
                 //   sliver tier before that point).
-                .frame(minWidth: 60, maxWidth: 640)
+                .frame(minWidth: 60, maxWidth: 420)
             }
             // "N / M" prompt-position counter as its own ToolbarItem.
             // Pulled out of the breadcrumb capsule because the
@@ -626,17 +631,43 @@ struct MacOSRootView: View {
         // the SwiftUI intrinsic size. So we don't touch those and
         // rely on the SwiftUI content alone.
         if let toolbar = window.toolbar {
-            // Pin every toolbar item we own to `.high` so AppKit
-            // treats them as equally important under overflow
-            // pressure. Previously we switched on specific item IDs,
-            // which created a race: if a SwiftUI toolbar refresh
-            // added (or re-added) an item AFTER this pass ran, that
-            // new item entered the toolbar at the default `.standard`
-            // priority and AppKit overflowed it on first display.
-            // Unconditionally `.high` covers late-arriving items on
-            // subsequent `updateNSView` passes.
+            // Differentiated priorities — earlier we pinned all four
+            // of our items to `.high`, reasoning that equal-priority
+            // items would be treated as equally important. The log
+            // diagnostic below proved that wrong: when the budget is
+            // tight, AppKit overflows equal-priority items in
+            // declaration order from the end, so `mode-picker` (last)
+            // and `share` (second-last) got dropped while
+            // `navigation-bar` and `prompt-counter` stayed. What we
+            // actually want is a priority *gradient*:
+            //
+            //   * `mode-picker` → `.user` (highest — never drop, this
+            //     is the view-mode switcher and losing it breaks the
+            //     app's top-level navigation)
+            //   * `share`, `navigation-bar` → `.high` (important but
+            //     survivable)
+            //   * `prompt-counter` → `.standard` (first to go — it's
+            //     purely informational and its absence doesn't block
+            //     any action)
+            //
+            // The nav-bar's internal `ViewThatFits` tier descent
+            // still handles horizontal pressure before any overflow
+            // happens; this priority gradient just tells AppKit what
+            // order to make sacrifices in once the principal itself
+            // can't shrink further.
             for item in toolbar.items {
-                item.visibilityPriority = .high
+                switch item.itemIdentifier.rawValue {
+                case "mode-picker":
+                    item.visibilityPriority = .user
+                case "share", "navigation-bar":
+                    item.visibilityPriority = .high
+                case "prompt-counter":
+                    item.visibilityPriority = .standard
+                default:
+                    // System items (sidebar toggle, split-view
+                    // separator, flexible spaces) — leave as-is.
+                    break
+                }
             }
 
             // Kill the toolbar's persisted configuration. SwiftUI's
