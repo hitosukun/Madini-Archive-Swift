@@ -499,22 +499,23 @@ struct MacOSRootView: View {
                 // deprecated `NSToolbarItem.minSize` / `.maxSize`
                 // properties.
                 //
-                // We declare a low `idealWidth` on purpose. If the
-                // ideal is close to the natural width of the full
-                // breadcrumb (~500pt), AppKit hands the principal
-                // item that much space even when the window is
-                // narrow — which pushes the right-side primary
-                // actions (share, mode picker) off the toolbar.
-                // Setting `idealWidth` to something closer to a
-                // *narrow* breadcrumb state tells AppKit: "I'm happy
-                // living small; only give me more if you have
-                // slack." The principal's inner `ViewThatFits` then
-                // upgrades to a richer tier when space is actually
-                // available. `minWidth: 60` is the icon-only sort
-                // chip + the last-resort thread-only breadcrumb;
-                // `maxWidth: 720` just caps unchecked growth on
+                // We declare a moderate `idealWidth` on purpose. The
+                // ideal is the size AppKit tries to grant when there's
+                // no pressure — too high (~520) and it pushes the
+                // share/mode-picker buttons off on narrow windows;
+                // too low (~220) and the ViewThatFits ladder picks a
+                // prompt-less tier even at normal window widths,
+                // making the prompt pulldown disappear.
+                //
+                // Pick a width that comfortably fits the "compact
+                // with prompt visible" tier (thread 120 + chevron +
+                // prompt 70 = ~210pt, plus breathing room for the
+                // sort chip and counter siblings). `minWidth: 60`
+                // still lets the content collapse to an icon-only
+                // sort chip + a thread sliver when the window is
+                // truly narrow; `maxWidth: 720` caps growth on
                 // ultra-wide displays.
-                .frame(minWidth: 60, idealWidth: 220, maxWidth: 720)
+                .frame(minWidth: 60, idealWidth: 380, maxWidth: 720)
             }
             ToolbarItem(id: "share", placement: .primaryAction) {
                 WorkspaceFloatingExportButton(detail: tabManager.activeDetail)
