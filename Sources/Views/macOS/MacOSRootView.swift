@@ -445,6 +445,23 @@ struct MacOSRootView: View {
         // work will go in a separate pane-internal observer, not via
         // the AppKit-automatic titlebar path.
         .toolbar(id: "workspace") {
+            // Sort pulldown — leading edge of the toolbar, right after
+            // the sidebar toggle. Was previously mounted in the sidebar
+            // under the search field (`LibraryListHeaderBar`'s
+            // sort+date row), but the user asked to promote it into
+            // window chrome so the middle pane's sort state reads at
+            // the top-of-window level regardless of sidebar
+            // collapse/expand state. `.navigation` placement is the
+            // macOS slot for items that sit at the leading edge
+            // (conceptually: back-button / nav-action region), which
+            // is the behavior we want — opposite side from the share
+            // button + mode picker in `.primaryAction`. Date picker
+            // stays in the sidebar because it's a wider control that
+            // would cost too much toolbar real estate on narrow
+            // windows.
+            ToolbarItem(id: "sort-menu", placement: .navigation) {
+                LibraryListSortMenu(viewModel: libraryViewModel)
+            }
             ToolbarItem(id: "navigation-bar", placement: .principal) {
                 ReaderHeaderActivityPill(
                     activeDetail: tabManager.activeDetail,
@@ -631,8 +648,16 @@ private struct UnifiedLibrarySidebar: View {
                         onClearChip: viewModel.clearFilterChip
                     )
 
+                    // Sort pulldown moved to the window toolbar's leading
+                    // edge (`ToolbarItem(placement: .navigation)` in
+                    // `workspaceSplitView`), so this row now carries only
+                    // the date-range picker. The HStack + trailing
+                    // `Spacer` is kept so the date chip stays
+                    // left-aligned and the row's height matches the
+                    // other sidebar rows above/below it — dropping the
+                    // HStack would pull the chip flush against the
+                    // section-header padding.
                     HStack(spacing: WorkspaceLayoutMetrics.headerBarInteriorSpacing) {
-                        LibraryListSortMenu(viewModel: viewModel)
                         HeaderDateRangePicker(viewModel: viewModel)
                         Spacer(minLength: 0)
                     }
