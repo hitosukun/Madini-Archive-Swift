@@ -314,28 +314,55 @@ struct ConversationTableView: View {
 
     @TableColumnBuilder<LibraryConversationRow, KeyPathComparator<LibraryConversationRow>>
     private var tableColumns: some TableColumnContent<LibraryConversationRow, KeyPathComparator<LibraryConversationRow>> {
+        // Each cell installs a `TagDragPayload` drop target so the user
+        // can drag a tag chip from the sidebar Tags section onto any
+        // part of a row and attach it to that conversation. We put the
+        // drop on every cell (instead of once per row) because SwiftUI
+        // `Table` doesn't expose a row-level `.dropDestination` hook —
+        // the only row-level drop API on `TableRowContent` is the
+        // reorder-offset variant, which doesn't fit a "drop onto this
+        // row" gesture. Per-cell drops give the user the full row as a
+        // target: wherever the cursor is when they let go, the cell
+        // under the cursor catches the drop and forwards to the same
+        // `attachTag` handler keyed by the row's id.
+        //
+        // Each cell owns a local `@State var isTargeted` for drop
+        // highlighting. Coordinating a single "row is targeted" flag
+        // across cells would require a shared binding at this view
+        // level with custom coalescing (SwiftUI's per-destination
+        // isTargeted callback fires on every cursor tick and multiple
+        // cells may toggle in/out simultaneously as the cursor
+        // crosses column boundaries). Per-cell highlight is visually
+        // acceptable: the cell directly under the cursor lights up,
+        // which is still a clear "this row will receive the drop"
+        // signal.
         TableColumn("タイトル", value: \LibraryConversationRow.title) { (row: LibraryConversationRow) in
             TitleCell(row: row)
+                .modifier(RowTagDropModifier { name in attachTag(named: name, to: row.id) })
         }
         .width(min: 200, ideal: 360)
 
         TableColumn("日付", value: \LibraryConversationRow.dateSortKey) { (row: LibraryConversationRow) in
             DateCell(row: row)
+                .modifier(RowTagDropModifier { name in attachTag(named: name, to: row.id) })
         }
         .width(min: 110, ideal: 160, max: 220)
 
         TableColumn("モデル", value: \LibraryConversationRow.model) { (row: LibraryConversationRow) in
             ModelCell(row: row)
+                .modifier(RowTagDropModifier { name in attachTag(named: name, to: row.id) })
         }
         .width(min: 80, ideal: 140, max: 220)
 
         TableColumn("タグ", value: \LibraryConversationRow.tagsSortKey) { (row: LibraryConversationRow) in
             TagsCell(row: row)
+                .modifier(RowTagDropModifier { name in attachTag(named: name, to: row.id) })
         }
         .width(min: 100, ideal: 200)
 
         TableColumn("プロンプト数", value: \LibraryConversationRow.promptCount) { (row: LibraryConversationRow) in
             PromptCountCell(row: row)
+                .modifier(RowTagDropModifier { name in attachTag(named: name, to: row.id) })
         }
         .width(min: 80, ideal: 100, max: 140)
     }
@@ -353,6 +380,22 @@ struct ConversationTableView: View {
         // this the tab would open behind a zero-width detail column
         // and the user would see nothing change.
         onExitTableMode()
+    }
+
+    /// Sidebar-tag → table-row drop handler. Mirrors the list side's
+    /// `onAttachTag` closure (see `MacOSRootView.conversationRow`),
+    /// delegating to the same view-model entry point so tag writes go
+    /// through a single persistence path regardless of which surface
+    /// the user dropped onto. Fire-and-forget — the Table does not
+    /// await the attach and will re-render from the view model's
+    /// next `conversationTags` update.
+    private func attachTag(named name: String, to conversationID: String) {
+        Task {
+            await viewModel.attachTag(
+                named: name,
+                toConversation: conversationID
+            )
+        }
     }
 
     // MARK: - Sort persistence
@@ -594,6 +637,50 @@ private struct PromptCountCell: View {
             .monospacedDigit()
             .foregroundStyle(.secondary)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+    }
+}
+
+/// Attaches a `TagDragPayload` drop destination to a table cell, with a
+/// subtle accent-tinted background while the cell is targeted. Applied
+/// per cell (see `tableColumns` in `ConversationTableView`) because
+/// SwiftUI `Table` doesn't expose a row-level drop hook for the "drop
+/// onto this row" shape (the one on `TableRowContent` is a reorder
+/// variant). Each cell keeps its own `isTargeted` so the highlight is
+/// self-contained; coordinating a single row-wide flag would require
+/// shared mutable state and careful coalescing of the many per-tick
+/// isTargeted callbacks SwiftUI fires during a drag.
+private struct RowTagDropModifier: ViewModifier {
+    let onAttach: (String) -> Void
+
+    @State private var isTargeted: Bool = false
+
+    func body(content: Content) -> some View {
+        content
+            .background(
+                // Inset slightly from the cell edges so adjacent cells'
+                // highlights don't butt up against each other into a
+                // single continuous bar — keeps the "one cell is the
+                // drop target" cue readable.
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .fill(Color.accentColor.opacity(isTargeted ? 0.14 : 0))
+                    .padding(.horizontal, 1)
+                    .padding(.vertical, 1)
+            )
+            // Animate the accent fade only — nothing layout-affecting.
+            // ConversationRowView (the list side's equivalent) explains
+            // why layout animation interferes with drop hit-testing.
+            .animation(.easeOut(duration: 0.12), value: isTargeted)
+            .dropDestination(for: TagDragPayload.self) { payloads, _ in
+                guard let first = payloads.first else { return false }
+                onAttach(first.name)
+                return true
+            } isTargeted: { newValue in
+                // Coalesce — SwiftUI fires this every cursor-tick with
+                // the same value; each write re-runs body and retriggers
+                // the animation watcher, which was a visible hitch on
+                // tables with dozens of mounted rows.
+                if isTargeted != newValue { isTargeted = newValue }
+            }
     }
 }
 
