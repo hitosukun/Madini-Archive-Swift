@@ -55,6 +55,27 @@ struct ConversationTableView: View {
         KeyPathComparator(\.dateSortKey, order: .reverse)
     ]
 
+    /// Local, table-only selection state.
+    ///
+    /// Earlier revisions bound the `Table` selection to
+    /// `viewModel.selectedConversationIDs` — the same set the card
+    /// `List` uses. That sharing had a subtle side effect: every
+    /// single-click in the table wrote the clicked row's id into the
+    /// shared global, which `MacOSRootView` also observes via
+    /// `selectedConversationId` (a `.first` shim over the same set).
+    /// Depending on the observation order, a plain click could trip
+    /// the reader-tab-open path even though the user only wanted to
+    /// highlight a row in the grid. Keeping the table's selection
+    /// local is sufficient because the "open this conversation"
+    /// pathway (double-click / context menu / primaryAction) writes
+    /// `viewModel.selectedConversationId` explicitly — the global
+    /// only needs to be touched when the user actually asks to open.
+    ///
+    /// The drag payload still needs to cover multi-row drags, so the
+    /// `TableRow.draggable` closure below reads this local set when
+    /// composing the dragged id list.
+    @State private var tableSelection: Set<String> = []
+
     /// Stable IDs for each sortable column. Raw string values are
     /// what ends up in `@AppStorage` — renaming a case breaks the
     /// persisted preference for existing users, so treat these like
@@ -108,8 +129,37 @@ struct ConversationTableView: View {
         // underlying `NSScrollView` when the target id matches a row's
         // `Identifiable.id`.
         ScrollViewReader { proxy in
-            Table(rows, selection: $viewModel.selectedConversationIDs, sortOrder: $sortOrder) {
+            // Explicit-row-builder `Table` init (`Table(of:selection:sortOrder:) { columns } rows: { ... }`)
+            // rather than the data-driven `Table(rows, selection:, sortOrder:) { columns }` shorthand,
+            // because only the explicit form lets us attach `TableRow.draggable(...)` per row.
+            //
+            // Why that matters: the cell-level `.draggable` modifier
+            // inside a `TableColumn`'s content closure is unreliable
+            // — `NSTableView` intercepts `mouseDown` before the cell's
+            // SwiftUI gesture recognizer arms, so the drag never
+            // starts. `TableRow.draggable` hooks into the row's
+            // underlying `NSTableRowView` drag source, which is the
+            // path Apple's sample code uses and the only one that
+            // actually initiates drags on macOS 14+.
+            //
+            // `viewModel.draggedConversationIDs(for:)` on the
+            // view-model still keys off `selectedConversationIDs` (the
+            // card list's global selection), so we compute the drag
+            // payload inline here against the table's local selection:
+            // if the row under the cursor is part of the current
+            // multi-select, drag the whole set; otherwise just the
+            // one row.
+            Table(of: LibraryConversationRow.self, selection: $tableSelection, sortOrder: $sortOrder) {
                 tableColumns
+            } rows: {
+                ForEach(rows) { row in
+                    TableRow(row)
+                        .draggable(ConversationDragPayload(
+                            ids: tableSelection.contains(row.id)
+                                ? Array(tableSelection)
+                                : [row.id]
+                        ))
+                }
             }
             // Horizontal swipe → `MiddlePaneMode` cascade is now handled
             // exclusively by the single `ViewerModeSwipeGesture` installed
@@ -149,7 +199,7 @@ struct ConversationTableView: View {
             // realizes rows in the viewport plus a small buffer).
             .onChange(of: viewModel.pendingListScrollConversationID) { _, newValue in
                 guard let id = newValue else { return }
-                viewModel.selectedConversationIDs = [id]
+                tableSelection = [id]
                 Task { @MainActor in
                     try? await Task.sleep(nanoseconds: 30_000_000)
                     withAnimation(.easeInOut(duration: 0.2)) {
@@ -198,7 +248,7 @@ struct ConversationTableView: View {
                 }
                 for delayMs: UInt64 in [80, 200, 500] {
                     try? await Task.sleep(nanoseconds: delayMs * 1_000_000)
-                    viewModel.selectedConversationIDs = [id]
+                    tableSelection = [id]
                     proxy.scrollTo(id, anchor: .center)
                 }
                 if viewModel.pendingListScrollConversationID == id {
