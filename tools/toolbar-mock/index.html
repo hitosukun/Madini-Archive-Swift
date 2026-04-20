@@ -1,0 +1,2668 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>Madini Archive — Toolbar Mock</title>
+<style>
+/* ==========================================================================
+   Design tokens — mirrors SwiftUI's material / primary-opacity system.
+   ========================================================================== */
+:root {
+  color-scheme: light dark;
+
+  /* macOS-like system chrome (dark mode defaults) */
+  --win-bg:         #1e1e1e;
+  --toolbar-bg:     #2a2a2a;
+  --sidebar-bg:     #252525;
+  --middle-bg:      #1e1e1e;
+  --reader-bg:      #1a1a1a;
+  --border:         rgba(255,255,255,0.08);
+  --border-strong:  rgba(255,255,255,0.14);
+
+  /* primary/secondary/tertiary opacity system */
+  --fg-primary:     rgba(255,255,255,0.92);
+  --fg-secondary:   rgba(255,255,255,0.55);
+  --fg-tertiary:    rgba(255,255,255,0.32);
+
+  /* Chip / capsule materials */
+  --chip-mat:       rgba(255,255,255,0.06);
+  --chip-border:    rgba(255,255,255,0.08);
+  --capsule-mat:    rgba(255,255,255,0.03);
+  --capsule-border: rgba(255,255,255,0.03);
+
+  /* segment hover bg (primary @ 0.08) */
+  --seg-hover-bg:   rgba(255,255,255,0.08);
+
+  --accent:         #0a84ff;
+
+  /* Spec metrics (1:1 from WorkspaceLayoutMetrics.swift) */
+  --chip-height:    30px;
+  --chip-pad-h:     10px;
+  --capsule-h:      24px;
+  --capsule-pad-h:  4px;
+  --capsule-gap:    2px;
+  --segment-h:      22px;
+  --segment-pad-h:  6px;
+  --segment-gap:    6px;
+
+  /* Principal slot — the design goal is ONLY to cap over-expansion
+     on wide displays. There is no intent to share space with the
+     side spacers at narrow/medium widths; when the window has
+     room, the principal should claim all of it.
+       • `--principal-grow: 100` vs `--spacer-grow: 1` is a 99:1
+         split of free space, effectively "principal takes
+         everything until it can't take any more."
+       • `--principal-max: 900px` is the "can't take any more"
+         threshold — above it, excess window width flows to the
+         spacers (the only growable items left) and becomes balanced
+         air on either side. That's the only reason the spacers
+         exist: to drain the overflow once the cap engages.
+     Earlier attempts (4:1, 2:1, 1:1 ratios) all made the principal
+     shrink even when there was room to grow, because the spacers
+     kept skimming a meaningful fraction of free space. This design
+     has spacers stay effectively 0 until the cap engages. */
+  --principal-min:   60px;
+  --principal-max:   900px;   /* hard ceiling — taste-driven */
+  --principal-grow:  100;     /* effectively "greedy" */
+  --spacer-grow:     1;       /* "overflow drain only" */
+  --nav-gap:         10px;    /* spacing in HStack(spacing: 10) */
+
+  /* Toolbar height matching macOS unified toolbar */
+  --toolbar-h:      52px;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --win-bg:         #ededed;
+    --toolbar-bg:     #e2e2e2;
+    --sidebar-bg:     #dddddd;
+    --middle-bg:      #f6f6f6;
+    --reader-bg:      #ffffff;
+    --border:         rgba(0,0,0,0.10);
+    --border-strong:  rgba(0,0,0,0.18);
+
+    --fg-primary:     rgba(0,0,0,0.88);
+    --fg-secondary:   rgba(0,0,0,0.55);
+    --fg-tertiary:    rgba(0,0,0,0.32);
+
+    --chip-mat:       rgba(255,255,255,0.6);
+    --chip-border:    rgba(0,0,0,0.08);
+    --capsule-mat:    rgba(255,255,255,0.5);
+    --capsule-border: rgba(0,0,0,0.04);
+
+    --seg-hover-bg:   rgba(0,0,0,0.06);
+  }
+}
+
+/* ==========================================================================
+   Base
+   ========================================================================== */
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro",
+               "Helvetica Neue", system-ui, sans-serif;
+  color: var(--fg-primary);
+  background: var(--win-bg);
+  display: flex;
+  flex-direction: column;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ==========================================================================
+   Window toolbar (.titlebar-area)
+   Two-zone layout, mirroring Finder / Mail:
+
+     [ toolbar-left        ][ toolbar-right                                ]
+     [ (width = sidebar)   ][ flex-spacer  principal  flex-spacer trailing ]
+
+   The **left zone** sits directly above the sidebar column and shares
+   its width. Opening / closing the sidebar resizes this zone by the
+   full sidebar width — so the right zone (which is where principal +
+   trailing live) gains / loses exactly that width of budget. This is
+   the key behavior that was missing from the earlier single-zone
+   version, where only the tiny split-view separator moved.
+
+   The **right zone** spans above the middle + reader columns; all the
+   actual content-level chrome (sort chip, breadcrumb, counter, share,
+   mode picker) competes for space inside this zone only.
+   ========================================================================== */
+.toolbar {
+  display: flex;
+  align-items: stretch;
+  height: var(--toolbar-h);
+  background: var(--toolbar-bg);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  position: relative;
+  padding: 0;
+}
+
+/* Left zone — sized to match the sidebar column below.
+   Responsive breakpoints mirror `.three-pane .sidebar`. */
+.toolbar-left {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 12px;
+  width: 260px;                 /* = .three-pane .sidebar default width */
+  flex-shrink: 0;
+  border-right: 1px solid var(--border);
+  transition: width 120ms ease, border-right-color 120ms ease;
+}
+@media (max-width: 900px) { .toolbar-left { width: 200px; } }
+@media (max-width: 700px) { .toolbar-left { width: 160px; } }
+
+/* Sidebar closed → left zone shrinks to just fit the toggle button,
+   and the divider line that separates the zones disappears (there's
+   no sidebar beneath it to line up with). The content zone expands
+   into the reclaimed width by exactly the sidebar width. */
+body[data-sidebar="closed"] .toolbar-left {
+  width: auto;
+  border-right-color: transparent;
+}
+
+/* Right zone — everything content-side. All budget math for the
+   principal + trailing overflow happens inside THIS container's
+   width, not the whole window. */
+.toolbar-right {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 12px;
+}
+
+/* Principal slot — greedy grow + hard ceiling.
+   The 100:1 grow ratio vs. the spacers means the principal takes
+   ~99% of any free space until it hits `max-width`. Only then does
+   the remainder flow to the spacers (which become the residual
+   drain, positioning the capped principal as a centered island).
+   No intentional shrinkage at narrow widths — the principal uses
+   every pixel available up to the readable-width ceiling. */
+.toolbar .principal {
+  display: flex;
+  align-items: center;
+  gap: var(--nav-gap);
+  flex-grow: var(--principal-grow);
+  flex-shrink: 1;
+  flex-basis: auto;
+  min-width: var(--principal-min);
+  max-width: var(--principal-max);
+  justify-content: flex-start;
+}
+
+/* Flex spacers around the principal — 1/4 the grow weight of the
+   principal. They absorb space AFTER the principal has taken its
+   share, and they pick up all the residual once the principal hits
+   its max-width ceiling (since they're the only items still
+   growable at that point). */
+.toolbar .flex-spacer {
+  flex-grow: var(--spacer-grow);
+  flex-shrink: 1;
+  flex-basis: auto;
+  min-width: 6px;
+}
+
+/* Trailing cluster inside toolbar-right — counter + share + mode picker. */
+.toolbar .trailing {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+/* ==========================================================================
+   Sidebar toggle (system) — just a placeholder to show it's there.
+   ========================================================================== */
+.btn-system {
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: var(--fg-primary);
+  cursor: pointer;
+  padding: 0;
+  transition: background 120ms;
+}
+.btn-system:hover { background: var(--seg-hover-bg); }
+.btn-system svg { width: 18px; height: 18px; }
+
+/* Hide the sidebar column itself when closed. The zone divider line
+   between `.toolbar-left` and `.toolbar-right` is already handled by
+   the `border-right-color: transparent` transition on `.toolbar-left`
+   in the `[data-sidebar="closed"]` rule above — no separate AppKit
+   `splitViewSeparator` item needed in the two-zone model. */
+body[data-sidebar="closed"] .three-pane .sidebar { display: none; }
+
+/* ==========================================================================
+   Sort chip (LibraryListSortMenu, compressible: true)
+   ========================================================================== */
+.sort-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: var(--chip-height);
+  padding: 0 var(--chip-pad-h);
+  background: var(--chip-mat);
+  border: 0.5px solid var(--chip-border);
+  border-radius: calc(var(--chip-height) / 2);
+  color: var(--fg-primary);
+  font: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  min-width: 30px;
+  flex-shrink: 1;
+  position: relative;
+  transition: background 120ms;
+}
+.sort-chip:hover { background: var(--seg-hover-bg); }
+
+/* The glyph gets layoutPriority 1 — never compresses away. */
+.sort-chip .glyph {
+  flex-shrink: 0;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The label gets layoutPriority 0 — truncates with ellipsis first.
+   At the tightest width the label collapses to 0 via flex-basis: 0
+   and only the glyph remains. */
+.sort-chip .label {
+  font-size: 11px;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Sort menu dropdown */
+.sort-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  min-width: 180px;
+  background: var(--toolbar-bg);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  padding: 4px;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+  display: none;
+  z-index: 100;
+}
+.sort-chip[aria-expanded="true"] + .sort-menu { display: block; }
+
+.sort-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--fg-primary);
+}
+.sort-menu-item:hover { background: var(--seg-hover-bg); }
+.sort-menu-item .check {
+  width: 16px;
+  display: inline-flex;
+  justify-content: center;
+  font-weight: 700;
+  color: var(--fg-secondary);
+}
+.sort-menu hr {
+  border: none;
+  border-top: 0.5px solid var(--border);
+  margin: 4px 0;
+}
+
+/* ==========================================================================
+   Breadcrumb capsule (ReaderHeaderActivityPill)
+   Container-query driven tier selection.
+   ========================================================================== */
+.breadcrumb {
+  height: var(--capsule-h);
+  padding: 0 var(--capsule-pad-h);
+  background: var(--capsule-mat);
+  border: 0.5px solid var(--capsule-border);
+  border-radius: calc(var(--capsule-h) / 2);
+  display: flex;
+  align-items: center;
+  flex: 1 1 auto;   /* absorbs remaining space inside .principal */
+  min-width: 0;
+  overflow: hidden;
+  container-type: inline-size;
+  container-name: breadcrumb;
+  position: relative;
+}
+
+/* Each tier is a flex HStack of [thread] [chevron] [prompt|stub]. Only
+   one tier is display:flex at a time — others are display:none. */
+.breadcrumb .tier {
+  display: none;
+  align-items: center;
+  gap: var(--capsule-gap);
+  height: 100%;
+  width: 100%;
+}
+
+/* Default: tier 1 (full). Container queries below progressively swap
+   down when the measured inline-size no longer accommodates the
+   previous tier's fixed-width segments. */
+.breadcrumb .tier-1 { display: flex; }
+
+/* Tier thresholds — each tier is allowed to shrink ~25% below its
+   ideal (via `flex-shrink: 1` on the segments) BEFORE the next tier
+   takes over. That way narrowing the window first squeezes the
+   title with ellipsis inside the current tier, and only flips to
+   the smaller tier once the text has become genuinely cramped.
+   Previously thresholds sat right at each tier's ideal sum, so the
+   moment the capsule lost a single pixel below 556 we jumped from
+   260/280 segments to 180/160 — an abrupt visual step. Dropping
+   the thresholds by ~25% gives the discrete tier swaps more
+   breathing room and makes the whole breadcrumb feel like it's
+   smoothly shrinking with the window.
+
+     tier 1 ideal  260 + 16 + 280 + counter(~28)  ≈  584
+            shrink floor ~440 → drop to tier 2
+     tier 2 ideal  180 + 16 + 160 + counter(~28)  ≈  384
+            shrink floor ~280 → drop to tier 3
+     tier 3 ideal  120 + 16 +  70 + counter(~28)  ≈  234
+            shrink floor ~185 → drop to tier 4
+     tier 4 ideal  120 + 16 +  24 + counter(~28)  ≈  188
+            shrink floor ~145 → drop to tier 5
+     tier 5 ideal   90                            =   90
+*/
+@container breadcrumb (max-width: 440px) {
+  .breadcrumb .tier-1 { display: none; }
+  .breadcrumb .tier-2 { display: flex; }
+}
+@container breadcrumb (max-width: 280px) {
+  .breadcrumb .tier-2 { display: none; }
+  .breadcrumb .tier-3 { display: flex; }
+}
+@container breadcrumb (max-width: 185px) {
+  .breadcrumb .tier-3 { display: none; }
+  .breadcrumb .tier-4 { display: flex; }
+}
+@container breadcrumb (max-width: 145px) {
+  .breadcrumb .tier-4 { display: none; }
+  .breadcrumb .tier-5 { display: flex; }
+}
+
+/* Segment widths per tier — same flex-basis as the Swift `Tier`
+   table, but symmetric grow/shrink factors so thread and prompt
+   stretch and compress together in lockstep.
+     flex-basis = Npx  — "at rest, show this width"
+     grow = 1          — equal share of any extra capsule width
+     shrink = 1        — equal (basis-weighted) give-back when
+                         the capsule is pressured
+   An earlier iteration gave the prompt `flex-grow: 2`, reasoning
+   that prompt labels are usually the longer text and should claim
+   more of the new space on wide windows. In practice that made the
+   two segments sit asymmetrically at rest, and when the window
+   started to narrow the prompt appeared to shrink faster than the
+   thread — even though the shrink math was identical — because it
+   was falling from a higher starting width. Equal grow factors
+   keep the two segments visually paired, so narrowing compresses
+   them in tandem and the ratio feels uniform end-to-end. */
+.tier-1 .seg-thread { flex: 1 1 260px; }
+.tier-1 .seg-prompt { flex: 1 1 280px; }
+.tier-2 .seg-thread { flex: 1 1 180px; }
+.tier-2 .seg-prompt { flex: 1 1 160px; }
+.tier-3 .seg-thread { flex: 1 1 120px; }
+.tier-3 .seg-prompt { flex: 1 1 70px;  }
+.tier-4 .seg-thread { flex: 1 1 120px; }
+.tier-5 .seg-thread { flex: 1 1 90px;  }
+
+/* Segment = clickable button inside the capsule */
+.segment {
+  height: var(--segment-h);
+  padding: 0 var(--segment-pad-h);
+  background: transparent;
+  border: none;
+  border-radius: 9px;
+  color: var(--fg-primary);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: var(--segment-gap);
+  min-width: 0;
+  overflow: hidden;
+  font: inherit;
+  transition: background 120ms;
+}
+.segment:hover,
+.segment[aria-expanded="true"] { background: var(--seg-hover-bg); }
+.segment:disabled { cursor: default; opacity: 0.6; }
+
+.segment .seg-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.segment .disclosure {
+  flex-shrink: 0;
+  font-size: 9px;
+  color: var(--fg-secondary);
+  opacity: 0;
+  transition: opacity 120ms;
+}
+.segment:hover .disclosure,
+.segment[aria-expanded="true"] .disclosure { opacity: 1; }
+
+.seg-thread .seg-label { font-weight: 600; }
+.seg-prompt .seg-label { color: var(--fg-secondary); font-weight: 400; }
+
+/* Chevron divider between thread and prompt segments */
+.chevron-divider {
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--fg-tertiary);
+  padding: 0 1px;
+  transition: opacity 120ms;
+}
+/* Dim the divider while the thread segment is highlighted
+   (matches opacity 0.25 from Swift). */
+.breadcrumb:has(.seg-thread:hover) .chevron-divider,
+.breadcrumb:has(.seg-thread[aria-expanded="true"]) .chevron-divider {
+  opacity: 0.25;
+}
+
+/* Tier 4 collapsed prompt stub (the "…" button) */
+.seg-prompt-stub {
+  height: var(--segment-h);
+  padding: 0 var(--segment-pad-h);
+  background: transparent;
+  border: none;
+  border-radius: 9px;
+  color: var(--fg-secondary);
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+.seg-prompt-stub:hover,
+.seg-prompt-stub[aria-expanded="true"] { background: var(--seg-hover-bg); }
+
+/* ==========================================================================
+   Prompt counter — embedded inside the breadcrumb capsule, sitting
+   flush to the right of the prompt segment. Not a separate toolbar
+   item anymore: it only exists when there is a prompt context to
+   count (tiers 1–4). Tier 5 is thread-only so the counter is absent
+   by construction, which is also exactly when it stops making sense.
+
+   Separator dot before the counter (reusing the dim-when-hovered
+   chevron-divider family) visually detaches the count from the
+   prompt label without introducing new chrome.
+   ========================================================================== */
+.tier-counter {
+  flex-shrink: 0;
+  /* Tight padding — the breadcrumb capsule already provides 4pt of
+     inner padding on the right edge, so a 2pt left gap from the
+     prompt segment and a 2pt right gap inside the counter is
+     enough breathing room. Previous 6pt right gap made the counter
+     float noticeably inside the capsule. */
+  padding: 0 2px 0 2px;
+  font-size: 11px;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  color: var(--fg-tertiary);
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+/* Dim the counter + its separator while the prompt segment is
+   active (hover or popover open), so the prompt chrome pops and
+   the count recedes — same idea as `.chevron-divider` dimming
+   behind the thread segment. */
+.breadcrumb:has(.seg-prompt:hover) .tier-counter,
+.breadcrumb:has(.seg-prompt[aria-expanded="true"]) .tier-counter,
+.breadcrumb:has(.seg-prompt-stub:hover) .tier-counter,
+.breadcrumb:has(.seg-prompt-stub[aria-expanded="true"]) .tier-counter {
+  opacity: 0.4;
+}
+
+/* ==========================================================================
+   Share button (default toolbar button chrome)
+   ========================================================================== */
+.btn-share {
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: var(--fg-primary);
+  cursor: pointer;
+  padding: 0;
+  transition: background 120ms;
+  flex-shrink: 0;
+}
+.btn-share:hover { background: var(--seg-hover-bg); }
+.btn-share:disabled { opacity: 0.4; cursor: default; }
+.btn-share svg { width: 16px; height: 16px; }
+
+/* ==========================================================================
+   Mode picker (NSSegmentedControl) — .user priority → never overflows
+   ========================================================================== */
+.mode-picker {
+  display: inline-flex;
+  height: 26px;
+  background: var(--chip-mat);
+  border: 0.5px solid var(--chip-border);
+  border-radius: 6px;
+  padding: 2px;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.mode-seg {
+  width: 28px;
+  height: 22px;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: var(--fg-secondary);
+  transition: background 100ms, color 100ms;
+  padding: 0;
+}
+.mode-seg:hover { color: var(--fg-primary); }
+.mode-seg[aria-selected="true"] {
+  background: rgba(255,255,255,0.14);
+  color: var(--fg-primary);
+}
+@media (prefers-color-scheme: light) {
+  .mode-seg[aria-selected="true"] {
+    background: rgba(0,0,0,0.08);
+    color: var(--fg-primary);
+  }
+}
+.mode-seg svg { width: 14px; height: 14px; }
+
+/* ==========================================================================
+   OVERFLOW simulation — the mock used to drop the standalone
+   `.prompt-counter` at narrow widths (mirroring .standard priority
+   in AppKit). Now the counter lives inside the breadcrumb capsule
+   and piggybacks on the tier-descent mechanism: it is rendered only
+   in tiers 1–4 and vanishes naturally in tier 5 (thread-only).
+   That removes an entire class of independent overflow bookkeeping.
+   ========================================================================== */
+
+/* When the window is so narrow that even the principal would be crushed,
+   AppKit sends the whole principal to overflow. We never let the mode-
+   picker get sacrificed — the CSS order keeps it last-dropped anyway,
+   but under 360 we visually drop the sort chip label to icon-only. */
+@media (max-width: 520px) {
+  .sort-chip .label { display: none; }
+}
+
+/* ==========================================================================
+   Three-pane content below the toolbar.
+
+   Middle-pane content varies by MiddlePaneMode:
+
+     .table     — Full-width sortable table; reader hidden.
+     .default   — Same table (just narrower); reader visible to the right.
+     .viewer    — Active conversation card pinned at the top, flat
+                  prompt list underneath. Sidebar force-hidden.
+     .focus     — Middle pane collapsed; reader fills content area.
+                  Sidebar force-hidden.
+
+   Table vs. default therefore share the same middle-pane contents —
+   only the adjacent reader column differs. This matches the Swift
+   `MiddlePaneMode` cascade.
+   ========================================================================== */
+.three-pane {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.three-pane .sidebar {
+  width: 260px;
+  background: var(--sidebar-bg);
+  border-right: 1px solid var(--border);
+  padding: 10px 8px;
+  color: var(--fg-secondary);
+  font-size: 12px;
+  overflow-y: auto;
+}
+
+/* =======================================================================
+   Sidebar sections & items.
+   Each section is a labelled group of rows. Rows are uniform: glyph
+   (folder / triage / subtle dot) + label + optional count badge. Only
+   rows carrying `.sb-project` are interactive — clicking one toggles
+   `body[data-project="<id>"]` and highlights the row.
+   ======================================================================= */
+.sidebar .sb-section {
+  margin: 0 0 14px 0;
+}
+.sidebar .sb-section:last-child {
+  margin-bottom: 4px;
+}
+.sidebar .sb-header {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--fg-tertiary);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 0 6px;
+  margin: 0 0 4px 0;
+  /* Japanese doesn't carry the same "small-caps header" convention
+     as English, but since these labels are English (LIBRARY /
+     PROJECTS / TRIAGE / SOURCES) the Finder-style all-caps header
+     reads natively in both locales. */
+}
+.sidebar .sb-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  user-select: none;
+  color: var(--fg-secondary);
+  font-size: 12px;
+  line-height: 1.25;
+}
+.sidebar .sb-project:hover {
+  background: var(--seg-hover-bg);
+  color: var(--fg-primary);
+}
+.sidebar .sb-item.is-selected {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  color: var(--fg-primary);
+}
+.sidebar .sb-item.is-selected .sb-count {
+  color: var(--fg-primary);
+  opacity: 0.72;
+}
+.sidebar .sb-glyph {
+  flex-shrink: 0;
+  width: 18px;
+  text-align: center;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--fg-tertiary);
+}
+.sidebar .sb-item.is-selected .sb-glyph { color: var(--fg-primary); }
+.sidebar .sb-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sidebar .sb-count {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--fg-tertiary);
+  font-variant-numeric: tabular-nums;
+  padding-left: 4px;
+}
+/* Subtle items = read-only overview rows (archive.db, source counts).
+   They share the row layout but don't hover or select. */
+.sidebar .sb-item-subtle {
+  color: var(--fg-tertiary);
+  cursor: default;
+}
+.sidebar .sb-item-subtle:hover {
+  background: transparent;
+  color: var(--fg-tertiary);
+}
+/* Triage rows (Inbox / Orphans) share the project row type but carry
+   a different glyph family and slightly subdued label weight. */
+.sidebar .sb-item-triage .sb-glyph { color: var(--fg-secondary); }
+.three-pane .middle {
+  width: 420px;
+  background: var(--middle-bg);
+  border-right: 1px solid var(--border);
+  color: var(--fg-secondary);
+  font-size: 12px;
+  overflow-y: auto;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+}
+.three-pane .reader {
+  flex: 1 1 auto;
+  background: var(--reader-bg);
+  padding: 16px;
+  color: var(--fg-secondary);
+  font-size: 12px;
+  overflow-y: auto;
+}
+
+/* Sidebar width responsive tiers — apply whenever the sidebar is open.
+   The sidebar is user-controllable in ALL four modes (the toggle button
+   stays live everywhere), so these widths are mode-agnostic. */
+@media (max-width: 900px) { .three-pane .sidebar { width: 200px; } }
+@media (max-width: 700px) { .three-pane .sidebar { width: 160px; } }
+
+/* --- Mode: .table — middle fills the content area, reader hides --- */
+body[data-mode="table"] .three-pane .middle {
+  flex: 1 1 auto;
+  width: auto;
+  border-right: none;
+}
+body[data-mode="table"] .three-pane .reader { display: none; }
+
+/* --- Mode: .default — middle shows the same table, narrower --- */
+/* (no overrides needed; default widths from above apply) */
+
+/* --- Mode: .viewer — middle = card + prompt list, reader visible ---
+   Sidebar is NOT force-hidden; the user may keep it open or closed via
+   the toggle button, same as in table / default modes. */
+
+/* --- Mode: .focus — middle collapsed, reader fills ---
+   Sidebar is NOT force-hidden here either. Collapsing the middle pane
+   is the mode's defining behavior; whether the sidebar also disappears
+   is left to the user's toggle state. */
+body[data-mode="focus"] .three-pane .middle { display: none; }
+
+/* =======================================================================
+   Middle-pane content switcher.
+   Two content blocks live inside `.middle`; CSS picks which is visible
+   based on `body[data-mode]`. Everything hidden by default so a mode
+   that doesn't explicitly opt-in shows nothing (fail-loud).
+   ======================================================================= */
+.middle-table,
+.middle-viewer { display: none; }
+
+body[data-mode="table"]  .middle-table,
+body[data-mode="default"] .middle-table  { display: block; }
+body[data-mode="viewer"]  .middle-viewer { display: flex; flex-direction: column; }
+
+/* ---- Table content (table + default modes) ---------------------------- */
+.convo-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  color: var(--fg-primary);
+}
+.convo-table thead th {
+  position: sticky;
+  top: 0;
+  background: var(--middle-bg);
+  text-align: left;
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--fg-secondary);
+  padding: 8px 10px;
+  border-bottom: 0.5px solid var(--border);
+}
+.convo-table tbody td {
+  padding: 8px 10px;
+  border-bottom: 0.5px solid var(--border);
+  vertical-align: middle;
+}
+.convo-table tbody tr { cursor: pointer; }
+.convo-table tbody tr:hover { background: var(--seg-hover-bg); }
+.convo-table tbody tr.active { background: rgba(10, 132, 255, 0.12); }
+.convo-table .col-prompts { text-align: right; font-variant-numeric: tabular-nums; color: var(--fg-secondary); }
+.convo-table .col-source  { color: var(--fg-tertiary); font-size: 11px; }
+.convo-table .col-date    { color: var(--fg-tertiary); font-size: 11px; white-space: nowrap; }
+
+/* Project column. Sits right after Title in the column order so
+   "what this is" and "where this lives" read side-by-side — same
+   left-right logic the viewer-card uses. Cell content varies by
+   membership + suggestion state:
+     canonical_import    → 📁 <name>
+     manual_add          → 📁 <name> ✎
+     accepted_suggestion → 📁 <name> <score>
+     unassigned + pending suggestion → → <suggested-name> <score>
+     unassigned + no suggestion      → — (em-dash)
+   The whole column is hidden when the sidebar scopes to a concrete
+   project — redundant to show "📁 アルラウネ" on every row when the
+   sidebar already makes that scope explicit. */
+.convo-table .col-project {
+  color: var(--fg-secondary);
+  font-size: 11px;
+  max-width: 200px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.convo-table .col-project .proj-glyph {
+  color: var(--fg-tertiary);
+  margin-right: 4px;
+}
+.convo-table .col-project .proj-name {
+  color: var(--fg-primary);
+}
+.convo-table .col-project .proj-score {
+  color: var(--fg-tertiary);
+  font-variant-numeric: tabular-nums;
+  font-size: 10px;
+  margin-left: 6px;
+  letter-spacing: 0.02em;
+}
+/* Tiny glyph marking user-added manual membership. Sits after the
+   name so assigned rows share a consistent "glyph name [decoration]"
+   shape regardless of how they got there. */
+.convo-table .col-project .proj-mark {
+  color: var(--fg-tertiary);
+  font-size: 10px;
+  margin-left: 4px;
+}
+/* Unassigned cell — whole row reads in tertiary grey so Inbox /
+   Orphans entries recede compared to confirmed memberships. */
+.convo-table .col-project.unassigned {
+  color: var(--fg-tertiary);
+}
+.convo-table .col-project.unassigned .proj-suggest-arrow {
+  color: var(--fg-tertiary);
+  margin-right: 4px;
+}
+.convo-table .col-project.unassigned .proj-suggest-name {
+  color: var(--fg-secondary);
+}
+
+/* Reason tooltip on `.proj-score[data-reason]` hover.
+   The viewer-card prints reason terms inline under the project
+   badge, but in the table the Project column is height-constrained
+   (one row each) so there's no room for a permanent reason strip.
+   Surface the evidence terms via a hover tooltip on the score.
+
+   Implementation journey:
+   1. `::after` popup — clipped by `.three-pane .middle`'s
+      `overflow-y: auto` scroll container. Rendered but chopped.
+   2. Native `title` attribute — worked, but ~1.5s OS-level delay
+      is too slow for a mock demo. User couldn't tell it was there.
+   3. ✅ Single floating div positioned with `position: fixed` via
+      JS — instant, styled, escapes every ancestor. See the
+      `.proj-tooltip` block below + the JS handler near the bottom
+      of the script. `data-reason` remains the semantic source of
+      truth; the tooltip reads from it on mouseenter. `title` is
+      kept in sync as a fallback for keyboard focus / long-press
+      users who don't trigger `mouseenter`.
+
+   The dotted underline is kept as the visual hint that the score
+   is hoverable. `cursor: help` doubles the hint on pointer approach. */
+.convo-table .col-project .proj-score[data-reason] {
+  cursor: help;
+  border-bottom: 0.5px dotted var(--fg-tertiary);
+}
+
+/* The single floating tooltip element. Lives at the body level
+   (outside every scroll container), positioned with top/left set
+   inline by the JS handler on hover. Starts invisible; the handler
+   adds `.is-visible` to fade in. One shared element serves all
+   score hotspots — cheaper than a tooltip per cell, and matches
+   how native platforms handle tooltips (one overlay layer). */
+.proj-tooltip {
+  position: fixed;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+  padding: 4px 8px;
+  background: var(--chip-mat);
+  border: 0.5px solid var(--chip-border);
+  border-radius: 6px;
+  color: var(--fg-primary);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+  font-size: 11px;
+  letter-spacing: 0;
+  font-variant-numeric: normal;
+  white-space: nowrap;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+  backdrop-filter: blur(12px);
+  opacity: 0;
+  transform: translateY(2px);
+  transition: opacity 0.1s ease, transform 0.1s ease;
+  z-index: 500;
+}
+.proj-tooltip.is-visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* Accept / dismiss action buttons — shared style used by both
+   the table's Project cell (Inbox rows) and the viewer-card's
+   right column (pending_suggestion state). A single class family
+   so the two surfaces agree on pill size, hover colors, and
+   borders. Visibility is gated PER SURFACE by its own rule:
+     · table  → visible only under `body[data-project="__inbox"]`
+     · card   → visible only under `data-membership="pending_suggestion"`
+   Keeping them visually identical communicates "same action" even
+   though each surface decides when to offer it. */
+.proj-action {
+  border: 0.5px solid var(--chip-border);
+  background: var(--chip-mat);
+  padding: 0;
+  width: 20px;
+  height: 18px;
+  border-radius: 4px;
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  color: var(--fg-secondary);
+  font-family: inherit;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.proj-action-accept:hover {
+  background: color-mix(in srgb, var(--accent) 30%, var(--chip-mat));
+  color: var(--fg-primary);
+  border-color: color-mix(in srgb, var(--accent) 50%, var(--chip-border));
+}
+.proj-action-dismiss:hover {
+  background: rgba(255, 90, 90, 0.18);
+  color: rgba(255, 160, 160, 0.95);
+  border-color: rgba(255, 90, 90, 0.35);
+}
+/* Table-surface visibility. Actions hide by default; the Inbox
+   filter reveals them so the column reads as a quiet annotation
+   in every other scope. */
+.convo-table .col-project .proj-actions {
+  display: none;
+  margin-left: 6px;
+  gap: 3px;
+}
+body[data-project="__inbox"] .convo-table .col-project .proj-actions {
+  display: inline-flex;
+  align-items: center;
+}
+/* Widen the column in Inbox mode so the two action buttons fit
+   alongside the suggestion text without eating the arrow / name. */
+body[data-project="__inbox"] .convo-table .col-project {
+  max-width: 340px;
+}
+
+/* In default mode the middle is narrower — drop less critical columns.
+   Project column stays visible because it's the primary scan anchor
+   for "did this thread end up where it should?" — the whole reason
+   default mode exists. */
+body[data-mode="default"] .convo-table .col-source,
+body[data-mode="default"] .convo-table .col-date { display: none; }
+
+/* Hide the Project column when a concrete project is scoped in the
+   sidebar. The meta-filters (`__all` / `__inbox` / `__orphans`) keep
+   the column visible because each of them shows a mix of projects
+   (or, in Orphans' case, emphasizes the absence of one).
+   Selector uses `^="__"` to match "sidebar virtual project" ids. */
+body[data-project]:not([data-project^="__"]) .convo-table .col-project {
+  display: none;
+}
+
+/* =======================================================================
+   Project scope filter.
+   Driven by `body[data-project="<id>"]` set by the sidebar click
+   handler. Absence of the attribute = "All" = no filtering.
+
+   Special ids:
+     __all       — synthesized "show everything" pseudo-project (the
+                   LIBRARY row). Behaves like absence of the attribute
+                   but keeps a selected highlight on the All row.
+     __inbox     — show only threads that have `data-has-suggestion`.
+                   These are unassigned threads with ≥1 pending
+                   ProjectSuggestion above the 0.4 score threshold.
+     __orphans   — show only unassigned threads WITHOUT a pending
+                   suggestion (all dismissed or scored below 0.4).
+
+   Concrete project ids (alraune / yuri / madini / reading) filter
+   to rows whose `data-project-id` matches.
+   ======================================================================= */
+body[data-project]:not([data-project="__all"]) .convo-table tbody tr {
+  display: none;
+}
+body[data-project="alraune"] .convo-table tbody tr[data-project-id="alraune"],
+body[data-project="yuri"]    .convo-table tbody tr[data-project-id="yuri"],
+body[data-project="madini"]  .convo-table tbody tr[data-project-id="madini"],
+body[data-project="reading"] .convo-table tbody tr[data-project-id="reading"] {
+  display: table-row;
+}
+/* Inbox = unassigned AND has a pending suggestion. */
+body[data-project="__inbox"] .convo-table tbody tr[data-project-id="__none"][data-has-suggestion="true"] {
+  display: table-row;
+}
+/* Orphans = unassigned AND no pending suggestion. */
+body[data-project="__orphans"] .convo-table tbody tr[data-project-id="__none"]:not([data-has-suggestion="true"]) {
+  display: table-row;
+}
+
+/* ---- Viewer content (card + prompt list) ------------------------------
+   Card layout is a two-column grid, each column stacking two rows:
+
+     ┌─ vc-col-left ──────────┬─ vc-col-right ────────────────┐
+     │ title (large, ellipsis) │ project badge (right-aligned) │
+     │ source · prompts · date │ suggestion reason (inherited) │
+     └────────────────────────┴───────────────────────────────┘
+
+   The left column holds everything about the thread itself (what it
+   is, when it was written, how big it is). The right column holds
+   everything about the thread's project assignment (which project,
+   how the assignment happened, why). The split maps each half-card
+   to one conceptual question — "what is this?" vs. "where does
+   this live?" — and the second row of each column is the
+   supporting detail for the first.
+
+   Left column flexes (title ellipsizes under pressure); right column
+   is rigid (project badge has its own internal ellipsis cap). */
+.viewer-card {
+  flex-shrink: 0;
+  padding: 14px 14px 12px;
+  margin: 10px 10px 6px;
+  background: var(--chip-mat);
+  border: 0.5px solid var(--chip-border);
+  border-radius: 10px;
+  color: var(--fg-primary);
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 16px;
+}
+.viewer-card .vc-col {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;    /* allow children to ellipsize */
+}
+.viewer-card .vc-col-left {
+  flex: 1 1 auto;
+}
+.viewer-card .vc-col-right {
+  /* Caps at ~half the card. Natural width follows the project
+     badge's content, but when the name is long enough to exceed
+     the cap, the badge wraps internally (inline flow inside
+     `.vc-project`) rather than pushing into the left column's
+     title space. Left column keeps enough room for the title to
+     read without being crushed. */
+  flex: 0 1 auto;
+  max-width: 55%;
+  align-items: flex-end;
+  text-align: right;
+}
+.viewer-card .vc-title {
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.35;
+  color: var(--fg-primary);
+  /* Titles wrap freely across multiple lines rather than ellipsizing.
+     Rationale: the viewer-card is unique (only one card is shown at a
+     time — the active thread), so vertical growth is acceptable and a
+     full title read is more useful than a truncated one. The left
+     column inherits `min-width: 0` from `.vc-col`, so the wrap
+     threshold follows whatever horizontal space the right column
+     leaves available. */
+}
+.viewer-card .vc-meta {
+  font-size: 11px;
+  color: var(--fg-secondary);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+}
+.viewer-card .vc-meta .dot {
+  color: var(--fg-tertiary);
+  margin: 0 5px;
+}
+/* Speech-bubble glyph annotating the prompt count ("💬 42"). Taking
+   the space of "42 prompts" and collapsing it into "💬 42" shaves
+   ~50px off the meta line, which frees the left column to host
+   longer model names + dates without pushing against the right
+   column. When this moves to SwiftUI use `Image(systemName:
+   "bubble.left")` with `.foregroundStyle(.secondary)`. */
+.viewer-card .vc-meta .prompts-glyph {
+  color: var(--fg-tertiary);
+  margin-right: 3px;
+  font-size: 10px;   /* nudge emoji down a hair so it sits on the meta baseline */
+}
+/* Project badge — occupies the right side of `.vc-meta-row`.
+   Replaces the old tag chip row. Layout is a single inline cluster:
+     📁  <project-name>  ·  <membership>  <score>
+   Visibility of `.vc-score` and `.vc-reason` is driven by the
+   `data-membership` attribute on `.viewer-card` (see below).
+
+   Membership label vocabulary (English to match the other internal
+   taxonomy labels like LIBRARY / PROJECTS / TRIAGE in the sidebar):
+     canonical_import    → "imported"   (folder came from external LLM)
+     manual_add          → "manual"     (user picked directly in Madini)
+     accepted_suggestion → "suggested"  (user accepted a TF-IDF match)
+   Only the suggested case carries a score + reason; the other two
+   are deterministic (no score to display). */
+/* Project badge — laid out as inline-flow text (NOT flex) so long
+   project names wrap within the right column alongside the rest
+   of the badge (membership label, score). Rationale: the user
+   wants the card to grow vertically when needed; with inline
+   flow, `📁 ファンタジー百合小説 · suggested 0.81` breaks at word
+   boundaries like natural prose rather than ellipsizing or
+   forcing a rigid single-line width. */
+.viewer-card .vc-project {
+  font-size: 11px;
+  color: var(--fg-secondary);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.35;
+  /* `text-align: right` is inherited from `.vc-col-right`, so
+     wrapped lines still flush to the right edge. */
+}
+/* Glyph is CSS-driven off `data-membership` so a single empty HTML
+   span serves all five membership states (the three assigned ones
+   plus pending_suggestion and unassigned). Keeps parity with the
+   `.vc-membership::after` pattern — one span, state-driven content. */
+.viewer-card .vc-project-glyph {
+  color: var(--fg-tertiary);
+  margin-right: 4px;
+}
+.viewer-card[data-membership="canonical_import"]    .vc-project-glyph::before { content: "📁"; }
+.viewer-card[data-membership="manual_add"]          .vc-project-glyph::before { content: "📁"; }
+.viewer-card[data-membership="accepted_suggestion"] .vc-project-glyph::before { content: "📁"; }
+/* pending_suggestion uses the arrow glyph the table's Inbox rows use
+   ("→ <candidate name>") so the two surfaces read as the same
+   "proposed match, awaiting user decision" visual grammar. */
+.viewer-card[data-membership="pending_suggestion"]  .vc-project-glyph::before { content: "→"; }
+/* unassigned skips the glyph entirely — nothing to point at, the
+   membership label alone carries the state. `display: none` on the
+   whole span (rather than just `::before { content: none }`) so the
+   4px right margin collapses too, leaving a tidy lone label. */
+.viewer-card[data-membership="unassigned"] .vc-project-glyph {
+  display: none;
+}
+
+.viewer-card .vc-project-name {
+  color: var(--fg-primary);
+  font-weight: 500;
+  /* No width cap and no nowrap — long names flow into additional
+     lines. The column's right alignment keeps them pinned to the
+     card's right edge. */
+}
+/* Unassigned cells have no project name to display. */
+.viewer-card[data-membership="unassigned"] .vc-project-name {
+  display: none;
+}
+/* Dot separator before the membership label. Single span; label
+   text is driven by CSS `content` off the `data-membership`
+   attribute so one HTML element serves all five states. */
+.viewer-card .vc-membership::before {
+  content: "·";
+  color: var(--fg-tertiary);
+  margin: 0 4px;
+}
+.viewer-card .vc-membership {
+  color: var(--fg-secondary);
+}
+.viewer-card[data-membership="canonical_import"]    .vc-membership::after { content: "imported"; }
+.viewer-card[data-membership="manual_add"]          .vc-membership::after { content: "manual"; }
+.viewer-card[data-membership="accepted_suggestion"] .vc-membership::after { content: "suggested"; }
+.viewer-card[data-membership="pending_suggestion"]  .vc-membership::after { content: "pending"; }
+.viewer-card[data-membership="unassigned"]          .vc-membership::after { content: "unassigned"; }
+/* Unassigned has no leading name, so the "·" separator before the
+   membership label reads as a stray dot. Drop it in that state only. */
+.viewer-card[data-membership="unassigned"] .vc-membership::before {
+  content: none;
+}
+.viewer-card .vc-score {
+  font-size: 10px;
+  color: var(--fg-tertiary);
+  letter-spacing: 0.02em;
+  margin-left: 4px;
+}
+/* Second row of the right column, hanging directly under the
+   project badge. Inherits `text-align: right` from `.vc-col-right`
+   so the reason terms align with the badge's right edge — visually
+   "this is the evidence for what's above me". Only rendered for
+   accepted_suggestion; the other two membership types hide this
+   row (and the score) via the rules below. */
+.viewer-card .vc-reason {
+  font-size: 11px;
+  color: var(--fg-tertiary);
+  line-height: 1.3;
+  letter-spacing: 0.01em;
+}
+/* Hide score + reason for deterministic memberships and for the
+   unassigned state. A single `display: none` on the nodes keeps the
+   rest of the meta-row layout untouched — the project badge just
+   loses its trailing number and the reason row collapses to zero
+   height. `accepted_suggestion` and `pending_suggestion` retain
+   both (score = TF-IDF match strength, reason = evidence terms). */
+.viewer-card[data-membership="canonical_import"] .vc-score,
+.viewer-card[data-membership="canonical_import"] .vc-reason,
+.viewer-card[data-membership="manual_add"]       .vc-score,
+.viewer-card[data-membership="manual_add"]       .vc-reason,
+.viewer-card[data-membership="unassigned"]       .vc-score,
+.viewer-card[data-membership="unassigned"]       .vc-reason {
+  display: none;
+}
+
+/* Accept / dismiss buttons — viewer-card surface. Same `.proj-action`
+   class family as the table's Inbox row so the two surfaces look
+   identical. Visibility is gated on `pending_suggestion`; any other
+   membership (including the `accepted_suggestion` that results from
+   clicking ✓, and the `unassigned` that results from clicking ×)
+   hides the buttons, matching how the Inbox rows disappear from the
+   filter after the user makes a decision. */
+.viewer-card .vc-actions {
+  display: none;
+  gap: 4px;
+  margin-top: 4px;
+}
+.viewer-card[data-membership="pending_suggestion"] .vc-actions {
+  display: inline-flex;
+  align-items: center;
+}
+
+.viewer-prompts {
+  list-style: none;
+  margin: 0;
+  padding: 4px 0 8px;
+  flex: 1 1 auto;
+  overflow-y: auto;
+}
+.viewer-prompts li {
+  padding: 8px 14px;
+  border-left: 2px solid transparent;
+  font-size: 12px;
+  color: var(--fg-secondary);
+  cursor: pointer;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  line-height: 1.4;
+}
+.viewer-prompts li:hover { background: var(--seg-hover-bg); color: var(--fg-primary); }
+.viewer-prompts li.active {
+  background: rgba(10, 132, 255, 0.10);
+  border-left-color: var(--accent);
+  color: var(--fg-primary);
+}
+.viewer-prompts li .idx {
+  font-size: 10px;
+  color: var(--fg-tertiary);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+  width: 26px;
+  text-align: right;
+}
+.viewer-prompts li .snippet {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ==========================================================================
+   Debug panel — live telemetry so the tier transitions are verifiable.
+   ========================================================================== */
+.debug-panel {
+  position: fixed;
+  right: 12px;
+  bottom: 12px;
+  min-width: 280px;
+  max-width: 360px;
+  padding: 10px 12px;
+  background: rgba(20,20,20,0.92);
+  color: #eaeaea;
+  font-family: "SF Mono", Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.55;
+  border: 1px solid rgba(255,255,255,0.15);
+  border-radius: 8px;
+  box-shadow: 0 10px 40px rgba(0,0,0,0.4);
+  z-index: 200;
+  backdrop-filter: blur(12px);
+}
+.debug-panel h1 {
+  margin: 0 0 6px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #8cd6ff;
+  font-weight: 600;
+}
+.debug-panel .row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 1px 0;
+}
+.debug-panel .row .key { color: #9aa4b2; }
+.debug-panel .row .val { color: #fff; font-weight: 500; }
+.debug-panel .pill {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 10px;
+  background: rgba(140, 214, 255, 0.18);
+  color: #8cd6ff;
+  font-size: 10px;
+}
+.debug-panel .pill.dropped {
+  background: rgba(255, 120, 120, 0.18);
+  color: #ff8e8e;
+}
+.debug-panel .list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding-top: 2px;
+}
+.debug-panel .hint {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 0.5px solid rgba(255,255,255,0.1);
+  color: #888;
+  font-size: 10px;
+}
+/* Sim buttons — dev-time affordances for triggering external-world
+   events the mock would otherwise have no way to exercise (e.g.
+   "the user went back to ChatGPT and moved this thread into a
+   different project folder, then re-imported"). Each click produces
+   a deterministic state change + sidebar count update so the user
+   can eyeball the "external LLM latest wins" behavior. */
+.debug-panel .sim-section {
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 0.5px solid rgba(255,255,255,0.1);
+}
+.debug-panel .sim-section .sim-label {
+  color: #9aa4b2;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 4px;
+}
+.debug-panel .sim-btn {
+  display: block;
+  width: 100%;
+  margin-top: 4px;
+  padding: 5px 8px;
+  background: rgba(255,255,255,0.06);
+  border: 0.5px solid rgba(255,255,255,0.18);
+  border-radius: 5px;
+  color: #eaeaea;
+  font-family: inherit;
+  font-size: 10.5px;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.1s ease;
+}
+.debug-panel .sim-btn:hover {
+  background: rgba(140, 214, 255, 0.18);
+  border-color: rgba(140, 214, 255, 0.35);
+}
+.debug-panel .sim-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  background: rgba(255,255,255,0.04);
+}
+.debug-panel .sim-feedback {
+  margin-top: 4px;
+  color: #8cd6ff;
+  font-size: 10px;
+  min-height: 12px;
+}
+
+/* Force-tier override buttons (optional — lets reviewer pin a tier). */
+.force-tier {
+  position: fixed;
+  left: 12px;
+  bottom: 12px;
+  display: flex;
+  gap: 4px;
+  padding: 6px;
+  background: rgba(20,20,20,0.92);
+  border: 1px solid rgba(255,255,255,0.15);
+  border-radius: 8px;
+  font-family: "SF Mono", Menlo, monospace;
+  font-size: 10px;
+  z-index: 200;
+}
+.force-tier button {
+  background: transparent;
+  border: 0.5px solid rgba(255,255,255,0.2);
+  color: #ddd;
+  padding: 3px 7px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.force-tier button:hover { background: rgba(255,255,255,0.08); }
+.force-tier button.active { background: #0a84ff; color: white; border-color: #0a84ff; }
+
+/* Force-tier CSS overrides — applied by JS by toggling a class on body. */
+body.force-tier-1 .breadcrumb .tier { display: none !important; }
+body.force-tier-1 .breadcrumb .tier-1 { display: flex !important; }
+body.force-tier-2 .breadcrumb .tier { display: none !important; }
+body.force-tier-2 .breadcrumb .tier-2 { display: flex !important; }
+body.force-tier-3 .breadcrumb .tier { display: none !important; }
+body.force-tier-3 .breadcrumb .tier-3 { display: flex !important; }
+body.force-tier-4 .breadcrumb .tier { display: none !important; }
+body.force-tier-4 .breadcrumb .tier-4 { display: flex !important; }
+body.force-tier-5 .breadcrumb .tier { display: none !important; }
+body.force-tier-5 .breadcrumb .tier-5 { display: flex !important; }
+
+/* ==========================================================================
+   Popovers
+   ========================================================================== */
+.popover {
+  position: absolute;
+  top: calc(100% + 8px);
+  background: var(--toolbar-bg);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  padding: 4px;
+  box-shadow: 0 12px 40px rgba(0,0,0,0.4);
+  z-index: 100;
+  display: none;
+  max-height: 360px;
+  overflow-y: auto;
+}
+.segment[aria-expanded="true"] + .popover,
+.seg-prompt-stub[aria-expanded="true"] + .popover { display: block; }
+
+.popover.thread-pop { left: 0; width: 340px; }
+.popover.prompt-pop { left: 0; width: 300px; }
+
+.popover-row {
+  padding: 6px 10px;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--fg-primary);
+}
+.popover-row:hover { background: var(--seg-hover-bg); }
+.popover-row[aria-selected="true"] {
+  background: rgba(255,255,255,0.12);
+}
+@media (prefers-color-scheme: light) {
+  .popover-row[aria-selected="true"] { background: rgba(0,0,0,0.08); }
+}
+</style>
+</head>
+
+<body>
+  <!-- ==================================================================
+       Window toolbar
+       ================================================================== -->
+  <header class="toolbar" role="toolbar" aria-label="Window toolbar">
+    <!-- ============================================================
+         LEFT ZONE — sidebar-aligned (Safari-style).
+         Shares its width with the sidebar column below. Closing the
+         sidebar collapses this zone to just the toggle's width and
+         the divider disappears.
+         ============================================================ -->
+    <div class="toolbar-left" id="toolbar-left">
+      <button class="btn-system" id="sidebar-toggle"
+              aria-label="Toggle sidebar" title="Toggle sidebar"
+              aria-pressed="true">
+        <!-- sidebar.left -->
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.4">
+          <rect x="2" y="3" width="16" height="14" rx="2"/>
+          <line x1="8" y1="3" x2="8" y2="17"/>
+        </svg>
+      </button>
+    </div>
+
+    <!-- ============================================================
+         RIGHT ZONE — content-aligned. Spans the full width above the
+         middle + reader panes. All principal + trailing layout math
+         happens inside this container's width.
+         ============================================================ -->
+    <div class="toolbar-right" id="toolbar-right">
+      <div class="flex-spacer"></div>
+
+    <!-- Principal: sort chip + breadcrumb (HStack spacing 10) -->
+    <div class="principal" id="principal">
+      <!-- ========== Sort chip (compressible: true) ========== -->
+      <div style="position: relative;">
+        <button class="sort-chip" id="sort-chip" aria-haspopup="menu" aria-expanded="false">
+          <span class="glyph" id="sort-glyph">↓</span>
+          <span class="label" id="sort-label">Newest</span>
+        </button>
+        <div class="sort-menu" id="sort-menu" role="menu">
+          <div class="sort-menu-item" data-key="dateDesc"       role="menuitem"><span class="check">✓</span>Newest first</div>
+          <div class="sort-menu-item" data-key="dateAsc"        role="menuitem"><span class="check"></span>Oldest first</div>
+          <hr>
+          <div class="sort-menu-item" data-key="promptCountDesc" role="menuitem"><span class="check"></span>Most prompts</div>
+          <div class="sort-menu-item" data-key="promptCountAsc"  role="menuitem"><span class="check"></span>Fewest prompts</div>
+        </div>
+      </div>
+
+      <!-- ========== Breadcrumb capsule (5-tier ViewThatFits) ========== -->
+      <div class="breadcrumb" id="breadcrumb">
+
+        <!-- TIER 1 — Full (thread 260, prompt 280, chevron, counter) -->
+        <div class="tier tier-1">
+          <div style="position: relative;" class="seg-thread-wrap">
+            <button class="segment seg-thread" aria-haspopup="listbox" aria-expanded="false">
+              <span class="seg-label">自作小説アルラウネの執筆支援</span>
+              <span class="disclosure">˅</span>
+            </button>
+            <div class="popover thread-pop" role="listbox"></div>
+          </div>
+          <span class="chevron-divider">›</span>
+          <div style="position: relative;" class="seg-prompt-wrap">
+            <button class="segment seg-prompt" aria-haspopup="listbox" aria-expanded="false">
+              <span class="seg-label">自作小説アルラウネを執筆支援</span>
+              <span class="disclosure">˅</span>
+            </button>
+            <div class="popover prompt-pop" role="listbox"></div>
+          </div>
+          <span class="tier-counter">1 / 42</span>
+        </div>
+
+        <!-- TIER 2 — Medium (180, 160, chevron, counter) -->
+        <div class="tier tier-2">
+          <div style="position: relative;" class="seg-thread-wrap">
+            <button class="segment seg-thread" aria-haspopup="listbox" aria-expanded="false">
+              <span class="seg-label">自作小説アルラウネの執筆支援</span>
+              <span class="disclosure">˅</span>
+            </button>
+            <div class="popover thread-pop" role="listbox"></div>
+          </div>
+          <span class="chevron-divider">›</span>
+          <div style="position: relative;" class="seg-prompt-wrap">
+            <button class="segment seg-prompt" aria-haspopup="listbox" aria-expanded="false">
+              <span class="seg-label">自作小説アルラウネを執筆支援</span>
+              <span class="disclosure">˅</span>
+            </button>
+            <div class="popover prompt-pop" role="listbox"></div>
+          </div>
+          <span class="tier-counter">1 / 42</span>
+        </div>
+
+        <!-- TIER 3 — Compact (120, 70, chevron, counter) -->
+        <div class="tier tier-3">
+          <div style="position: relative;" class="seg-thread-wrap">
+            <button class="segment seg-thread" aria-haspopup="listbox" aria-expanded="false">
+              <span class="seg-label">自作小説アルラウネの執筆支援</span>
+              <span class="disclosure">˅</span>
+            </button>
+            <div class="popover thread-pop" role="listbox"></div>
+          </div>
+          <span class="chevron-divider">›</span>
+          <div style="position: relative;" class="seg-prompt-wrap">
+            <button class="segment seg-prompt" aria-haspopup="listbox" aria-expanded="false">
+              <span class="seg-label">自作小説アルラウネを執筆支援</span>
+              <span class="disclosure">˅</span>
+            </button>
+            <div class="popover prompt-pop" role="listbox"></div>
+          </div>
+          <span class="tier-counter">1 / 42</span>
+        </div>
+
+        <!-- TIER 4 — Prompt-ellipsis (120, …, chevron, counter) -->
+        <div class="tier tier-4">
+          <div style="position: relative;" class="seg-thread-wrap">
+            <button class="segment seg-thread" aria-haspopup="listbox" aria-expanded="false">
+              <span class="seg-label">自作小説アルラウネの執筆支援</span>
+              <span class="disclosure">˅</span>
+            </button>
+            <div class="popover thread-pop" role="listbox"></div>
+          </div>
+          <span class="chevron-divider">›</span>
+          <div style="position: relative;">
+            <button class="seg-prompt-stub" aria-haspopup="listbox" aria-expanded="false"
+                    title="プロンプトを切り替え">…</button>
+            <div class="popover prompt-pop" role="listbox"></div>
+          </div>
+          <span class="tier-counter">1 / 42</span>
+        </div>
+
+        <!-- TIER 5 — Thread-only (90, no prompt, no chevron) -->
+        <div class="tier tier-5">
+          <div style="position: relative;" class="seg-thread-wrap" style="flex-basis: 90px;">
+            <button class="segment seg-thread" aria-haspopup="listbox" aria-expanded="false">
+              <span class="seg-label">自作小説アルラウネの執筆支援</span>
+              <span class="disclosure">˅</span>
+            </button>
+            <div class="popover thread-pop" role="listbox"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="flex-spacer"></div>
+
+    <!-- Trailing: share + mode picker.
+         (The prompt counter used to live here; it now sits inside
+         the breadcrumb capsule, right of the prompt segment.) -->
+    <div class="trailing">
+      <button class="btn-share" title="Share conversation">
+        <!-- square.and.arrow.up -->
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.4"
+             stroke-linecap="round" stroke-linejoin="round">
+          <path d="M10 3v10"/>
+          <path d="M6.5 6.5L10 3l3.5 3.5"/>
+          <path d="M5 10v6a1 1 0 001 1h8a1 1 0 001-1v-6"/>
+        </svg>
+      </button>
+
+      <!-- Mode picker: 4-segment NSSegmentedControl -->
+      <div class="mode-picker" role="tablist" aria-label="View mode">
+        <button class="mode-seg" role="tab" data-mode="table" aria-selected="false" title="テーブル">
+          <!-- tablecells -->
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2">
+            <rect x="2" y="3" width="12" height="10" rx="1"/>
+            <line x1="2" y1="8"  x2="14" y2="8"/>
+            <line x1="8" y1="3"  x2="8"  y2="13"/>
+          </svg>
+        </button>
+        <button class="mode-seg" role="tab" data-mode="default" aria-selected="true" title="デフォルト">
+          <!-- rectangle.split.3x1 -->
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2">
+            <rect x="2" y="4" width="12" height="8" rx="1"/>
+            <line x1="6"  y1="4" x2="6"  y2="12"/>
+            <line x1="10" y1="4" x2="10" y2="12"/>
+          </svg>
+        </button>
+        <button class="mode-seg" role="tab" data-mode="viewer" aria-selected="false" title="ビューアー">
+          <!-- book.pages -->
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2">
+            <path d="M2 4c2-1 4-1 6 0v8c-2-1-4-1-6 0z"/>
+            <path d="M14 4c-2-1-4-1-6 0v8c2-1 4-1 6 0z"/>
+          </svg>
+        </button>
+        <button class="mode-seg" role="tab" data-mode="focus" aria-selected="false" title="フォーカス">
+          <!-- doc.plaintext -->
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2">
+            <path d="M4 2h6l3 3v9H4z"/>
+            <line x1="6" y1="7"  x2="11" y2="7"/>
+            <line x1="6" y1="9.5" x2="11" y2="9.5"/>
+            <line x1="6" y1="12" x2="10" y2="12"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+    </div><!-- /.toolbar-right -->
+  </header>
+
+  <!-- ==================================================================
+       Three-pane body (placeholder — just for context)
+       ================================================================== -->
+  <main class="three-pane">
+    <!-- Sidebar (LEFT pane).
+         Per the new tag-system spec: projects are the primary
+         navigation unit. They come from external LLM export folders
+         (canonical_import) or user-created (user_created). Selecting
+         a project scopes the middle-pane table to that project's
+         threads. Triage (Inbox / Orphans) are meta-filters —
+         Inbox  = unassigned threads that have pending ProjectSuggestions
+         Orphans = unassigned threads with no viable suggestions.
+         Sources remain as a debug/overview bucket but are NOT a
+         primary navigation unit anymore. -->
+    <aside class="sidebar">
+      <!-- LIBRARY ————————————————————————————————— -->
+      <div class="sb-section">
+        <div class="sb-header">LIBRARY</div>
+        <div class="sb-item sb-project" data-project-id="__all">
+          <span class="sb-glyph">◉</span>
+          <span class="sb-label">All threads</span>
+          <span class="sb-count">629</span>
+        </div>
+        <div class="sb-item sb-item-subtle">
+          <span class="sb-glyph"></span>
+          <span class="sb-label">archive.db</span>
+        </div>
+      </div>
+
+      <!-- PROJECTS ——————————————————————————————————
+           Folder-icon rows. Click = scope the middle pane to this
+           project. Click again = deselect (back to All). Thread
+           counts are illustrative; in the real app they'd be
+           `COUNT(*)` over ProjectMembership joined to active
+           threads. -->
+      <div class="sb-section">
+        <div class="sb-header">PROJECTS</div>
+        <div class="sb-item sb-project" data-project-id="alraune">
+          <span class="sb-glyph">📁</span>
+          <span class="sb-label">アルラウネ執筆</span>
+          <span class="sb-count">42</span>
+        </div>
+        <div class="sb-item sb-project" data-project-id="yuri">
+          <span class="sb-glyph">📁</span>
+          <span class="sb-label">ファンタジー百合小説</span>
+          <span class="sb-count">31</span>
+        </div>
+        <div class="sb-item sb-project" data-project-id="madini">
+          <span class="sb-glyph">📁</span>
+          <span class="sb-label">Madini Archive</span>
+          <span class="sb-count">18</span>
+        </div>
+        <div class="sb-item sb-project" data-project-id="reading">
+          <span class="sb-glyph">📁</span>
+          <span class="sb-label">読書メモ</span>
+          <span class="sb-count">9</span>
+        </div>
+      </div>
+
+      <!-- TRIAGE ——————————————————————————————————
+           Meta-filters for threads not yet in any project.
+           Inbox  = has ≥1 pending ProjectSuggestion
+           Orphans = no pending suggestion (score below 0.4 for all
+                     projects, or all dismissed). -->
+      <div class="sb-section">
+        <div class="sb-header">TRIAGE</div>
+        <div class="sb-item sb-project sb-item-triage" data-project-id="__inbox">
+          <span class="sb-glyph">📥</span>
+          <span class="sb-label">Inbox</span>
+          <span class="sb-count">12</span>
+        </div>
+        <div class="sb-item sb-project sb-item-triage" data-project-id="__orphans">
+          <span class="sb-glyph">○</span>
+          <span class="sb-label">Orphans</span>
+          <span class="sb-count">517</span>
+        </div>
+      </div>
+
+      <!-- SOURCES ——————————————————————————————————
+           Kept as a reference pane but de-emphasized; in the new
+           model sources are not a navigation primitive, just a
+           sanity check on the underlying import mix. Not clickable. -->
+      <div class="sb-section">
+        <div class="sb-header">SOURCES</div>
+        <div class="sb-item sb-item-subtle">
+          <span class="sb-glyph">·</span>
+          <span class="sb-label">chatgpt</span>
+          <span class="sb-count">547</span>
+        </div>
+        <div class="sb-item sb-item-subtle">
+          <span class="sb-glyph">·</span>
+          <span class="sb-label">gemini</span>
+          <span class="sb-count">55</span>
+        </div>
+        <div class="sb-item sb-item-subtle">
+          <span class="sb-glyph">·</span>
+          <span class="sb-label">claude</span>
+          <span class="sb-count">27</span>
+        </div>
+      </div>
+    </aside>
+    <section class="middle">
+
+      <!-- TABLE content — rendered in .table and .default modes.
+           Column order: Title | Project | Updated | Prompts | Source.
+           Default mode hides Updated + Source (less critical at the
+           narrower 420pt middle width); the Project column survives
+           because tracking project assignments is the main thing the
+           user scans for in the default view. When a concrete project
+           is scoped from the sidebar, the Project column also hides
+           (redundant — every visible row shares that project). -->
+      <div class="middle-table">
+        <table class="convo-table">
+          <thead>
+            <tr>
+              <th class="col-title">Title</th>
+              <th class="col-project">Project</th>
+              <th class="col-date">Updated</th>
+              <th class="col-prompts">Prompts</th>
+              <th class="col-source">Source</th>
+            </tr>
+          </thead>
+          <tbody>
+            <!-- Each row carries:
+                 • data-project-id — the thread's current project
+                   (or `__none` for unassigned)
+                 • data-membership — HOW it got into the project
+                   (canonical_import | manual_add | accepted_suggestion),
+                   omitted for unassigned rows
+                 • data-has-suggestion — present on unassigned rows
+                   that have a pending ProjectSuggestion above the
+                   0.4 threshold (the Inbox filter scopes to these)
+                 Project-cell rendering follows from these three
+                 attributes; the mix of canonical / manual / accepted
+                 across the sample exists to exercise every visual
+                 variant in the demo. -->
+            <tr class="active" data-project-id="alraune" data-membership="canonical_import">
+              <td class="col-title">自作小説アルラウネの執筆支援</td>
+              <td class="col-project">
+                <span class="proj-glyph">📁</span><span class="proj-name">アルラウネ執筆</span>
+              </td>
+              <td class="col-date">Apr 18</td>
+              <td class="col-prompts">42</td>
+              <td class="col-source">chatgpt</td>
+            </tr>
+            <tr data-project-id="alraune" data-membership="canonical_import">
+              <td class="col-title">アルラウネ 設定まとめ</td>
+              <td class="col-project">
+                <span class="proj-glyph">📁</span><span class="proj-name">アルラウネ執筆</span>
+              </td>
+              <td class="col-date">Apr 12</td>
+              <td class="col-prompts">23</td>
+              <td class="col-source">chatgpt</td>
+            </tr>
+            <tr data-project-id="alraune" data-membership="accepted_suggestion">
+              <td class="col-title">続きの話を聞く</td>
+              <td class="col-project">
+                <span class="proj-glyph">📁</span><span class="proj-name">アルラウネ執筆</span><span class="proj-score" data-reason="真夜・錫花・アビエニア" title="真夜・錫花・アビエニア">0.73</span>
+              </td>
+              <td class="col-date">Apr 08</td>
+              <td class="col-prompts">15</td>
+              <td class="col-source">chatgpt</td>
+            </tr>
+            <tr data-project-id="__none" data-has-suggestion="true" data-suggested-project="madini">
+              <td class="col-title">Opusの意味とモデル名の由来</td>
+              <td class="col-project unassigned">
+                <span class="proj-suggest-arrow">→</span><span class="proj-suggest-name">Madini Archive</span><span class="proj-score" data-reason="SwiftUI・モデル名・アプリ命名" title="SwiftUI・モデル名・アプリ命名">0.62</span><!--
+                 Action buttons appear only in Inbox scope (see CSS).
+                 Accept = confirm the suggestion → row flips to
+                 accepted_suggestion membership in the target project.
+                 Dismiss = reject the suggestion → row moves to
+                 Orphans (still unassigned, no longer a candidate). -->
+                <span class="proj-actions">
+                  <button type="button" class="proj-action proj-action-accept" title="Accept suggestion">✓</button>
+                  <button type="button" class="proj-action proj-action-dismiss" title="Dismiss suggestion">×</button>
+                </span>
+              </td>
+              <td class="col-date">Apr 02</td>
+              <td class="col-prompts">7</td>
+              <td class="col-source">claude</td>
+            </tr>
+            <tr data-project-id="yuri" data-membership="canonical_import">
+              <td class="col-title">ファンタジー百合小説の設定と脚本管理</td>
+              <td class="col-project">
+                <span class="proj-glyph">📁</span><span class="proj-name">ファンタジー百合小説</span>
+              </td>
+              <td class="col-date">Mar 28</td>
+              <td class="col-prompts">31</td>
+              <td class="col-source">chatgpt</td>
+            </tr>
+            <tr data-project-id="__none" data-has-suggestion="true" data-suggested-project="reading">
+              <td class="col-title">輪行で運動習慣</td>
+              <td class="col-project unassigned">
+                <span class="proj-suggest-arrow">→</span><span class="proj-suggest-name">読書メモ</span><span class="proj-score" data-reason="運動・習慣・記録" title="運動・習慣・記録">0.48</span>
+                <span class="proj-actions">
+                  <button type="button" class="proj-action proj-action-accept" title="Accept suggestion">✓</button>
+                  <button type="button" class="proj-action proj-action-dismiss" title="Dismiss suggestion">×</button>
+                </span>
+              </td>
+              <td class="col-date">Mar 22</td>
+              <td class="col-prompts">11</td>
+              <td class="col-source">gemini</td>
+            </tr>
+            <tr data-project-id="madini" data-membership="manual_add">
+              <td class="col-title">README 改善提案</td>
+              <td class="col-project">
+                <span class="proj-glyph">📁</span><span class="proj-name">Madini Archive</span><span class="proj-mark" title="manually added">✎</span>
+              </td>
+              <td class="col-date">Mar 15</td>
+              <td class="col-prompts">6</td>
+              <td class="col-source">claude</td>
+            </tr>
+            <tr data-project-id="__none">
+              <td class="col-title">複利の仕組み</td>
+              <td class="col-project unassigned">—</td>
+              <td class="col-date">Mar 09</td>
+              <td class="col-prompts">4</td>
+              <td class="col-source">gemini</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- VIEWER content — rendered in .viewer mode only.
+           Top row is a single card summarising the active
+           conversation. Below it a flat prompt list inside the
+           same pane, each item selectable to seek the reader. -->
+      <div class="middle-viewer">
+        <!-- The viewer-card's `data-membership` attribute drives the
+             appearance of the project-badge cluster across five
+             states:
+               canonical_import    → "📁 アルラウネ執筆 · imported"
+               manual_add          → "📁 アルラウネ執筆 · manual"
+               accepted_suggestion → "📁 アルラウネ執筆 · suggested 0.81"
+                                     + reason row
+               pending_suggestion  → "→ アルラウネ執筆 · pending 0.81"
+                                     + reason row + [✓] [×] action buttons
+               unassigned          → "unassigned" (result of dismiss)
+             Glyph and membership label are both CSS-driven via
+             `::before` / `::after` off `data-membership`, so all
+             five states share one HTML skeleton — flip the attribute
+             in dev tools to preview.
+
+             Demo state is `pending_suggestion` so the card shows the
+             most feature-rich form (score + reason + the Inbox-style
+             triage buttons in the right column). Accept → becomes
+             accepted_suggestion; Dismiss → becomes unassigned. -->
+        <div
+          class="viewer-card"
+          data-membership="pending_suggestion"
+          data-suggested-project="alraune"
+        >
+          <!-- Left column: everything about the thread itself.
+               Prompt count is rendered as "💬 42" (speech bubble +
+               number) rather than "42 prompts" — compact enough
+               that the meta line fits even with long model names. -->
+          <div class="vc-col vc-col-left">
+            <div class="vc-title">自作小説アルラウネの執筆支援</div>
+            <div class="vc-meta">chatgpt<span class="dot">·</span><span class="prompts-glyph">💬</span>42<span class="dot">·</span>Apr 18</div>
+          </div>
+          <!-- Right column: everything about its project membership. -->
+          <div class="vc-col vc-col-right">
+            <div class="vc-project">
+              <!-- Empty spans; `::before`/`::after` off data-membership fill them. -->
+              <span class="vc-project-glyph"></span>
+              <span class="vc-project-name">アルラウネ執筆</span>
+              <span class="vc-membership"></span>
+              <span class="vc-score">0.81</span>
+            </div>
+            <div class="vc-reason">真夜・錫花・アビエニア</div>
+            <!-- Triage buttons, visible only under pending_suggestion.
+                 Share the `.proj-action` pill family with the table's
+                 Inbox rows — same visual, same verbs. -->
+            <div class="vc-actions">
+              <button type="button" class="proj-action proj-action-accept" title="Accept suggestion">✓</button>
+              <button type="button" class="proj-action proj-action-dismiss" title="Dismiss suggestion">×</button>
+            </div>
+          </div>
+        </div>
+        <ul class="viewer-prompts">
+          <li class="active"><span class="idx">1</span><span class="snippet">自作小説アルラウネを執筆支援</span></li>
+          <li><span class="idx">2</span><span class="snippet">キャラクター設定の深掘り</span></li>
+          <li><span class="idx">3</span><span class="snippet">世界観の補足設定を追加</span></li>
+          <li><span class="idx">4</span><span class="snippet">第一章の推敲</span></li>
+          <li><span class="idx">5</span><span class="snippet">アルラウネの過去エピソード</span></li>
+          <li><span class="idx">6</span><span class="snippet">対話シーンの調整</span></li>
+          <li><span class="idx">7</span><span class="snippet">文章表現のバリエーション</span></li>
+          <li><span class="idx">8</span><span class="snippet">第二章のプロット整理</span></li>
+          <li><span class="idx">9</span><span class="snippet">サブキャラの導入タイミング</span></li>
+          <li><span class="idx">10</span><span class="snippet">情景描写を強化</span></li>
+          <li><span class="idx">11</span><span class="snippet">伏線の整理と回収</span></li>
+          <li><span class="idx">12</span><span class="snippet">クライマックスへの展開</span></li>
+        </ul>
+      </div>
+
+    </section>
+    <section class="reader">
+      <div style="font-weight:600;color:var(--fg-primary);margin-bottom:8px;">Reader pane</div>
+      <p>Resize the browser window to exercise the tier-descending breadcrumb and the priority-driven overflow of the trailing items.</p>
+    </section>
+  </main>
+
+  <!-- ==================================================================
+       Live debug panel
+       ================================================================== -->
+  <!-- Shared floating tooltip element. Populated + positioned on
+       hover of any `.proj-score[data-reason]` by the JS below.
+       Lives at body level so no ancestor scroll container can clip
+       it. `aria-hidden` because the semantic reason is already in
+       the `title` attribute on the score span — screen readers get
+       that path. -->
+  <div class="proj-tooltip" id="proj-tooltip" aria-hidden="true"></div>
+
+  <aside class="debug-panel" aria-live="polite">
+    <h1>Toolbar Telemetry</h1>
+    <div class="row"><span class="key">window</span><span class="val" id="dbg-win">—</span></div>
+    <div class="row"><span class="key">mode</span><span class="val" id="dbg-mode">—</span></div>
+    <div class="row"><span class="key">toolbar-left</span><span class="val" id="dbg-left">—</span></div>
+    <div class="row"><span class="key">toolbar-right</span><span class="val" id="dbg-right">—</span></div>
+    <div class="row"><span class="key">breadcrumb</span><span class="val" id="dbg-bc">—</span></div>
+    <div class="row"><span class="key">active tier</span><span class="val" id="dbg-tier">—</span></div>
+    <div class="row"><span class="key">sidebar</span><span class="val" id="dbg-sidebar">—</span></div>
+    <div class="row"><span class="key">project</span><span class="val" id="dbg-project">—</span></div>
+    <div class="row"><span class="key">visible</span></div>
+    <div class="list" id="dbg-visible"></div>
+    <div class="row"><span class="key">dropped</span></div>
+    <div class="list" id="dbg-dropped"></div>
+
+    <!-- Sim section — dev-time affordances for flipping rows through
+         their "external LLM project changed" lifecycle. Only the
+         re-import button is wired for now; more sims can be added
+         here (manual re-ranking of suggestions, folder deletion,
+         etc.) without restructuring the panel. -->
+    <div class="sim-section">
+      <div class="sim-label">External LLM sim</div>
+      <button type="button" class="sim-btn" id="sim-reimport">
+        Re-import folders &mdash; move README row to 百合
+      </button>
+      <div class="sim-feedback" id="sim-feedback">&nbsp;</div>
+    </div>
+
+    <div class="hint">Drag the window edge &mdash; tier and overflow update live.</div>
+  </aside>
+
+  <aside class="force-tier" aria-label="Force tier">
+    <span style="color:#888;align-self:center;padding-right:4px;">force</span>
+    <button data-force="">auto</button>
+    <button data-force="1">1</button>
+    <button data-force="2">2</button>
+    <button data-force="3">3</button>
+    <button data-force="4">4</button>
+    <button data-force="5">5</button>
+  </aside>
+
+<script>
+(() => {
+  // ======================================================================
+  // Sidebar toggle — mirrors NavigationSplitView.columnVisibility.
+  // Clicking flips a `data-sidebar` attribute on <body>; CSS reads that
+  // to show/hide the sidebar column AND the toolbar's split-view
+  // separator. Auto-collapsing at narrow widths matches SwiftUI's
+  // automatic column visibility at breakpoints.
+  // ======================================================================
+  document.body.setAttribute('data-sidebar', 'open');
+
+  const sidebarToggle = document.getElementById('sidebar-toggle');
+  sidebarToggle.addEventListener('click', () => {
+    const now = document.body.getAttribute('data-sidebar');
+    const next = now === 'open' ? 'closed' : 'open';
+    document.body.setAttribute('data-sidebar', next);
+    sidebarToggle.setAttribute('aria-pressed', next === 'open' ? 'true' : 'false');
+    updateTelemetry();
+  });
+
+  // NOTE: NavigationSplitView auto-collapses its sidebar at narrow
+  // widths in the real app. The mock deliberately leaves sidebar
+  // visibility under pure user control so every combination
+  // (open/closed × wide/narrow) can be exercised independently when
+  // exploring the toolbar budget math.
+
+  // ======================================================================
+  // Sort chip menu — toggle open/closed, update glyph + short label.
+  // ======================================================================
+  const SORT_TABLE = {
+    dateDesc:         { glyph: '↓',  label: 'Newest',  long: 'Newest first'  },
+    dateAsc:          { glyph: '↑',  label: 'Oldest',  long: 'Oldest first'  },
+    promptCountDesc:  { glyph: '●',  label: 'Most',    long: 'Most prompts'  },
+    promptCountAsc:   { glyph: '○',  label: 'Fewest',  long: 'Fewest prompts'},
+  };
+  const sortChip  = document.getElementById('sort-chip');
+  const sortMenu  = document.getElementById('sort-menu');
+  const sortGlyph = document.getElementById('sort-glyph');
+  const sortLabel = document.getElementById('sort-label');
+  let   sortKey   = 'dateDesc';
+
+  sortChip.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const open = sortChip.getAttribute('aria-expanded') === 'true';
+    sortChip.setAttribute('aria-expanded', open ? 'false' : 'true');
+  });
+  sortMenu.addEventListener('click', (e) => {
+    const item = e.target.closest('.sort-menu-item');
+    if (!item) return;
+    sortKey = item.dataset.key;
+    const { glyph, label } = SORT_TABLE[sortKey];
+    sortGlyph.textContent = glyph;
+    sortLabel.textContent = label;
+    // Update checkmarks
+    sortMenu.querySelectorAll('.sort-menu-item').forEach(el => {
+      el.querySelector('.check').textContent = (el.dataset.key === sortKey) ? '✓' : '';
+    });
+    sortChip.setAttribute('aria-expanded', 'false');
+  });
+
+  // ======================================================================
+  // Segment popovers — mutually exclusive open state per breadcrumb.
+  // ======================================================================
+  const breadcrumb = document.getElementById('breadcrumb');
+
+  function populatePopover(el, kind) {
+    if (el.children.length) return; // populated once
+    const rows = (kind === 'thread')
+      ? ['自作小説アルラウネの執筆支援', 'アルラウネ 設定まとめ',
+         '続きの話を聞く', 'Opusの意味とモデル名の由来',
+         'Pages ダークモード 反転方法', 'ファンタジー百合小説の設定と脚本管理',
+         '輪行で運動習慣', '会話統計と傾向分析', 'README 改善提案',
+         '複利の仕組み', '転校生の逆の表現']
+      : Array.from({ length: 42 }, (_, i) => `プロンプト ${i + 1}`);
+    rows.forEach((text, i) => {
+      const row = document.createElement('div');
+      row.className = 'popover-row';
+      row.setAttribute('role', 'option');
+      row.textContent = text;
+      if (i === 0 && kind === 'thread') row.setAttribute('aria-selected', 'true');
+      if (i === 0 && kind === 'prompt') row.setAttribute('aria-selected', 'true');
+      el.appendChild(row);
+    });
+  }
+
+  function closeAllPopovers() {
+    document.querySelectorAll('.segment[aria-expanded="true"], .seg-prompt-stub[aria-expanded="true"]')
+      .forEach(btn => btn.setAttribute('aria-expanded', 'false'));
+  }
+
+  breadcrumb.addEventListener('click', (e) => {
+    const btn = e.target.closest('.segment, .seg-prompt-stub');
+    if (!btn) return;
+    e.stopPropagation();
+    const wasOpen = btn.getAttribute('aria-expanded') === 'true';
+    closeAllPopovers();
+    if (!wasOpen) {
+      btn.setAttribute('aria-expanded', 'true');
+      const pop = btn.nextElementSibling;
+      const kind = btn.classList.contains('seg-thread') ? 'thread' : 'prompt';
+      if (pop) populatePopover(pop, kind);
+    }
+  });
+
+  // ======================================================================
+  // Project picker (sidebar) — single-select. Clicking a project row
+  // sets `body[data-project="<id>"]`; CSS uses that attribute to scope
+  // the middle-pane table to matching rows. Clicking the currently-
+  // selected row deselects back to "All" (which sets the attribute to
+  // `__all` so the All row keeps its highlight). Re-clicking All also
+  // deselects (removes the attribute) so "no selection" remains
+  // addressable for tests / screenshots.
+  // ======================================================================
+  const projectItems = document.querySelectorAll('.sb-project');
+  function applyProjectSelection(id) {
+    if (id && id !== '__all') {
+      document.body.setAttribute('data-project', id);
+    } else if (id === '__all') {
+      document.body.setAttribute('data-project', '__all');
+    } else {
+      document.body.removeAttribute('data-project');
+    }
+    projectItems.forEach(row => {
+      row.classList.toggle('is-selected', row.dataset.projectId === id);
+    });
+  }
+  projectItems.forEach(row => {
+    row.addEventListener('click', () => {
+      const clicked = row.dataset.projectId;
+      const current = document.body.getAttribute('data-project');
+      // Toggle semantics: click the already-selected row to deselect.
+      // Exception: clicking `__all` while no attribute is set is a no-op.
+      const next = current === clicked ? null : clicked;
+      applyProjectSelection(next);
+      updateTelemetry();
+      // Event deliberately bubbles — the global click handler dismisses
+      // any open sort-menu / breadcrumb popovers, which is the right
+      // behavior when the user clicks over to the sidebar.
+    });
+  });
+  // Initial state: no project selected → all rows visible, no sidebar
+  // row highlighted. User can click "All" to make the selection
+  // explicit, or any project row to scope.
+
+  // ======================================================================
+  // Inbox triage actions — accept / dismiss ProjectSuggestion.
+  //
+  // Accept:  transforms the row from
+  //          (data-project-id="__none", data-has-suggestion="true")
+  //          to (data-project-id="<suggestedId>",
+  //              data-membership="accepted_suggestion").
+  //          The row keeps its score in the Project cell but loses
+  //          the arrow + action buttons — visually it's now an
+  //          assigned row with a numeric score suffix.
+  //          Under the Inbox filter it promptly disappears (no longer
+  //          unassigned); switching to "All" or to the target project
+  //          reveals it in its new home.
+  //
+  // Dismiss: drops `data-has-suggestion`. The row stays unassigned
+  //          but leaves the Inbox queue (moves to Orphans). Cell
+  //          collapses to a single em-dash.
+  //
+  // Event delegation on the table body so rows added / re-rendered
+  // later still work. Clicks bubble through to document's popover-
+  // dismiss handler as usual, but stop propagation to the row so
+  // the button press doesn't also trigger row-selection.
+  // ======================================================================
+  const tableBody = document.querySelector('.convo-table tbody');
+  if (tableBody) {
+    tableBody.addEventListener('click', (ev) => {
+      const btn = ev.target.closest('.proj-action');
+      if (!btn) return;
+      ev.stopPropagation();       // don't select the row
+      const row = btn.closest('tr');
+      const cell = row.querySelector('.col-project');
+      if (btn.classList.contains('proj-action-accept')) {
+        const target = row.dataset.suggestedProject;
+        acceptSuggestion(row, cell);
+        if (target) recordAccept(target);
+      } else if (btn.classList.contains('proj-action-dismiss')) {
+        dismissSuggestion(row, cell);
+        recordDismiss();
+      }
+      updateTelemetry();
+    });
+  }
+
+  function acceptSuggestion(row, cell) {
+    const targetProject = row.dataset.suggestedProject;
+    const name   = cell.querySelector('.proj-suggest-name')?.textContent ?? '';
+    const scoreEl = cell.querySelector('.proj-score');
+    const score  = scoreEl?.textContent ?? '';
+    // Reason terms survive the accept transition — the thread is
+    // still matched by the same TF-IDF evidence, just confirmed now.
+    // Without this step the tooltip would drop on accepted rows.
+    const reason = scoreEl?.getAttribute('data-reason') ?? '';
+    if (!targetProject) return;
+    // Flip the row's membership attributes. CSS filter rules react
+    // via the generic `body[data-project=…] tr[data-project-id=…]`
+    // pattern — no extra wiring needed to re-display this row under
+    // its new project scope.
+    row.dataset.projectId  = targetProject;
+    row.dataset.membership = 'accepted_suggestion';
+    delete row.dataset.hasSuggestion;
+    delete row.dataset.suggestedProject;
+    // Re-render the cell in the "accepted_suggestion" visual style
+    // (matches the `.proj-glyph / .proj-name / .proj-score` pattern
+    // used by the baked-in sample row "続きの話を聞く 0.73").
+    cell.className = 'col-project';
+    cell.innerHTML =
+      '<span class="proj-glyph">📁</span>' +
+      '<span class="proj-name"></span>' +
+      '<span class="proj-score"></span>';
+    cell.querySelector('.proj-name').textContent  = name;
+    const newScoreEl = cell.querySelector('.proj-score');
+    newScoreEl.textContent = score;
+    if (reason) {
+      // Carry both attributes: `data-reason` is the semantic source
+      // of truth (SwiftUI port will read from there); `title` is the
+      // surface that actually drives the browser's native tooltip.
+      newScoreEl.setAttribute('data-reason', reason);
+      newScoreEl.setAttribute('title', reason);
+    }
+  }
+
+  function dismissSuggestion(row, cell) {
+    delete row.dataset.hasSuggestion;
+    delete row.dataset.suggestedProject;
+    // Cell collapses to the bare em-dash Orphans rows already use.
+    cell.className = 'col-project unassigned';
+    cell.textContent = '—';
+  }
+
+  // Sidebar count bumping — applies deltas to the `.sb-count` badges
+  // for "Inbox ↔ <target>" / "Inbox ↔ Orphans" flows so the user
+  // sees a live counter tick on each triage action. The labels on
+  // page load are aspirational (pretend ~600-thread corpus while the
+  // table only ships 8 demo rows), so we can't derive counts from
+  // the DOM — we just perturb the baked numbers by ±1 per decision,
+  // which is enough to make the feedback loop feel real without
+  // pretending the mock is a full dataset.
+  function bumpSidebarCount(projectId, delta) {
+    const el = document.querySelector(
+      `.sb-project[data-project-id="${projectId}"] .sb-count`
+    );
+    if (!el) return;
+    const n = parseInt(el.textContent, 10);
+    if (Number.isNaN(n)) return;
+    el.textContent = String(Math.max(0, n + delta));
+  }
+  // Accept: the thread leaves Inbox and joins the target project.
+  // "All" is unchanged (the row's membership changed, not its
+  // existence), so no update there. Same rationale for `__orphans`
+  // on the dismiss side — a dismissed thread doesn't leave the app,
+  // it just moves from "Inbox (has suggestion)" to "Orphans (no
+  // suggestion)", so Orphans gains one and Inbox loses one.
+  function recordAccept(targetProjectId) {
+    bumpSidebarCount('__inbox', -1);
+    bumpSidebarCount(targetProjectId, +1);
+  }
+  function recordDismiss() {
+    bumpSidebarCount('__inbox', -1);
+    bumpSidebarCount('__orphans', +1);
+  }
+
+  // ======================================================================
+  // Reason-terms tooltip — instant, styled, escapes every scroll
+  // container.
+  //
+  // Native `title` has a ~1.5s delay that made the mock feel broken
+  // ("the `?` cursor shows but nothing appears"). CSS-only popups
+  // got clipped by `.three-pane .middle`'s overflow-y. The winning
+  // approach is a single body-level `<div>` positioned with
+  // `position: fixed` and `getBoundingClientRect()` on mouseenter:
+  // zero delay, zero clipping, one shared element for every
+  // hotspot.
+  //
+  // Delegation: listen for `mouseover` / `mouseout` on document
+  // and filter by closest('.proj-score[data-reason]'). We pick
+  // mouseover over mouseenter because mouseover bubbles — capture-
+  // phase mouseenter is inconsistent across browsers, and bubbling
+  // events let us attach one listener at document level regardless
+  // of when the hotspot enters the DOM (accept flow mutates rows).
+  // `.proj-score` is a leaf span, so the multi-fire behavior of
+  // mouseover on descendant entry doesn't apply — one fire per
+  // actual pointer-in event.
+  //
+  // Position: anchored above-right of the score span, offset 6px
+  // up. If the score is near the top of the viewport the tooltip
+  // would clip against the window edge — clamp to a 8px top margin
+  // and flip to below-right in that case.
+  // ======================================================================
+  const projTooltip = document.getElementById('proj-tooltip');
+  if (projTooltip) {
+    // Event target is the element under the cursor; closest() walks
+    // up to the score span if hover landed on the dotted-underline
+    // pseudo-element.
+    const showTooltip = (target) => {
+      const reason = target.getAttribute('data-reason');
+      if (!reason) return;
+      projTooltip.textContent = reason;
+      // Force a reflow before positioning so width reflects the new
+      // textContent (otherwise the first frame uses the previous
+      // tooltip's width when it was .is-visible).
+      projTooltip.classList.add('is-visible');
+      const tipRect = projTooltip.getBoundingClientRect();
+      const tgtRect = target.getBoundingClientRect();
+      // Prefer above; flip to below if not enough room (8px margin).
+      const aboveTop = tgtRect.top - tipRect.height - 6;
+      const belowTop = tgtRect.bottom + 6;
+      const top  = aboveTop < 8 ? belowTop : aboveTop;
+      // Right-align to the target's right edge, with the tip not
+      // running off the left side of the viewport.
+      const rawLeft = tgtRect.right - tipRect.width;
+      const left = Math.max(8, rawLeft);
+      projTooltip.style.top  = `${top}px`;
+      projTooltip.style.left = `${left}px`;
+    };
+    const hideTooltip = () => {
+      projTooltip.classList.remove('is-visible');
+    };
+    document.addEventListener('mouseover', (ev) => {
+      const target = ev.target.closest?.('.proj-score[data-reason]');
+      if (target) showTooltip(target);
+    });
+    document.addEventListener('mouseout', (ev) => {
+      // `relatedTarget` is the element the pointer moved to. If it's
+      // still inside the same score hotspot (shouldn't happen for a
+      // leaf span but robust against future structure), keep the
+      // tooltip up.
+      const from = ev.target.closest?.('.proj-score[data-reason]');
+      if (!from) return;
+      const to = ev.relatedTarget?.closest?.('.proj-score[data-reason]');
+      if (to !== from) hideTooltip();
+    });
+    // Also hide on scroll — the fixed position doesn't track the
+    // scrolling target, so a stale tooltip would hover in space.
+    document.addEventListener('scroll', hideTooltip, true);
+  }
+
+  // ======================================================================
+  // Re-import simulation — "external LLM latest wins" preview.
+  //
+  // Spec decision #5 (2026-04): the LLM's project folder is treated
+  // as the canonical source of truth. If the user moves a thread
+  // between project folders on the LLM side and then re-imports,
+  // Madini overwrites whatever local assignment it had — even if
+  // that local assignment was `manual_add` (user-confirmed).
+  // Rationale: the user's mental "where does this live" lives in
+  // the LLM's UI, not in Madini. Keeping Madini authoritative means
+  // the user has to maintain two taxonomies; letting the LLM win
+  // means they maintain one.
+  //
+  // This button previews that transition: the README row currently
+  // reads as `manual_add → Madini Archive` (✎ pencil glyph). One
+  // click simulates "the user moved it to the ファンタジー百合小説
+  // folder in ChatGPT and re-imported": membership flips to
+  // `canonical_import`, project to `yuri`, and the ✎ drops off.
+  // Sidebar counts tick: Madini Archive −1, 百合 +1.
+  //
+  // Idempotent: clicking again does nothing (the button disables
+  // once fired, since in real usage a re-import is an event, not
+  // a toggle). A page reload resets the demo.
+  // ======================================================================
+  const simReimportBtn = document.getElementById('sim-reimport');
+  const simFeedback    = document.getElementById('sim-feedback');
+  if (simReimportBtn) {
+    simReimportBtn.addEventListener('click', () => {
+      const row = document.querySelector(
+        '.convo-table tbody tr[data-project-id="madini"][data-membership="manual_add"]'
+      );
+      if (!row) {
+        simFeedback.textContent = '(row already moved)';
+        simReimportBtn.disabled = true;
+        return;
+      }
+      const cell = row.querySelector('.col-project');
+      // Flip attributes — canonical_import beats manual_add even
+      // though manual_add is "higher trust" locally. Spec is
+      // explicit: latest external import wins.
+      row.dataset.projectId  = 'yuri';
+      row.dataset.membership = 'canonical_import';
+      // Re-render cell as a plain canonical row (no ✎ mark, no
+      // score, just 📁 + name).
+      cell.className = 'col-project';
+      cell.innerHTML =
+        '<span class="proj-glyph">📁</span>' +
+        '<span class="proj-name">ファンタジー百合小説</span>';
+      // Count adjustments — Madini Archive loses the thread, 百合
+      // gains it. "All" is unchanged (the thread didn't leave the
+      // app, just changed project).
+      bumpSidebarCount('madini', -1);
+      bumpSidebarCount('yuri',   +1);
+      simFeedback.textContent = 'README moved: Madini → 百合';
+      simReimportBtn.disabled = true;
+      updateTelemetry();
+    });
+  }
+
+  // ======================================================================
+  // Viewer-card triage — same accept / dismiss verbs, second surface.
+  //
+  // The viewer-card pending_suggestion state mirrors the Inbox row:
+  // score + reason are visible and a pair of `.proj-action` buttons
+  // offer the same two decisions. Clicking ✓ flips the card into
+  // `accepted_suggestion` (same as the table's accept flow) — the
+  // buttons disappear, the glyph turns from → into 📁, and the
+  // membership label swaps "pending" for "suggested", all via the
+  // `data-membership` CSS rules above. Clicking × drops to
+  // `unassigned`: project name + score + reason + buttons all hide,
+  // leaving a single "unassigned" label as residue.
+  //
+  // No row-selection concern here (the viewer-card isn't a list row),
+  // but we still stopPropagation so the click doesn't bubble up to
+  // any future card-level handlers that might reasonably want to
+  // treat a click on the card as "open this thread's detail".
+  // ======================================================================
+  const viewerCard = document.querySelector('.viewer-card');
+  if (viewerCard) {
+    viewerCard.addEventListener('click', (ev) => {
+      const btn = ev.target.closest('.proj-action');
+      if (!btn) return;
+      ev.stopPropagation();
+      if (btn.classList.contains('proj-action-accept')) {
+        // Membership flips to `accepted_suggestion`; the CSS rules
+        // above hide the action buttons automatically. Score + reason
+        // stay visible because both membership states keep them.
+        const target = viewerCard.dataset.suggestedProject;
+        viewerCard.dataset.membership = 'accepted_suggestion';
+        delete viewerCard.dataset.suggestedProject;
+        if (target) recordAccept(target);
+      } else if (btn.classList.contains('proj-action-dismiss')) {
+        // `unassigned` hides project name, score, reason, and actions
+        // — the right column collapses to just the "unassigned"
+        // label driven by the membership pseudo-element.
+        viewerCard.dataset.membership = 'unassigned';
+        delete viewerCard.dataset.suggestedProject;
+        recordDismiss();
+      }
+      updateTelemetry();
+    });
+  }
+
+  // ======================================================================
+  // Mode picker — single-select like NSSegmentedControl, and also
+  // drives `body[data-mode]` so the middle pane content + adjacent
+  // panes swap per MiddlePaneMode cascade. The sidebar is deliberately
+  // NOT force-hidden by any mode: the toggle button stays live in all
+  // four modes so the user can open / close the sidebar regardless
+  // of middle-pane state (diverges from the earlier Swift behavior
+  // that override `columnVisibility` in viewer / focus).
+  // ======================================================================
+  document.body.setAttribute('data-mode', 'default');
+  document.querySelectorAll('.mode-seg').forEach(seg => {
+    seg.addEventListener('click', () => {
+      document.querySelectorAll('.mode-seg').forEach(s => s.setAttribute('aria-selected', 'false'));
+      seg.setAttribute('aria-selected', 'true');
+      document.body.setAttribute('data-mode', seg.dataset.mode);
+      updateTelemetry();
+    });
+  });
+
+  // ======================================================================
+  // Click-outside dismissal for the sort menu + popovers.
+  // ======================================================================
+  document.addEventListener('click', () => {
+    sortChip.setAttribute('aria-expanded', 'false');
+    closeAllPopovers();
+  });
+
+  // ======================================================================
+  // Force-tier override buttons.
+  // ======================================================================
+  const forceButtons = document.querySelectorAll('.force-tier button');
+  forceButtons.forEach(btn => {
+    btn.addEventListener('click', () => {
+      forceButtons.forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      document.body.classList.remove('force-tier-1','force-tier-2','force-tier-3','force-tier-4','force-tier-5');
+      if (btn.dataset.force) {
+        document.body.classList.add(`force-tier-${btn.dataset.force}`);
+      }
+      updateTelemetry();
+    });
+  });
+  document.querySelector('.force-tier button[data-force=""]').classList.add('active');
+
+  // ======================================================================
+  // Telemetry — report window / breadcrumb / tier / overflow live.
+  //
+  // "visible" and "dropped" mirror the priority gradient enforced by
+  // `applyWindowChrome` in Swift:
+  //    mode-picker (.user)      → never dropped
+  //    share, navigation-bar    → .high
+  //    prompt-counter           → .standard (first to drop)
+  // The CSS media queries drop the counter first (< 700), then the sort-
+  // chip label (< 520), matching the Swift priority.
+  // ======================================================================
+  const dbgWin      = document.getElementById('dbg-win');
+  const dbgMode     = document.getElementById('dbg-mode');
+  const dbgLeft     = document.getElementById('dbg-left');
+  const dbgRight    = document.getElementById('dbg-right');
+  const dbgBc       = document.getElementById('dbg-bc');
+  const dbgTier     = document.getElementById('dbg-tier');
+  const dbgSidebar  = document.getElementById('dbg-sidebar');
+  const dbgProject  = document.getElementById('dbg-project');
+  const dbgVisible  = document.getElementById('dbg-visible');
+  const dbgDropped  = document.getElementById('dbg-dropped');
+  const counterEl   = document.getElementById('prompt-counter');
+  const bcEl        = breadcrumb;
+  const leftZoneEl  = document.getElementById('toolbar-left');
+  const rightZoneEl = document.getElementById('toolbar-right');
+
+  function activeTierLabel() {
+    // Honor the force class if present.
+    for (let i = 1; i <= 5; i++) {
+      if (document.body.classList.contains(`force-tier-${i}`)) return `forced tier ${i}`;
+    }
+    // Otherwise find whichever tier is currently display:flex.
+    for (let i = 1; i <= 5; i++) {
+      const el = bcEl.querySelector(`.tier-${i}`);
+      if (el && getComputedStyle(el).display !== 'none') {
+        const names = ['', 'Full', 'Medium', 'Compact', 'Prompt-ellipsis', 'Thread-only'];
+        return `${i} · ${names[i]}`;
+      }
+    }
+    return '—';
+  }
+
+  function makePill(text, dropped = false) {
+    const span = document.createElement('span');
+    span.className = 'pill' + (dropped ? ' dropped' : '');
+    span.textContent = text;
+    return span;
+  }
+
+  function updateTelemetry() {
+    const w  = window.innerWidth;
+    const bw = Math.round(bcEl.getBoundingClientRect().width);
+    const lw = Math.round(leftZoneEl.getBoundingClientRect().width);
+    const rw = Math.round(rightZoneEl.getBoundingClientRect().width);
+    const sidebarOpen = document.body.getAttribute('data-sidebar') === 'open';
+
+    const modeNames = {
+      table: 'table · full-width grid',
+      default: 'default · grid + reader',
+      viewer: 'viewer · card + prompts',
+      focus: 'focus · reader only',
+    };
+    const modeKey = document.body.getAttribute('data-mode') || 'default';
+
+    dbgWin.textContent     = `${w}px`;
+    dbgMode.textContent    = modeNames[modeKey] || modeKey;
+    dbgLeft.textContent    = `${lw}px`;
+    dbgRight.textContent   = `${rw}px`;
+    dbgBc.textContent      = `${bw}px`;
+    dbgTier.textContent    = activeTierLabel();
+    // `data-sidebar` toggles the left zone between (sidebar-width) and
+    // (just-the-toggle). The full delta flows into `.toolbar-right`,
+    // so the budget available to principal + trailing changes by the
+    // sidebar's width — exactly the Safari 2-zone behavior.
+    dbgSidebar.textContent = sidebarOpen
+      ? `open — left zone matches sidebar`
+      : `closed — full width in right zone`;
+
+    // Project scope — reports which sidebar row is driving the
+    // middle-pane filter. Counts the resulting visible rows so the
+    // mapping "selected project → table content" is verifiable at
+    // a glance while dragging the window / flipping modes.
+    const projectKey = document.body.getAttribute('data-project');
+    const projectLabel = (() => {
+      if (!projectKey) return 'none — all rows visible';
+      if (projectKey === '__all')     return 'All';
+      if (projectKey === '__inbox')   return 'Inbox (pending suggestions)';
+      if (projectKey === '__orphans') return 'Orphans (no suggestion)';
+      const sel = document.querySelector(`.sb-project[data-project-id="${projectKey}"] .sb-label`);
+      return sel ? sel.textContent.trim() : projectKey;
+    })();
+    // Row visibility is CSS-driven (no inline style set) so rely on
+    // getComputedStyle to count what's actually showing.
+    const rows = document.querySelectorAll('.convo-table tbody tr');
+    const shown = Array.from(rows).filter(tr => getComputedStyle(tr).display !== 'none').length;
+    dbgProject.textContent = `${projectLabel} · ${shown}/${rows.length} rows`;
+
+    // Evaluate which items are visible vs. dropped. Visibility is
+    // driven purely by CSS media queries (tier / compression); the
+    // sidebar toggle stays live in all four modes so the user can
+    // open or close the sidebar regardless of middle-pane state.
+    const tier5 = bcEl.querySelector('.tier-5');
+    const inTier5 = tier5 && getComputedStyle(tier5).display !== 'none';
+    const items = [
+      { id: 'sidebar-toggle',       shown: true },
+      { id: 'sort-chip',            shown: true },
+      { id: 'sort-chip.label',      shown: w >= 520 },
+      { id: 'breadcrumb',           shown: true },
+      { id: 'tier-counter (in-bc)', shown: !inTier5 },
+      { id: 'share',                shown: true },
+      { id: 'mode-picker',          shown: true },
+    ];
+    dbgVisible.replaceChildren();
+    dbgDropped.replaceChildren();
+    items.filter(x => x.shown).forEach(x => dbgVisible.appendChild(makePill(x.id)));
+    items.filter(x => !x.shown).forEach(x => dbgDropped.appendChild(makePill(x.id, true)));
+  }
+
+  // Keep in sync with window resizes AND with breadcrumb-container resizes
+  // (the breadcrumb reports its own inline-size via ResizeObserver).
+  // Also observe `<body>` so the `data-sidebar` attribute toggle — which
+  // shifts leading-cluster width and therefore the flex budget available
+  // to the principal + trailing — triggers a live telemetry update.
+  const ro = new ResizeObserver(updateTelemetry);
+  ro.observe(bcEl);
+  const mo = new MutationObserver(updateTelemetry);
+  mo.observe(document.body, { attributes: true, attributeFilter: ['data-sidebar', 'data-mode', 'data-project'] });
+  window.addEventListener('resize', updateTelemetry);
+  updateTelemetry();
+})();
+</script>
+</body>
+</html>
