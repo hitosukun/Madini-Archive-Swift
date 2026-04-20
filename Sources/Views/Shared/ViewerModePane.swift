@@ -103,6 +103,11 @@ struct ViewerModePane: View {
                     }
                     .padding(.vertical, 4)
                 }
+                .safeAreaInset(edge: .bottom, spacing: 0) {
+                    Color.clear
+                        .frame(height: WorkspaceLayoutMetrics.bottomFadeHeight)
+                        .allowsHitTesting(false)
+                }
                 .onChange(of: tabManager.selectedPromptID) { _, newID in
                     guard let newID else { return }
                     // `.center` keeps the currently-reading prompt around
@@ -172,12 +177,12 @@ private struct ViewerPromptRow: View {
         Button(action: onSelect) {
             HStack(alignment: .top, spacing: 10) {
                 Text("\(prompt.index)")
-                    .font(.caption.monospacedDigit())
+                    .font(.callout.monospacedDigit())
                     .foregroundStyle(.secondary)
-                    .frame(width: 28, alignment: .trailing)
+                    .frame(width: 32, alignment: .trailing)
 
                 Text(prompt.label)
-                    .font(.subheadline)
+                    .font(.body)
                     .foregroundStyle(.primary)
                     .lineLimit(2)
                     .multilineTextAlignment(.leading)
@@ -190,7 +195,7 @@ private struct ViewerPromptRow: View {
                 }
             }
             .padding(.horizontal, 12)
-            .padding(.vertical, 6)
+            .padding(.vertical, 8)
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
             .background(rowBackground)

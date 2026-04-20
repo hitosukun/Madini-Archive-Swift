@@ -162,6 +162,11 @@ struct ReaderWorkspaceView: View {
 /// (table included) and its x-coordinate doesn't jump as the user
 /// cascades through middle-pane modes.
 struct ReaderHeaderActivityPill: View {
+    private enum HoveredSegment {
+        case thread
+        case prompt
+    }
+
     private static let titleSegmentMinWidth: CGFloat = 170
     private static let titleSegmentIdealWidth: CGFloat = 220
     private static let titleSegmentMaxWidth: CGFloat = 300
@@ -200,6 +205,7 @@ struct ReaderHeaderActivityPill: View {
     @State private var isPromptPopoverPresented = false
     @State private var measuredThreadSegmentWidth: CGFloat = Self.titleSegmentIdealWidth
     @State private var measuredPromptSegmentWidth: CGFloat = Self.promptSegmentIdealWidth
+    @State private var hoveredSegment: HoveredSegment?
 
     var body: some View {
         // Xcode-style cascade breadcrumb: [thread popover] > [prompt popover]
@@ -255,6 +261,10 @@ struct ReaderHeaderActivityPill: View {
                     .foregroundStyle(.secondary)
             }
         }
+        .animation(.easeInOut(duration: 0.12), value: hoveredSegment == .thread)
+        .animation(.easeInOut(duration: 0.12), value: hoveredSegment == .prompt)
+        .animation(.easeInOut(duration: 0.12), value: isThreadPopoverPresented)
+        .animation(.easeInOut(duration: 0.12), value: isPromptPopoverPresented)
     }
 
     // MARK: - Thread segment (primary axis)
@@ -268,7 +278,8 @@ struct ReaderHeaderActivityPill: View {
             segmentLabel(
                 text: titleText,
                 foregroundStyle: activeDetail == nil ? .secondary : .primary,
-                weight: .semibold
+                weight: .semibold,
+                showsDisclosure: isThreadHighlighted
             )
         }
         .buttonStyle(.plain)
@@ -279,6 +290,7 @@ struct ReaderHeaderActivityPill: View {
             minHeight: Self.segmentHeight,
             maxHeight: Self.segmentHeight
         )
+        .background(segmentBackground(isHighlighted: isThreadHighlighted))
         .background(widthReader(ThreadSegmentWidthPreferenceKey.self))
         .onPreferenceChange(ThreadSegmentWidthPreferenceKey.self) { newWidth in
             measuredThreadSegmentWidth = clamped(
@@ -286,6 +298,9 @@ struct ReaderHeaderActivityPill: View {
                 min: Self.titleSegmentMinWidth,
                 max: Self.titleSegmentMaxWidth
             )
+        }
+        .onHover { isHovering in
+            hoveredSegment = isHovering ? .thread : (hoveredSegment == .thread ? nil : hoveredSegment)
         }
         .disabled(activeDetail == nil && conversations.isEmpty)
         .help("会話を切り替え")
@@ -318,7 +333,8 @@ struct ReaderHeaderActivityPill: View {
             segmentLabel(
                 text: currentPromptTitle,
                 foregroundStyle: .secondary,
-                weight: .regular
+                weight: .regular,
+                showsDisclosure: isPromptHighlighted
             )
         }
         .buttonStyle(.plain)
@@ -329,6 +345,7 @@ struct ReaderHeaderActivityPill: View {
             minHeight: Self.segmentHeight,
             maxHeight: Self.segmentHeight
         )
+        .background(segmentBackground(isHighlighted: isPromptHighlighted))
         .background(widthReader(PromptSegmentWidthPreferenceKey.self))
         .onPreferenceChange(PromptSegmentWidthPreferenceKey.self) { newWidth in
             measuredPromptSegmentWidth = clamped(
@@ -336,6 +353,9 @@ struct ReaderHeaderActivityPill: View {
                 min: Self.promptSegmentMinWidth,
                 max: Self.promptSegmentMaxWidth
             )
+        }
+        .onHover { isHovering in
+            hoveredSegment = isHovering ? .prompt : (hoveredSegment == .prompt ? nil : hoveredSegment)
         }
         .disabled(promptOutline.isEmpty)
         .help("プロンプトを切り替え")
@@ -362,25 +382,40 @@ struct ReaderHeaderActivityPill: View {
         Image(systemName: "chevron.right")
             .font(.caption2.weight(.semibold))
             .foregroundStyle(.tertiary)
+            .opacity(isThreadHighlighted ? 0.25 : 1)
     }
 
     private func segmentLabel(
         text: String,
         foregroundStyle: HierarchicalShapeStyle,
-        weight: Font.Weight
+        weight: Font.Weight,
+        showsDisclosure: Bool
     ) -> some View {
-        HStack(spacing: 0) {
+        HStack(spacing: 6) {
             Text(text)
                 .font(.subheadline.weight(weight))
                 .foregroundStyle(foregroundStyle)
                 .lineLimit(1)
                 .truncationMode(.tail)
                 .frame(maxWidth: .infinity, alignment: .leading)
-            Spacer(minLength: 0)
+
+            Image(systemName: "chevron.down")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .opacity(showsDisclosure ? 1 : 0)
         }
         .padding(.horizontal, 6)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
         .contentShape(Rectangle())
+    }
+
+    private func segmentBackground(isHighlighted: Bool) -> some View {
+        RoundedRectangle(cornerRadius: 9, style: .continuous)
+            .fill(Color.primary.opacity(isHighlighted ? 0.08 : 0))
+            .overlay(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(isHighlighted ? 0.06 : 0), lineWidth: 0.5)
+            )
     }
 
     private func widthReader<Key: PreferenceKey>(_ key: Key.Type) -> some View where Key.Value == CGFloat {
@@ -395,6 +430,14 @@ struct ReaderHeaderActivityPill: View {
 
     private func popoverWidth(for segmentWidth: CGFloat, min: CGFloat, max: CGFloat) -> CGFloat {
         clamped(segmentWidth + 56, min: min, max: max)
+    }
+
+    private var isThreadHighlighted: Bool {
+        hoveredSegment == .thread || isThreadPopoverPresented
+    }
+
+    private var isPromptHighlighted: Bool {
+        hoveredSegment == .prompt || isPromptPopoverPresented
     }
 
     // MARK: - Text helpers
