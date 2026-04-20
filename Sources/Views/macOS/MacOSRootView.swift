@@ -96,16 +96,7 @@ struct MacOSRootView: View {
         // both broke `NavigationSplitView`'s sidebar layout on the
         // current SDK), `.titleVisibility` only hides the label and
         // leaves AppKit's titlebar / toolbar geometry untouched.
-        .background(WindowConfigurator { window in
-            window.titleVisibility = .hidden
-            // Belt-and-suspenders: `.titleVisibility = .hidden` alone
-            // is sometimes overridden by SwiftUI writing a non-empty
-            // `window.title` from the app bundle name after a
-            // navigation state change. Blanking the title string
-            // itself guarantees no glyphs render even if the
-            // visibility bit gets flipped back.
-            window.title = ""
-        })
+        .background(WindowConfigurator(configure: Self.applyWindowChrome))
         // Window-level JSON drop handler. Sits ABOVE the in-app tag /
         // conversation drop destinations (which live on specific rows
         // further down the view tree) so an external file drag lands
@@ -538,6 +529,54 @@ struct MacOSRootView: View {
     private func revealActiveConversationInMiddlePane() {
         guard let id = tabManager.activeTab?.conversationID else { return }
         Task { await libraryViewModel.revealConversation(id: id) }
+    }
+
+    /// Apply all window-chrome tweaks that must survive SwiftUI re-
+    /// writing them. Called by `WindowConfigurator` once on attach and
+    /// again on every `updateNSView` pass, plus from the KVO observer
+    /// whenever SwiftUI writes `window.title`.
+    ///
+    /// Kept as a static helper (rather than inline inside
+    /// `.background(WindowConfigurator { ... })`) because embedding
+    /// the toolbar-item loop directly in `body` tipped the Swift type
+    /// checker over the "unable to type-check in reasonable time"
+    /// threshold. Static methods type-check independently, so pulling
+    /// this out keeps the body lean.
+    private static func applyWindowChrome(_ window: NSWindow) {
+        // Hide the system window title label. Blanking the string too
+        // guarantees no glyphs render even if the visibility bit gets
+        // flipped back by a later SwiftUI pass.
+        window.titleVisibility = .hidden
+        window.title = ""
+
+        // Toolbar overflow priorities. SwiftUI's default NSToolbar
+        // behavior is to shove `.primaryAction` items into the »
+        // overflow menu before compressing a wide `.principal` item
+        // — i.e., the mode picker and share button get hidden while
+        // the breadcrumb keeps its full ideal width. The user wants
+        // the opposite ordering: breadcrumb compresses / disappears
+        // first, primary-action icons stay visible across every
+        // reasonable window width. Set per-item `visibilityPriority`
+        // so AppKit's overflow algorithm picks the right losers.
+        // Item identifiers match the `ToolbarItem(id:)` strings
+        // declared in `workspaceSplitView`; unknown ids (e.g. the
+        // built-in sidebar toggle) are left alone.
+        if let toolbar = window.toolbar {
+            for item in toolbar.items {
+                switch item.itemIdentifier.rawValue {
+                case "navigation-bar":
+                    // Breadcrumb — lowest priority so it compresses
+                    // and eventually disappears before everyone else.
+                    item.visibilityPriority = .low
+                case "share", "mode-picker":
+                    // Primary-action icons — pinned at high so they
+                    // survive every reasonable window width.
+                    item.visibilityPriority = .high
+                default:
+                    break
+                }
+            }
+        }
     }
 
     private var libraryContentPane: some View {
@@ -1394,13 +1433,11 @@ struct WindowConfigurator: NSViewRepresentable {
         return view
     }
 
-    // Re-apply `configure` on every SwiftUI update pass. The title
-    // state in particular needs this: SwiftUI's NavigationSplitView
-    // writes the window title back (from the sidebar content / app
-    // bundle name) after navigation state changes, so a one-shot
-    // `viewDidMoveToWindow` call gets overridden the next time the
-    // user picks a different sidebar row. Re-applying here is cheap
-    // — `titleVisibility = .hidden` is idempotent.
+    // Re-apply `configure` on every SwiftUI update pass. Belt-and-
+    // suspenders on top of the KVO observer installed in
+    // `viewDidMoveToWindow` — some state (toolbar item priorities)
+    // gets rebuilt by SwiftUI on toolbar refresh, so catching the
+    // view-update pass covers the gap while KVO covers the title.
     func updateNSView(_ nsView: WindowAccessorView, context: Context) {
         if let window = nsView.window {
             configure(window)
@@ -1409,12 +1446,37 @@ struct WindowConfigurator: NSViewRepresentable {
 
     final class WindowAccessorView: NSView {
         var onAttach: ((NSWindow) -> Void)?
+        /// KVO token for `window.title`. SwiftUI's NavigationSplitView
+        /// re-writes `NSWindow.title` from the app bundle name on its
+        /// own schedule (not tied to our `updateNSView` calls), so we
+        /// need an observer that fires whenever the title is written
+        /// and forces it back to empty. Without this, setting
+        /// `.titleVisibility = .hidden` + `title = ""` from
+        /// `updateNSView` is insufficient — by the time AppKit renders
+        /// the titlebar, SwiftUI has already put "MadiniArchive" back.
+        private var titleObservation: NSKeyValueObservation?
 
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
-            if let window = self.window {
-                onAttach?(window)
+            titleObservation?.invalidate()
+            guard let window = self.window else { return }
+            onAttach?(window)
+
+            titleObservation = window.observe(\.title, options: [.new]) { [weak self] window, _ in
+                guard let self = self else { return }
+                // Only re-run `onAttach` when SwiftUI has put a non-
+                // empty string back — otherwise our own `title = ""`
+                // call inside `onAttach` would recurse here. Setting
+                // an already-empty title is a no-op for KVO so this
+                // terminates cleanly on the first intercept.
+                if window.title != "" {
+                    self.onAttach?(window)
+                }
             }
+        }
+
+        deinit {
+            titleObservation?.invalidate()
         }
     }
 }
