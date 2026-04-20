@@ -167,13 +167,29 @@ struct ReaderHeaderActivityPill: View {
         case prompt
     }
 
-    private static let titleSegmentMinWidth: CGFloat = 170
+    // Minimum widths are intentionally narrow so the whole breadcrumb
+    // can compress when the window narrows. SwiftUI's toolbar layout
+    // treats the `.principal` item's natural width as a hard floor —
+    // whatever we declare here is what the toolbar insists on keeping
+    // between the sidebar toggle and the `.primaryAction` cluster, so
+    // any min greater than "a few truncated characters + chevron"
+    // would push the share / mode-picker buttons off into the »
+    // overflow menu on narrow windows.
+    //
+    // The `segmentLabel` helper already truncates via
+    // `.lineLimit(1) + .truncationMode(.tail)`, so a 70pt min still
+    // reads as a usable breadcrumb — the user sees the first few
+    // characters + "…" and can still click to open the popover.
+    // Ideal / max stay at the previous comfortable values so the pill
+    // only shrinks under pressure and otherwise reads at its
+    // original proportions.
+    private static let titleSegmentMinWidth: CGFloat = 70
     private static let titleSegmentIdealWidth: CGFloat = 220
     private static let titleSegmentMaxWidth: CGFloat = 300
-    private static let promptSegmentMinWidth: CGFloat = 170
+    private static let promptSegmentMinWidth: CGFloat = 70
     private static let promptSegmentIdealWidth: CGFloat = 230
     private static let promptSegmentMaxWidth: CGFloat = 320
-    private static let pillMinWidth: CGFloat = 358
+    private static let pillMinWidth: CGFloat = 180
     private static let pillIdealWidth: CGFloat = 472
     private static let pillMaxWidth: CGFloat = 626
     private static let segmentHeight: CGFloat = 22
