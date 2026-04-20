@@ -617,16 +617,6 @@ struct MacOSRootView: View {
             ideal: WorkspaceLayoutMetrics.sidebarIdealWidth,
             max: WorkspaceLayoutMetrics.sidebarMaxWidth
         )
-        // SwiftUI `NavigationSplitView` derives the window title from
-        // the sidebar column's `.navigationTitle`. Without an explicit
-        // one, it falls back to the app bundle name ("MadiniArchive"),
-        // and that fallback is re-applied by SwiftUI after every
-        // navigation state change — overriding whatever we set on
-        // `NSWindow.title` from `WindowConfigurator`. Declaring an
-        // empty `.navigationTitle` here tells SwiftUI authoritatively
-        // that the title IS empty, so the bundle-name fallback never
-        // runs and our `NSWindow.titleVisibility = .hidden` can stick.
-        .navigationTitle(Text(verbatim: ""))
     }
 
 }
