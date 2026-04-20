@@ -12,6 +12,14 @@ import SwiftUI
 /// `Label(systemImage:)` swap below.
 struct LibraryListSortMenu: View {
     @Bindable var viewModel: LibraryViewModel
+    /// When mounted in a narrow container (e.g. the window toolbar's
+    /// `.principal` slot, which competes with the breadcrumb and the
+    /// right-side action cluster for available width), callers set
+    /// this to let the chip truncate its label — and in the worst case
+    /// collapse to icon-only — rather than refusing to shrink. The
+    /// default (sidebar / search-row usage) keeps the chip at its
+    /// comfortable natural size via `.fixedSize()`.
+    var compressible: Bool = false
 
     var body: some View {
         Menu {
@@ -24,15 +32,28 @@ struct LibraryListSortMenu: View {
             HStack(spacing: 4) {
                 Image(systemName: sortGlyph)
                     .font(.subheadline.weight(.semibold))
+                    // Never compress the icon itself — it's the fallback
+                    // when the text truncates down to nothing.
+                    .layoutPriority(1)
                 Text(sortLabel)
                     .font(.caption)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    // Lower priority than the icon so the text is the
+                    // first casualty when the container narrows. Only
+                    // relevant in `compressible` mode (see `.fixedSize()`
+                    // below, which locks the whole HStack otherwise).
+                    .layoutPriority(compressible ? 0 : 1)
             }
             .headerChipStyle()
         }
         .menuStyle(.button)
         .buttonStyle(.plain)
         .menuIndicator(.hidden)
-        .fixedSize()
+        // `.fixedSize()` locks the label to its natural width. Keep it
+        // on for the default (sidebar) mount, drop it for the toolbar
+        // mount so the label can truncate under window-width pressure.
+        .modifier(ConditionalFixedSize(active: !compressible))
         .help("Change sort order")
     }
 
@@ -66,6 +87,22 @@ struct LibraryListSortMenu: View {
         case .dateAsc: return "Oldest"
         case .promptCountDesc: return "Most"
         case .promptCountAsc: return "Fewest"
+        }
+    }
+}
+
+/// Toggle `.fixedSize()` without breaking the `some View` type of the
+/// parent's body. A plain `if` branch over `.fixedSize()` changes the
+/// returned view type, which ripples into unhelpful generics
+/// diagnostics; a `ViewModifier` keeps the outer type stable.
+private struct ConditionalFixedSize: ViewModifier {
+    let active: Bool
+
+    func body(content: Content) -> some View {
+        if active {
+            content.fixedSize()
+        } else {
+            content
         }
     }
 }

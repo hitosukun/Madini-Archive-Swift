@@ -473,7 +473,11 @@ struct MacOSRootView: View {
             // to the breadcrumb regardless of window width.
             ToolbarItem(id: "navigation-bar", placement: .principal) {
                 HStack(spacing: 10) {
-                    LibraryListSortMenu(viewModel: libraryViewModel)
+                    // `compressible: true` — the toolbar competes with
+                    // the breadcrumb and the right-side action cluster
+                    // for width, so the sort chip must be willing to
+                    // truncate its label (worst case: icon-only).
+                    LibraryListSortMenu(viewModel: libraryViewModel, compressible: true)
                     ReaderHeaderActivityPill(
                         activeDetail: tabManager.activeDetail,
                         promptOutline: tabManager.promptOutline,
@@ -488,6 +492,31 @@ struct MacOSRootView: View {
                         onTitlePulldownOpen: revealActiveConversationInMiddlePane
                     )
                 }
+                // Frame hint for NSToolbar's size measurement.
+                // AppKit's modern (macOS 12+) toolbar sizing derives
+                // each item's acceptable width range from the hosted
+                // view's intrinsic constraints rather than the
+                // deprecated `NSToolbarItem.minSize` / `.maxSize`
+                // properties. Without this hint, SwiftUI reports the
+                // HStack's ideal width (~500pt for the full sort chip
+                // + breadcrumb pill) as its natural size, and when
+                // the remaining window room drops below that ideal
+                // AppKit shunts the whole item to the » overflow menu
+                // in one step — which is exactly what we were seeing:
+                // breadcrumb vanishes from the titlebar the moment
+                // the window narrows.
+                //
+                // Declaring `minWidth: 80` tells AppKit the content
+                // is happy compressing down to ~80pt (icon-only sort
+                // chip + a truncated-to-ellipsis breadcrumb pill), so
+                // the item stays visible across every practical
+                // window width. `idealWidth` is the same as the
+                // pill's natural width so the chrome still reads at
+                // its original proportions on normal-size windows;
+                // `maxWidth` caps growth so the principal doesn't
+                // greedily swallow the whole toolbar on ultra-wide
+                // displays.
+                .frame(minWidth: 80, idealWidth: 520, maxWidth: 720)
             }
             ToolbarItem(id: "share", placement: .primaryAction) {
                 WorkspaceFloatingExportButton(detail: tabManager.activeDetail)
@@ -549,28 +578,28 @@ struct MacOSRootView: View {
         window.titleVisibility = .hidden
         window.title = ""
 
-        // Toolbar overflow priorities. SwiftUI's default NSToolbar
-        // behavior is to shove `.primaryAction` items into the »
-        // overflow menu before compressing a wide `.principal` item
-        // — i.e., the mode picker and share button get hidden while
-        // the breadcrumb keeps its full ideal width. The user wants
-        // the opposite ordering: breadcrumb compresses / disappears
-        // first, primary-action icons stay visible across every
-        // reasonable window width. Set per-item `visibilityPriority`
-        // so AppKit's overflow algorithm picks the right losers.
-        // Item identifiers match the `ToolbarItem(id:)` strings
-        // declared in `workspaceSplitView`; unknown ids (e.g. the
-        // built-in sidebar toggle) are left alone.
+        // Toolbar overflow priorities. Keep all three of our custom
+        // items (navigation-bar, share, mode-picker) pinned at the
+        // same `.high` priority so AppKit's overflow algorithm
+        // treats them as equally important — no single one gets
+        // sacrificed before the others. Compressibility itself is
+        // driven from the SwiftUI side: the principal HStack uses
+        // a `.frame(minWidth: …)` that lets it measure small, and
+        // its children (`LibraryListSortMenu(compressible: true)`,
+        // `ReaderHeaderActivityPill`) truncate internally. With a
+        // flexible minimum, NSToolbar reads the principal as
+        // "happy at a narrow width," so it stays visible alongside
+        // primary-action items even when the window is narrow.
+        //
+        // `NSToolbarItem.minSize` / `.maxSize` are deprecated in
+        // macOS 12+ — Apple's guidance is to let the system measure
+        // from the hosted view's constraints, which for us means
+        // the SwiftUI intrinsic size. So we don't touch those and
+        // rely on the SwiftUI content alone.
         if let toolbar = window.toolbar {
             for item in toolbar.items {
                 switch item.itemIdentifier.rawValue {
-                case "navigation-bar":
-                    // Breadcrumb — lowest priority so it compresses
-                    // and eventually disappears before everyone else.
-                    item.visibilityPriority = .low
-                case "share", "mode-picker":
-                    // Primary-action icons — pinned at high so they
-                    // survive every reasonable window width.
+                case "navigation-bar", "share", "mode-picker":
                     item.visibilityPriority = .high
                 default:
                     break
