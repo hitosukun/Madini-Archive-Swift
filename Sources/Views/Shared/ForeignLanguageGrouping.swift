@@ -31,7 +31,21 @@ enum MessageRenderItem {
 ///    Below that we treat the text as "not confidently foreign" and
 ///    leave it as a normal block.
 enum ForeignLanguageGrouping {
-    static func group(_ blocks: [ContentBlock]) -> [MessageRenderItem] {
+    static func group(_ blocks: [ContentBlock], mode: GroupingMode = .allRuns) -> [MessageRenderItem] {
+        switch mode {
+        case .allRuns:
+            return groupAllRuns(blocks)
+        case .leadingRunOnly:
+            return groupLeadingRunOnly(blocks)
+        }
+    }
+
+    enum GroupingMode {
+        case allRuns
+        case leadingRunOnly
+    }
+
+    private static func groupAllRuns(_ blocks: [ContentBlock]) -> [MessageRenderItem] {
         let system = systemLanguage
         var result: [MessageRenderItem] = []
         var pending: (language: NLLanguage, blocks: [ContentBlock])?
@@ -58,6 +72,51 @@ enum ForeignLanguageGrouping {
             }
         }
         flush()
+        return result
+    }
+
+    /// Narrower mode used for assistant replies: only fold a foreign-
+    /// language run if it appears at the very start of the message.
+    /// This matches the original UX goal — collapse Claude/ChatGPT's
+    /// initial English "thinking out loud" preamble — without
+    /// de-emphasizing later legitimate content such as standalone math
+    /// explanations, quoted snippets, or short English sub-sections.
+    private static func groupLeadingRunOnly(_ blocks: [ContentBlock]) -> [MessageRenderItem] {
+        let system = systemLanguage
+        var leadingBlocks: [MessageRenderItem] = []
+        var prefixLanguage: NLLanguage?
+        var prefixBlocks: [ContentBlock] = []
+        var index = 0
+
+        while index < blocks.count {
+            let block = blocks[index]
+            if prefixBlocks.isEmpty, Detection.isIgnorableLeadingBlock(block) {
+                leadingBlocks.append(.block(block))
+                index += 1
+                continue
+            }
+
+            guard let lang = Detection.dominantLanguage(of: block), lang != system else {
+                break
+            }
+
+            if let prefixLanguage {
+                guard prefixLanguage == lang else { break }
+            } else {
+                prefixLanguage = lang
+            }
+
+            prefixBlocks.append(block)
+            index += 1
+        }
+
+        guard let prefixLanguage, !prefixBlocks.isEmpty else {
+            return blocks.map(MessageRenderItem.block)
+        }
+
+        var result: [MessageRenderItem] = leadingBlocks
+        result.append(.foreignLanguageGroup(language: prefixLanguage, blocks: prefixBlocks))
+        result.append(contentsOf: blocks.dropFirst(index).map(MessageRenderItem.block))
         return result
     }
 
@@ -94,6 +153,20 @@ enum ForeignLanguageGrouping {
     /// per-message grouping work near-zero on cache hits.
     private enum Detection {
         private static let cache = NSCache<NSString, NSString>()
+
+        static func isIgnorableLeadingBlock(_ block: ContentBlock) -> Bool {
+            guard let text = textContent(of: block)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+                !text.isEmpty else {
+                return true
+            }
+
+            if text.contains("http://") || text.contains("https://") {
+                return true
+            }
+
+            return false
+        }
 
         static func dominantLanguage(of block: ContentBlock) -> NLLanguage? {
             guard let text = textContent(of: block), text.count >= 20 else {

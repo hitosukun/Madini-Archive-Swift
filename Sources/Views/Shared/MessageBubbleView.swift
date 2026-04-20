@@ -391,7 +391,9 @@ struct MessageBubbleView: View, Equatable {
         if let cached = Self.renderItemsCache.object(forKey: key) {
             return cached.items
         }
-        let items = ForeignLanguageGrouping.group(contentBlocks)
+        let groupingMode: ForeignLanguageGrouping.GroupingMode =
+            message.isUser ? .allRuns : .leadingRunOnly
+        let items = ForeignLanguageGrouping.group(contentBlocks, mode: groupingMode)
         Self.renderItemsCache.setObject(RenderItemsBox(items), forKey: key)
         return items
     }

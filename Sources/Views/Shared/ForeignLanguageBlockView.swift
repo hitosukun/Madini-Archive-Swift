@@ -46,7 +46,7 @@ struct ForeignLanguageBlockView<Content: View>: View {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .strokeBorder(Color.secondary.opacity(0.18), lineWidth: 0.5)
         )
-        .opacity(expanded ? 1.0 : 0.55)
+        .opacity(expanded ? 1.0 : 0.78)
         .animation(.easeInOut(duration: 0.18), value: expanded)
     }
 
@@ -67,7 +67,7 @@ struct ForeignLanguageBlockView<Content: View>: View {
                     if !expanded {
                         Text("·")
                             .foregroundStyle(.tertiary)
-                        Text(previewSnippet)
+                        Text(collapsedLabelText)
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
@@ -112,6 +112,60 @@ struct ForeignLanguageBlockView<Content: View>: View {
         if combined.count <= 60 { return combined }
         let idx = combined.index(combined.startIndex, offsetBy: 60)
         return String(combined[..<idx]) + "…"
+    }
+
+    private var collapsedLabelText: String {
+        trailingJapaneseSummary ?? previewSnippet
+    }
+
+    /// Claude-style English preambles often end with a short Japanese
+    /// aside that works well as a collapsed summary ("いい質問…",
+    /// "要するに…"). Prefer showing that tail when present so the
+    /// folded header hints at the answer, not just the original English.
+    private var trailingJapaneseSummary: String? {
+        guard let lastText = blocks
+            .compactMap({ ForeignLanguageGrouping.textContent(of: $0) })
+            .reversed()
+            .first(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else {
+            return nil
+        }
+
+        let lastLine = lastText
+            .split(whereSeparator: \.isNewline)
+            .map(String.init)
+            .reversed()
+            .first(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
+            ?? lastText
+
+        guard let firstJapaneseIndex = lastLine.firstIndex(where: Self.containsJapaneseCharacter(in:)),
+              firstJapaneseIndex != lastLine.startIndex else {
+            return nil
+        }
+
+        let candidate = String(lastLine[firstJapaneseIndex...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard candidate.count >= 4 else { return nil }
+
+        if candidate.count <= 48 {
+            return candidate
+        }
+        let endIndex = candidate.index(candidate.startIndex, offsetBy: 48)
+        return String(candidate[..<endIndex]).trimmingCharacters(in: .whitespacesAndNewlines) + "…"
+    }
+
+    private static func containsJapaneseCharacter(in character: Character) -> Bool {
+        character.unicodeScalars.contains { scalar in
+            switch scalar.value {
+            case 0x3040...0x309F,    // Hiragana
+                 0x30A0...0x30FF,    // Katakana
+                 0x3400...0x4DBF,    // CJK Extension A
+                 0x4E00...0x9FFF,    // CJK Unified Ideographs
+                 0x3000...0x303F:    // CJK punctuation
+                return true
+            default:
+                return false
+            }
+        }
     }
 }
 
