@@ -112,8 +112,31 @@ struct MacOSRootView: View {
                     .padding(.bottom, 24)
             }
         }
+        // Trash-drop undo toast. Distinct overlay from `importToast`
+        // above so each has its own transition / z-order — stacking
+        // them in a single overlay branch would cause one to abort the
+        // other's transition when both change at the same time. The
+        // toast sits slightly above the import-toast anchor so a rare
+        // race (import finishes while undo window is still open) keeps
+        // both visible instead of the later one clipping the earlier.
+        .overlay(alignment: .bottom) {
+            if let snapshot = libraryViewModel.pendingTrashUndo {
+                TrashUndoToast(
+                    snapshot: snapshot,
+                    onUndo: {
+                        Task { await libraryViewModel.undoTrashPurge() }
+                    },
+                    onDismiss: {
+                        libraryViewModel.dismissTrashUndo()
+                    }
+                )
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+                .padding(.bottom, 72)
+            }
+        }
         .animation(.easeInOut(duration: 0.18), value: isJSONDropTargeted)
         .animation(.easeInOut(duration: 0.2), value: importToast?.id)
+        .animation(.easeInOut(duration: 0.2), value: libraryViewModel.pendingTrashUndo)
         .focusedSceneValue(\.libraryViewModel, libraryViewModel)
         // Make the Library view-model and archive events visible to the
         // right-pane tag editor (`ConversationTagsEditor`) without
@@ -1426,6 +1449,88 @@ private struct ImportToastView: View {
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundStyle(.orange)
         }
+    }
+}
+
+/// Bottom-of-window banner shown right after a Trash drop bulk-detached
+/// tags from one or more conversations. Gives the user an explicit Undo
+/// affordance for the brief window between action and commit — without
+/// this, a single stray drop could silently clear tag state the user
+/// spent time curating, which is the "foolproof" property asked for.
+///
+/// Separate from `ImportToastView` because the content shape differs
+/// (this one has interactive buttons and must accept hit-testing; the
+/// import toast is passive). Sharing a "Toast" chrome helper would be
+/// premature while there are only two; revisit if a third toast lands.
+private struct TrashUndoToast: View {
+    let snapshot: TrashTagsUndoSnapshot
+    let onUndo: () -> Void
+    let onDismiss: () -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "trash")
+                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(primaryMessage)
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(.primary)
+                if snapshot.detachedTagCount > 0 {
+                    Text(secondaryMessage)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            // The Undo affordance is the whole point of the toast —
+            // rendered as a bordered prominent button so it reads as
+            // the primary action even while the user is still looking
+            // at the drop origin (sidebar) rather than the toast.
+            Button("Undo", action: onUndo)
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .keyboardShortcut("z", modifiers: [.command])
+
+            // Dismiss without restoring — the user accepts the purge
+            // mid-window. `onDismiss` just clears `pendingTrashUndo`
+            // (no DB work), so this is cheap and non-destructive.
+            Button {
+                onDismiss()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Dismiss")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(.regularMaterial)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+        )
+        .shadow(color: .black.opacity(0.18), radius: 10, y: 4)
+    }
+
+    private var primaryMessage: String {
+        let count = snapshot.conversationCount
+        if count == 1 {
+            return "Cleared tags from 1 conversation"
+        }
+        return "Cleared tags from \(count) conversations"
+    }
+
+    private var secondaryMessage: String {
+        let count = snapshot.detachedTagCount
+        if count == 1 {
+            return "1 tag removed — Undo to restore"
+        }
+        return "\(count) tags removed — Undo to restore"
     }
 }
 

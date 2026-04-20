@@ -106,18 +106,31 @@ struct SidebarTagsSection: View {
                         onToggleAttach: { viewModel.toggleAttachmentToSelection(tag) },
                         onRename: { newName in viewModel.renameTag(tag, to: newName) },
                         onRequestDelete: { tagPendingDeletion = tag },
-                        onAttachDroppedConversations: { conversationIDs in
-                            // Multi-select drag: the user may drop several
-                            // selected cards at once. We attach sequentially
-                            // (each attach is its own transaction) and
-                            // refresh once at the end so tag counts / chip
-                            // strips update in one pass instead of N.
+                        onDropConversations: { conversationIDs in
+                            // Trash has been repurposed from "attach the
+                            // system Trash tag" to "clear every tag from
+                            // each dropped conversation". The view-model
+                            // path captures a snapshot for undo before
+                            // detaching, and publishes `pendingTrashUndo`
+                            // so the root-view toast can surface the
+                            // Undo button. Other tag rows follow the
+                            // original attach path (multi-select drag
+                            // delivers all selected ids at once; we
+                            // attach sequentially and refresh once at
+                            // the end so chip strips / tag counts update
+                            // in a single pass).
                             Task {
-                                for conversationID in conversationIDs {
-                                    await libraryViewModel.attachTag(
-                                        named: tag.name,
-                                        toConversation: conversationID
+                                if tag.systemKey == "trash" {
+                                    await libraryViewModel.purgeTags(
+                                        fromConversations: conversationIDs
                                     )
+                                } else {
+                                    for conversationID in conversationIDs {
+                                        await libraryViewModel.attachTag(
+                                            named: tag.name,
+                                            toConversation: conversationID
+                                        )
+                                    }
                                 }
                                 await viewModel.refreshCurrentConversationTags()
                                 await viewModel.refreshTags()
@@ -158,7 +171,11 @@ private struct SidebarTagRow: View {
     let onToggleAttach: () -> Void
     let onRename: (String) -> Void
     let onRequestDelete: () -> Void
-    let onAttachDroppedConversations: ([String]) -> Void
+    /// Receives the dropped conversation id set. The parent decides
+    /// whether this means "attach this tag" (normal rows) or "purge all
+    /// tags from these conversations" (Trash row) — the row doesn't
+    /// need to know which; it just forwards the ids.
+    let onDropConversations: ([String]) -> Void
 
     @State private var isHovering = false
     @State private var isEditing = false
@@ -179,50 +196,22 @@ private struct SidebarTagRow: View {
             // `.contentShape` + `.onTapGesture` makes the drag recognizer
             // the gesture-priority winner: a quick click still fires the
             // tap, but any movement-after-press flips to a drag instantly.
-            HStack(spacing: 8) {
-                Image(systemName: leadingIconName)
-                    .foregroundStyle(leadingIconColor)
-
-                if isEditing {
-                    TextField("Tag name", text: $draftName, onCommit: commitRename)
-                        .textFieldStyle(.roundedBorder)
-                } else {
-                    Text(tag.name)
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-                        .onTapGesture(count: 2) {
-                            // Trash is locked; don't let the user rename it via double-tap.
-                            if !tag.isSystem { beginEditing() }
-                        }
-                }
-
-                Text("\(tag.usageCount)")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-                    .monospacedDigit()
-
-                Spacer(minLength: 0)
-            }
-            .contentShape(Rectangle())
-            .draggable(TagDragPayload(name: tag.name)) {
-                // Neutral drag preview — matches the monochrome treatment of
-                // tag chips elsewhere (card row, saved-filter list). The `#`
-                // prefix + capsule shape already signal "tag" without needing
-                // a colored fill.
-                Text("#\(tag.name)")
-                    .font(.caption.weight(.semibold))
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(Capsule().fill(.thinMaterial))
-                    .overlay(
-                        Capsule().strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5)
-                    )
-                    .foregroundStyle(.primary)
-            }
-            // Tap-to-toggle-filter sits AFTER `.draggable` so the drag
-            // recognizer registers first; SwiftUI still routes a movement-
-            // free press to this tap handler on release.
-            .onTapGesture { onToggleFilter() }
+            tagNameContent
+                // Trash is a drop target only — it represents the "clear
+                // every tag" lane, and letting the user pick it up would
+                // let them drop "#Trash" onto a conversation, which is
+                // the old semantics we're retiring. Skip `.draggable`
+                // here so the row still accepts drops via the
+                // `.dropDestination` modifier below but cannot be the
+                // source of a drag.
+                .modifier(TagRowDragSourceModifier(
+                    isDraggable: !isTrash,
+                    tagName: tag.name
+                ))
+                // Tap-to-toggle-filter sits AFTER `.draggable` so the drag
+                // recognizer registers first; SwiftUI still routes a movement-
+                // free press to this tap handler on release.
+                .onTapGesture { onToggleFilter() }
 
             Button(action: onToggleAttach) {
                 Image(systemName: isAttachedToSelection ? "checkmark.circle.fill" : "plus.circle")
@@ -271,13 +260,15 @@ private struct SidebarTagRow: View {
                 )
         )
         .onHover { isHovering = $0 }
-        // Accept dragged conversation card(s) → attach this tag to each.
-        // When the drag originated from a multi-selected List row, SwiftUI
-        // delivers one payload per selected item, so we forward the full
-        // array to the handler rather than just the first element.
-        // (The reverse direction — picking a tag UP from this row — is
-        // handled by `.draggable` on the inner tag-name HStack above, so
-        // it doesn't fight with the +/− attach button or the menu.)
+        // Accept dragged conversation card(s). For normal rows the
+        // parent forwards the ids to `attachTag`; for the Trash row the
+        // parent switches to `purgeTags` (see `SidebarTagsSection.tagList`).
+        // This row doesn't branch on `isTrash` itself — that decision
+        // lives one layer up with the view-model calls.
+        //
+        // When the drag originated from a multi-selected List/Table row,
+        // SwiftUI delivers one payload per selected item, so we flatten
+        // the payloads and dedupe ids before forwarding.
         .dropDestination(for: ConversationDragPayload.self) { payloads, _ in
             guard !payloads.isEmpty else { return false }
             let conversationIDs = payloads
@@ -287,11 +278,43 @@ private struct SidebarTagRow: View {
                         partialResult.append(id)
                     }
                 }
-            onAttachDroppedConversations(conversationIDs)
+            onDropConversations(conversationIDs)
             return true
         } isTargeted: { newValue in
             if isDropTargeted != newValue { isDropTargeted = newValue }
         }
+    }
+
+    /// Tag-name area — doubles as the filter-toggle tap target and (for
+    /// non-Trash rows) the drag handle. Extracted as a computed property
+    /// so the `TagRowDragSourceModifier` below can gate `.draggable`
+    /// cleanly without duplicating the layout.
+    private var tagNameContent: some View {
+        HStack(spacing: 8) {
+            Image(systemName: leadingIconName)
+                .foregroundStyle(leadingIconColor)
+
+            if isEditing {
+                TextField("Tag name", text: $draftName, onCommit: commitRename)
+                    .textFieldStyle(.roundedBorder)
+            } else {
+                Text(tag.name)
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .onTapGesture(count: 2) {
+                        // Trash is locked; don't let the user rename it via double-tap.
+                        if !tag.isSystem { beginEditing() }
+                    }
+            }
+
+            Text("\(tag.usageCount)")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .monospacedDigit()
+
+            Spacer(minLength: 0)
+        }
+        .contentShape(Rectangle())
     }
 
     /// Leading glyph differentiates Trash (rescue lane) from regular
@@ -322,5 +345,39 @@ private struct SidebarTagRow: View {
             onRename(draftName)
         }
         isEditing = false
+    }
+}
+
+/// Conditionally attaches `.draggable(TagDragPayload)` to a view. Kept
+/// as a ViewModifier (instead of an inline `if`) so the return type
+/// stays the same whether or not the row is draggable — without this,
+/// SwiftUI's Group-based branching would change the view identity when
+/// a tag is retroactively promoted/demoted to/from system status.
+/// Right now only Trash flips the gate, but keeping the identity stable
+/// is cheap insurance against future system tags.
+private struct TagRowDragSourceModifier: ViewModifier {
+    let isDraggable: Bool
+    let tagName: String
+
+    func body(content: Content) -> some View {
+        if isDraggable {
+            content.draggable(TagDragPayload(name: tagName)) {
+                // Neutral drag preview — matches the monochrome treatment of
+                // tag chips elsewhere (card row, saved-filter list). The `#`
+                // prefix + capsule shape already signal "tag" without needing
+                // a colored fill.
+                Text("#\(tagName)")
+                    .font(.caption.weight(.semibold))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Capsule().fill(.thinMaterial))
+                    .overlay(
+                        Capsule().strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5)
+                    )
+                    .foregroundStyle(.primary)
+            }
+        } else {
+            content
+        }
     }
 }

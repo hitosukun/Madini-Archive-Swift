@@ -67,6 +67,32 @@ final class LibraryViewModel {
     /// Keyed by conversation id; used to render chip strips on each card.
     var conversationTags: [String: [TagEntry]] = [:]
 
+    /// Snapshot of per-conversation tag state, captured right before a
+    /// Trash drop bulk-detaches tags. Lives on the view model rather
+    /// than the sidebar because the "Undo" toast is rendered at the
+    /// root-view level (bottom overlay on `workspaceSplitView`) — state
+    /// living on the drop source would not survive the sidebar
+    /// unmounting between drops, and the root already `@Bindable`s
+    /// this view model so the toast's observation wiring is free.
+    ///
+    /// `nil` when no recent Trash drop is eligible for undo; set to a
+    /// non-nil value when `purgeTags(fromConversations:)` completes,
+    /// cleared by `undoTrashPurge()`, `dismissTrashUndo()`, or an
+    /// auto-dismiss timer.
+    var pendingTrashUndo: TrashTagsUndoSnapshot?
+
+    /// Background task that clears `pendingTrashUndo` after a fixed
+    /// grace period. Held so a new Trash drop can cancel the pending
+    /// dismiss and start a fresh countdown — otherwise the second drop
+    /// would inherit a shortened window from the first drop's timer.
+    private var trashUndoDismissTask: Task<Void, Never>?
+
+    /// Seconds the undo toast stays on screen before silently clearing
+    /// itself. Long enough to register "wait, I didn't mean that" and
+    /// reach the Undo button; short enough that it doesn't overlap the
+    /// next drag gesture or linger visually.
+    private static let trashUndoTimeoutSeconds: UInt64 = 6
+
     // MARK: - Viewer-mode conversation state
     //
     // Viewer Mode is a focused "reading" layout driven by the **right-pane
@@ -867,6 +893,93 @@ final class LibraryViewModel {
         }
     }
 
+    // MARK: - Trash drop (bulk tag purge) + undo
+
+    /// Drop-onto-Trash handler. Repurposes the Trash sidebar row from
+    /// "attach Trash tag" to "clear every tag from each dropped
+    /// conversation" — the user wanted a foolproof untag lane that
+    /// doesn't itself pollute the tag graph with a system marker. The
+    /// pre-purge tag state is captured in `pendingTrashUndo` so the
+    /// root-view toast can restore it if the user hits Undo.
+    ///
+    /// Per-tag detach walks through the existing
+    /// `detachTag(named:fromConversation:)` call for consistency with
+    /// the rest of the app; a batched SQL path would be faster but
+    /// would duplicate the repository surface just for one call site.
+    func purgeTags(fromConversations conversationIDs: [String]) async {
+        guard !conversationIDs.isEmpty else { return }
+
+        // 1. Snapshot the current tag list for each target. We read
+        //    from the in-memory `conversationTags` map — drops only
+        //    originate from visible rows (list or table), which are
+        //    guaranteed to have their tag bindings populated via
+        //    `refreshConversationTags` during load. Rows missing from
+        //    the map contribute an empty tag list (nothing to undo).
+        let entries: [TrashTagsUndoSnapshot.Entry] = conversationIDs.map { id in
+            TrashTagsUndoSnapshot.Entry(
+                conversationID: id,
+                tagNames: (conversationTags[id] ?? []).map(\.name)
+            )
+        }
+
+        // 2. Detach every tag from every target.
+        for entry in entries where !entry.tagNames.isEmpty {
+            for name in entry.tagNames {
+                await detachTag(named: name, fromConversation: entry.conversationID)
+            }
+        }
+
+        // 3. Publish the snapshot for the toast and schedule an
+        //    auto-dismiss. A previous toast's pending dismiss is
+        //    cancelled so the new one starts on a fresh timer.
+        trashUndoDismissTask?.cancel()
+        pendingTrashUndo = TrashTagsUndoSnapshot(entries: entries)
+
+        let timeout = LibraryViewModel.trashUndoTimeoutSeconds
+        trashUndoDismissTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: timeout * 1_000_000_000)
+            // `Task.sleep` throws on cancellation — the `try?` swallows
+            // that, so we still need an explicit cancellation check
+            // before touching state in case the user already undid /
+            // dismissed while we were asleep.
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard let self, self.trashUndoDismissTask != nil else { return }
+                self.pendingTrashUndo = nil
+                self.trashUndoDismissTask = nil
+            }
+        }
+    }
+
+    /// Re-attach every tag captured in the pending snapshot and clear
+    /// the toast. Driven by the Undo button inside `TrashUndoToast`.
+    /// The attach loop uses the normal `attachTag(named:toConversation:)`
+    /// path, which also handles the "create the tag if it no longer
+    /// exists" edge — the user-triggered purge doesn't delete tag
+    /// rows, but a separate sidebar Delete action between purge and
+    /// undo could, and the attach path transparently recreates.
+    func undoTrashPurge() async {
+        guard let snapshot = pendingTrashUndo else { return }
+        pendingTrashUndo = nil
+        trashUndoDismissTask?.cancel()
+        trashUndoDismissTask = nil
+
+        for entry in snapshot.entries {
+            for name in entry.tagNames {
+                await attachTag(named: name, toConversation: entry.conversationID)
+            }
+        }
+    }
+
+    /// Dismiss the undo toast without restoring tags (user chose to
+    /// accept the purge by clicking the toast's close button or
+    /// letting it time out mid-session).
+    func dismissTrashUndo() {
+        pendingTrashUndo = nil
+        trashUndoDismissTask?.cancel()
+        trashUndoDismissTask = nil
+    }
+
     private func refreshSidebarState() async {
         do {
             async let facets = loadSourceFacets()
@@ -1129,6 +1242,32 @@ extension LibraryViewModel {
         let ids = Array(selectedConversationIDs)
         return ids.isEmpty ? [conversationID] : ids
     }
+}
+
+/// Captured tag state from a Trash-drop bulk detach, consumed by the
+/// root-view undo toast. Each entry remembers one conversation's tags at
+/// the moment of the purge; `undoTrashPurge()` walks the array and
+/// re-attaches every `tagNames` entry back to its `conversationID`.
+///
+/// Array-of-struct (not `[String: [String]]`) preserves the user's drag
+/// order — matters only incidentally for restore, but also makes the
+/// "N conversations cleared" count a stable `entries.count` even when
+/// two dragged rows happen to share an id (e.g. a future duplicate-drop
+/// safeguard).
+struct TrashTagsUndoSnapshot: Equatable, Sendable {
+    struct Entry: Equatable, Sendable {
+        let conversationID: String
+        let tagNames: [String]
+    }
+
+    let entries: [Entry]
+
+    var conversationCount: Int { entries.count }
+
+    /// Total number of (conversation, tag) pairs — informational, used
+    /// by the toast when it wants to say "N tags removed" instead of
+    /// "N conversations cleared".
+    var detachedTagCount: Int { entries.reduce(0) { $0 + $1.tagNames.count } }
 }
 
 struct LibrarySourceFacet: Identifiable, Hashable {
