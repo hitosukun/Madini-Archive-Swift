@@ -100,11 +100,14 @@ final class GRDBProjectRepository: ProjectRepository, @unchecked Sendable {
         guard !trimmed.isEmpty else { throw ProjectRepositoryError.emptyName }
 
         return try await GRDBAsync.write(to: dbQueue) { db in
-            let updated = try db.execute(
+            try db.execute(
                 sql: "UPDATE project SET name = ? WHERE id = ?",
                 arguments: [trimmed, id.rawValue]
             )
-            _ = updated // changesCount is on db, not on the return
+            // Deliberately no changesCount check here — the followup
+            // SELECT below returns `notFound` if the id didn't exist,
+            // so an update that matched zero rows surfaces as the same
+            // error the caller already handles.
             guard let row = try Row.fetchOne(
                 db,
                 sql: """

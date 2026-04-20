@@ -784,6 +784,7 @@ struct MacOSRootView: View {
 private struct UnifiedLibrarySidebar: View {
     @Bindable var viewModel: LibraryViewModel
     let dataSource: AppServices.DataSource
+    @EnvironmentObject private var services: AppServices
     @State private var expandedSources: Set<String> = []
     /// Separate expanded state for the archive.db entry so it doesn't collide
     /// with source-facet ids (they share the `expandedSources` key space
@@ -794,6 +795,20 @@ private struct UnifiedLibrarySidebar: View {
     /// expanded on first launch — a new user isn't greeted by a sidebar
     /// full of collapsed headers.
     @State private var collapsedSections: Set<String> = []
+
+    /// View-model for the Projects + Triage sections. Lives here
+    /// (rather than in each section view) so both sections share one
+    /// repository fetch — a single `loadInitial()` populates the
+    /// project list AND the count overlay that drives both sections'
+    /// badges. Nil until `.task` resolves on first appearance.
+    @State private var projectsViewModel: SidebarProjectsViewModel?
+
+    /// Currently-selected project scope. Drives the row selection
+    /// highlight in the Projects + Triage sections. **Not yet wired
+    /// into `LibraryViewModel.filter`** — the middle-pane filter
+    /// integration lands in a follow-up so this commit is reviewable
+    /// against the HTML mock without entangling the conversation list.
+    @State private var projectScope: ProjectScope = .all
 
     var body: some View {
         ScrollView {
@@ -863,6 +878,39 @@ private struct UnifiedLibrarySidebar: View {
                     // arrow reveals one checkbox per imported JSON file so the
                     // user can narrow the library to a specific import batch.
                     archiveDataSourceRow
+                }
+
+                // PROJECTS + TRIAGE — data layer wired to
+                // `AppServices.projects`; selection is local to this
+                // view and does not yet plumb through to the
+                // middle-pane filter. Inserted directly under Library
+                // so the visual hierarchy reads LIBRARY → PROJECTS →
+                // TRIAGE → SOURCES, matching the HTML mock. (The
+                // middle-pane filter integration — adding a `scope`
+                // or `projects` dimension to `ArchiveSearchFilter` —
+                // is the next landing; doing it in this commit would
+                // mix "sidebar renders" with "filtering changes" and
+                // make the review harder.)
+                section(title: "Projects") {
+                    if let projectsViewModel {
+                        SidebarProjectsSection(
+                            viewModel: projectsViewModel,
+                            selection: $projectScope
+                        )
+                    } else {
+                        ProgressView().controlSize(.small)
+                    }
+                }
+
+                section(title: "Triage") {
+                    if let projectsViewModel {
+                        SidebarTriageSection(
+                            viewModel: projectsViewModel,
+                            selection: $projectScope
+                        )
+                    } else {
+                        ProgressView().controlSize(.small)
+                    }
                 }
 
                 section(title: "Sources") {
@@ -976,6 +1024,20 @@ private struct UnifiedLibrarySidebar: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .onAppear {
             expandedSources = Set(viewModel.sourceFacets.map(\.value))
+        }
+        // Lazy-initialize the Projects/Triage view-model on first
+        // appearance so it resolves `services` from the environment
+        // (which isn't available in an inline property initializer).
+        // Idempotent: if the sidebar re-appears after a column
+        // toggle, the cached VM is reused and `loadInitial` simply
+        // re-fetches in case the underlying data moved.
+        .task {
+            if projectsViewModel == nil {
+                projectsViewModel = SidebarProjectsViewModel(
+                    projectRepository: services.projects
+                )
+            }
+            await projectsViewModel?.loadInitial()
         }
     }
 
