@@ -142,64 +142,71 @@ struct ReaderWorkspaceView: View {
 
 }
 
-/// **The navigation bar.** Single connected capsule combining the
-/// conversation-title pulldown and the prompt-outline pulldown — the
-/// two halves are referred to together as "the navigation bar"
-/// throughout the app. Previously rendered as two separate pills; the
-/// user asked them merged into one window so "what am I reading /
-/// where am I in it" reads as a single piece of chrome.
+/// **The navigation bar.** Xcode-style cascade breadcrumb rendered
+/// inside a soft capsule: `[thread] > [prompt]`, with the "1 / N"
+/// prompt counter hanging off outside the capsule as a separate
+/// sibling.
 ///
-/// Layout, left to right:
+/// **Design rules (anchored in this order):**
 ///
-///   [ Title ] > [ Prompt ]   N / M
-///
-/// Single capsule, single thin-material fill. A `>` chevron sits
-/// between the two halves so the chip reads as a "Title › Prompt"
-/// breadcrumb rather than two unrelated buttons under one capsule.
+///   1. Right-side toolbar buttons never disappear. This pill is the
+///      only part of the toolbar that compresses under window-width
+///      pressure. The `.primaryAction` cluster (share, mode picker)
+///      stays pinned at its natural size.
+///   2. The pill shrinks via *truncation*, not via layout break. Text
+///      gets `lineLimit(1) + .truncationMode(.tail)`, and the chevron
+///      and counter are `fixedSize()` so they never distort.
+///   3. Within the pill, the prompt half yields first (lower
+///      `layoutPriority`), the thread half yields second, the chevron
+///      never yields.
+///   4. The "1 / N" counter is external to the breadcrumb capsule so
+///      it stays readable even when the thread/prompt labels are
+///      ellipsized. It's a higher `layoutPriority` sibling so it
+///      survives longer than the capsule body.
+///   5. The capsule itself uses `ViewThatFits` with 4 tiers
+///      (full → medium → compact → thread-only) to gracefully fall
+///      back when even tail-truncation would produce unreadable
+///      output. Each tier has bounded segment max widths so
+///      `ViewThatFits` can make a clean choice based on the proposed
+///      width from the toolbar.
 ///
 /// Mounted into the native window toolbar's `.principal` slot by
 /// `MacOSRootView.workspaceSplitView` so it's present in every mode
-/// (table included) and its x-coordinate doesn't jump as the user
-/// cascades through middle-pane modes.
+/// and its x-coordinate doesn't jump as the user cascades through
+/// middle-pane modes.
 struct ReaderHeaderActivityPill: View {
     private enum HoveredSegment {
         case thread
         case prompt
     }
 
-    // Minimum widths are pushed to the actual floor — the pill is
-    // allowed to compress to "just a chevron-sized nub" so the
-    // right-hand `.primaryAction` cluster (share button + mode
-    // picker) stays visible even when the window is dragged almost
-    // down to the sidebar's own minimum width.
-    //
-    // Why this aggressive. SwiftUI's toolbar layout treats the
-    // `.principal` item's minimum width as a hard floor: whatever we
-    // declare here is what the toolbar insists on reserving between
-    // the sidebar toggle and the `.primaryAction` cluster. Any floor
-    // above a few glyphs pushes share / mode picker into the »
-    // overflow menu. The user's explicit rule is "primaryAction
-    // buttons must not disappear no matter how narrow the window
-    // gets," so we take the pill's compressibility as far as it
-    // goes.
-    //
-    // The `segmentLabel` helper already truncates via
-    // `.lineLimit(1) + .truncationMode(.tail)`, so a ~20pt segment
-    // renders as `…` + chevron — it looks like a nub, but it's
-    // still a clickable target that opens the popover with the full
-    // list. At the pill level, ~40pt holds one truncated segment +
-    // chevron divider. Ideal / max are unchanged so the pill reads
-    // at its original proportions on normal-width windows and only
-    // compresses under real pressure.
-    private static let titleSegmentMinWidth: CGFloat = 20
-    private static let titleSegmentIdealWidth: CGFloat = 220
-    private static let titleSegmentMaxWidth: CGFloat = 300
-    private static let promptSegmentMinWidth: CGFloat = 20
-    private static let promptSegmentIdealWidth: CGFloat = 230
-    private static let promptSegmentMaxWidth: CGFloat = 320
-    private static let pillMinWidth: CGFloat = 40
-    private static let pillIdealWidth: CGFloat = 472
-    private static let pillMaxWidth: CGFloat = 626
+    /// Tier presets for `ViewThatFits`. `full` is what shows on
+    /// comfortably wide windows; `threadOnly` is the last fallback
+    /// before everything collapses to just the counter. Each tier
+    /// declares the max width each text segment is allowed to take —
+    /// below those caps the segments naturally shrink via truncation.
+    private struct Tier {
+        let threadMaxWidth: CGFloat
+        let promptMaxWidth: CGFloat?  // nil = prompt replaced by "…"
+        let showsChevron: Bool
+    }
+
+    private static let tiers: [Tier] = [
+        // Comfortable width: both segments read at their natural size.
+        Tier(threadMaxWidth: 300, promptMaxWidth: 320, showsChevron: true),
+        // Medium width: segments cap earlier → tail-truncation kicks in.
+        Tier(threadMaxWidth: 200, promptMaxWidth: 200, showsChevron: true),
+        // Compact width: prompt half is aggressively squeezed first.
+        Tier(threadMaxWidth: 160, promptMaxWidth: 90,  showsChevron: true),
+        // Very narrow: prompt is dropped entirely, replaced by "…" —
+        // the thread title still reads + chevron signals "there's more
+        // under the hood, click to see the full prompt list."
+        Tier(threadMaxWidth: 160, promptMaxWidth: nil, showsChevron: true),
+        // Last resort: thread alone, no chevron. Popover still works
+        // via the thread button → user can navigate from here.
+        Tier(threadMaxWidth: 120, promptMaxWidth: nil, showsChevron: false),
+    ]
+
     private static let segmentHeight: CGFloat = 22
     private static let titlePopoverMinWidth: CGFloat = 300
     private static let titlePopoverMaxWidth: CGFloat = 420
@@ -227,62 +234,30 @@ struct ReaderHeaderActivityPill: View {
 
     @State private var isThreadPopoverPresented = false
     @State private var isPromptPopoverPresented = false
-    @State private var measuredThreadSegmentWidth: CGFloat = Self.titleSegmentIdealWidth
-    @State private var measuredPromptSegmentWidth: CGFloat = Self.promptSegmentIdealWidth
     @State private var hoveredSegment: HoveredSegment?
 
     var body: some View {
-        // Xcode-style cascade breadcrumb: [thread popover] > [prompt popover]
-        // in a soft capsule, with the positional counter pulled OUT
-        // of the capsule and rendered as a separate trailing sibling.
+        // Two siblings in one horizontal stack:
+        //   * `breadcrumbCapsule` — the shrinkable part. `ViewThatFits`
+        //     picks a tier based on the width the toolbar proposes.
+        //   * `counterView` — a `fixedSize`, high-`layoutPriority`
+        //     annotation that rides alongside. It survives every
+        //     reasonable shrink, so "how far in am I" stays legible
+        //     even when the thread/prompt labels are ellipsized.
         //
-        // Information hierarchy: the pill carries the navigation path
-        // (thread > prompt), nothing else. Meta like "1 / 5" doesn't
-        // belong in the path — it's state about the current prompt,
-        // not a step of the breadcrumb — so it sits outside the
-        // capsule where the eye can separate "where am I" from "how
-        // far in am I".
-        //
-        // Visual weight: thread is the primary axis (heavier font,
-        // primary color), prompt is subordinate (regular weight,
-        // secondary color). Reads "thread → prompt" rather than two
-        // equal-rank hops.
-        //
-        // Each segment is a full-width button inside the capsule so the
-        // hit target is the bar interior, not just the rendered text.
-        // The popovers are also pinned to the exact same width as
-        // their source segment so opening them does not suddenly widen
-        // the navigation chrome.
+        // `layoutPriority` difference (capsule 1 vs counter 2) tells
+        // SwiftUI: if there's not enough room for both at their ideal
+        // widths, give the counter its natural size first and squeeze
+        // the capsule. The capsule's internal `ViewThatFits` then
+        // picks the tightest tier that fits the squeezed width.
         HStack(spacing: 8) {
-            HStack(spacing: 2) {
-                threadMenu
-                chevron
-                promptMenu
-            }
-            .padding(.horizontal, 4)
-            .frame(height: 24)
-            .background(
-                Capsule(style: .continuous)
-                    .fill(.ultraThinMaterial)
-                    .opacity(0.5)
-            )
-            .overlay(
-                Capsule(style: .continuous)
-                    .strokeBorder(Color.primary.opacity(0.03), lineWidth: 0.5)
-            )
-            .frame(
-                minWidth: Self.pillMinWidth,
-                idealWidth: Self.pillIdealWidth,
-                maxWidth: Self.pillMaxWidth
-            )
+            breadcrumbCapsule
+                .layoutPriority(1)
 
             if !promptOutline.isEmpty {
-                // Positional meta, outside the breadcrumb capsule.
-                // Tabular digits keep the column width stable as the
-                // numerator grows past single digits.
-                Text(promptCounterText)
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                counterView
+                    .layoutPriority(2)
+                    .fixedSize()
             }
         }
         .animation(.easeInOut(duration: 0.12), value: hoveredSegment == .thread)
@@ -291,9 +266,66 @@ struct ReaderHeaderActivityPill: View {
         .animation(.easeInOut(duration: 0.12), value: isPromptPopoverPresented)
     }
 
+    // MARK: - Breadcrumb capsule (tiered)
+
+    /// The whole breadcrumb body, picking the first tier that fits
+    /// the proposed width. Capsule shell is shared across tiers so the
+    /// background / border geometry stays identical through the stage
+    /// transitions.
+    private var breadcrumbCapsule: some View {
+        ViewThatFits(in: .horizontal) {
+            ForEach(Self.tiers.indices, id: \.self) { index in
+                tierLayout(Self.tiers[index])
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func tierLayout(_ tier: Tier) -> some View {
+        HStack(spacing: 2) {
+            threadMenu(maxWidth: tier.threadMaxWidth)
+                // Thread is the primary axis — shrinks second.
+                .layoutPriority(2)
+
+            if tier.showsChevron {
+                chevron
+                    // Chevron is a glyph: never compress it, it should
+                    // read crisp at every tier.
+                    .fixedSize()
+            }
+
+            if let promptMax = tier.promptMaxWidth {
+                promptMenu(maxWidth: promptMax)
+                    // Prompt is the subordinate axis — shrinks first.
+                    .layoutPriority(1)
+            } else if tier.showsChevron {
+                // Tier dropped the prompt entirely. Emit a tiny
+                // disclosure-style affordance so the user still knows
+                // there's a prompt pulldown behind the chevron.
+                // Rendered as a popover-opening button so they can
+                // still reach the outline from this width.
+                collapsedPromptStub
+                    .fixedSize()
+            }
+        }
+        .padding(.horizontal, 4)
+        .frame(height: 24)
+        .background(capsuleBackground)
+    }
+
+    private var capsuleBackground: some View {
+        ZStack {
+            Capsule(style: .continuous)
+                .fill(.ultraThinMaterial)
+                .opacity(0.5)
+            Capsule(style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.03), lineWidth: 0.5)
+        }
+    }
+
     // MARK: - Thread segment (primary axis)
 
-    private var threadMenu: some View {
+    private func threadMenu(maxWidth: CGFloat) -> some View {
         Button {
             guard activeDetail != nil || !conversations.isEmpty else { return }
             isPromptPopoverPresented = false
@@ -307,22 +339,15 @@ struct ReaderHeaderActivityPill: View {
             )
         }
         .buttonStyle(.plain)
-        .frame(
-            minWidth: Self.titleSegmentMinWidth,
-            idealWidth: Self.titleSegmentIdealWidth,
-            maxWidth: Self.titleSegmentMaxWidth,
-            minHeight: Self.segmentHeight,
-            maxHeight: Self.segmentHeight
-        )
+        // `maxWidth` is the tier's budget for this segment. No
+        // `minWidth` / `idealWidth` — SwiftUI's natural sizing under
+        // `lineLimit(1) + truncationMode(.tail)` already produces a
+        // well-behaved min (the tail ellipsis), and leaving `min/ideal`
+        // unset lets the HStack's layout-priority distribution actually
+        // take effect. Height is pinned so the capsule doesn't jump.
+        .frame(maxWidth: maxWidth)
+        .frame(minHeight: Self.segmentHeight, maxHeight: Self.segmentHeight)
         .background(segmentBackground(isHighlighted: isThreadHighlighted))
-        .background(widthReader(ThreadSegmentWidthPreferenceKey.self))
-        .onPreferenceChange(ThreadSegmentWidthPreferenceKey.self) { newWidth in
-            measuredThreadSegmentWidth = clamped(
-                newWidth,
-                min: Self.titleSegmentMinWidth,
-                max: Self.titleSegmentMaxWidth
-            )
-        }
         .onHover { isHovering in
             hoveredSegment = isHovering ? .thread : (hoveredSegment == .thread ? nil : hoveredSegment)
         }
@@ -333,7 +358,7 @@ struct ReaderHeaderActivityPill: View {
                 conversations: conversations,
                 activeConversationID: activeDetail?.summary.id,
                 rowWidth: popoverWidth(
-                    for: measuredThreadSegmentWidth,
+                    for: maxWidth,
                     min: Self.titlePopoverMinWidth,
                     max: Self.titlePopoverMaxWidth
                 ),
@@ -348,7 +373,7 @@ struct ReaderHeaderActivityPill: View {
 
     // MARK: - Prompt segment (subordinate)
 
-    private var promptMenu: some View {
+    private func promptMenu(maxWidth: CGFloat) -> some View {
         Button {
             guard !promptOutline.isEmpty else { return }
             isThreadPopoverPresented = false
@@ -362,22 +387,9 @@ struct ReaderHeaderActivityPill: View {
             )
         }
         .buttonStyle(.plain)
-        .frame(
-            minWidth: Self.promptSegmentMinWidth,
-            idealWidth: Self.promptSegmentIdealWidth,
-            maxWidth: Self.promptSegmentMaxWidth,
-            minHeight: Self.segmentHeight,
-            maxHeight: Self.segmentHeight
-        )
+        .frame(maxWidth: maxWidth)
+        .frame(minHeight: Self.segmentHeight, maxHeight: Self.segmentHeight)
         .background(segmentBackground(isHighlighted: isPromptHighlighted))
-        .background(widthReader(PromptSegmentWidthPreferenceKey.self))
-        .onPreferenceChange(PromptSegmentWidthPreferenceKey.self) { newWidth in
-            measuredPromptSegmentWidth = clamped(
-                newWidth,
-                min: Self.promptSegmentMinWidth,
-                max: Self.promptSegmentMaxWidth
-            )
-        }
         .onHover { isHovering in
             hoveredSegment = isHovering ? .prompt : (hoveredSegment == .prompt ? nil : hoveredSegment)
         }
@@ -388,7 +400,7 @@ struct ReaderHeaderActivityPill: View {
                 prompts: promptOutline,
                 selectedPromptID: selectedPromptID,
                 rowWidth: popoverWidth(
-                    for: measuredPromptSegmentWidth,
+                    for: maxWidth,
                     min: Self.promptPopoverMinWidth,
                     max: Self.promptPopoverMaxWidth
                 ),
@@ -398,6 +410,58 @@ struct ReaderHeaderActivityPill: View {
                 }
             )
         }
+    }
+
+    // MARK: - Collapsed prompt stub
+
+    /// Renders in very narrow tiers where the prompt label is dropped.
+    /// Keeps the popover reachable — tapping the "…" still opens the
+    /// prompt outline so the user can navigate even when there's no
+    /// room for the prompt text.
+    private var collapsedPromptStub: some View {
+        Button {
+            guard !promptOutline.isEmpty else { return }
+            isThreadPopoverPresented = false
+            isPromptPopoverPresented.toggle()
+        } label: {
+            Text("…")
+                .font(.subheadline.weight(.regular))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 6)
+                .frame(minHeight: Self.segmentHeight, maxHeight: Self.segmentHeight)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .background(segmentBackground(isHighlighted: isPromptHighlighted))
+        .onHover { isHovering in
+            hoveredSegment = isHovering ? .prompt : (hoveredSegment == .prompt ? nil : hoveredSegment)
+        }
+        .disabled(promptOutline.isEmpty)
+        .help("プロンプトを切り替え")
+        .popover(isPresented: $isPromptPopoverPresented, arrowEdge: .bottom) {
+            PromptOutlinePopover(
+                prompts: promptOutline,
+                selectedPromptID: selectedPromptID,
+                rowWidth: Self.promptPopoverMinWidth,
+                onSelect: { id in
+                    onSelectPrompt(id)
+                    isPromptPopoverPresented = false
+                }
+            )
+        }
+    }
+
+    // MARK: - Counter (independent sibling)
+
+    /// Positional meta outside the breadcrumb capsule. Tabular digits
+    /// keep the column width stable as the numerator grows past single
+    /// digits. `fixedSize()` + higher `layoutPriority` at the call
+    /// site keeps it visible as the capsule shrinks.
+    private var counterView: some View {
+        Text(promptCounterText)
+            .font(.caption.monospacedDigit())
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
     }
 
     // MARK: - Chevron divider
@@ -442,12 +506,6 @@ struct ReaderHeaderActivityPill: View {
             )
     }
 
-    private func widthReader<Key: PreferenceKey>(_ key: Key.Type) -> some View where Key.Value == CGFloat {
-        GeometryReader { proxy in
-            Color.clear.preference(key: key, value: proxy.size.width)
-        }
-    }
-
     private func clamped(_ value: CGFloat, min: CGFloat, max: CGFloat) -> CGFloat {
         Swift.max(min, Swift.min(max, value))
     }
@@ -482,22 +540,6 @@ struct ReaderHeaderActivityPill: View {
         guard !promptOutline.isEmpty else { return "—" }
         let current = promptOutline.firstIndex(where: { $0.id == selectedPromptID }).map { $0 + 1 } ?? 1
         return "\(current) / \(promptOutline.count)"
-    }
-}
-
-private struct ThreadSegmentWidthPreferenceKey: PreferenceKey {
-    static let defaultValue: CGFloat = 0
-
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
-    }
-}
-
-private struct PromptSegmentWidthPreferenceKey: PreferenceKey {
-    static let defaultValue: CGFloat = 0
-
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
     }
 }
 
