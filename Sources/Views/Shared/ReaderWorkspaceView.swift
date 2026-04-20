@@ -191,20 +191,29 @@ struct ReaderHeaderActivityPill: View {
         let showsChevron: Bool
     }
 
+    // Tier widths are applied via `.frame(width:)` at the segment
+    // level, which pins *both* ideal and max. That's deliberate — if
+    // we used `maxWidth` alone, every tier would report the same
+    // natural text width as its ideal, and `ViewThatFits` would never
+    // be able to tell them apart (it'd always pick tier 0 even when
+    // there's no room for it). Fixed widths give `ViewThatFits` a
+    // clean ideal-size ladder to descend.
     private static let tiers: [Tier] = [
-        // Comfortable width: both segments read at their natural size.
-        Tier(threadMaxWidth: 300, promptMaxWidth: 320, showsChevron: true),
+        // Comfortable width: both segments have room to breathe.
+        Tier(threadMaxWidth: 260, promptMaxWidth: 280, showsChevron: true),
         // Medium width: segments cap earlier → tail-truncation kicks in.
-        Tier(threadMaxWidth: 200, promptMaxWidth: 200, showsChevron: true),
+        Tier(threadMaxWidth: 180, promptMaxWidth: 160, showsChevron: true),
         // Compact width: prompt half is aggressively squeezed first.
-        Tier(threadMaxWidth: 160, promptMaxWidth: 90,  showsChevron: true),
+        Tier(threadMaxWidth: 120, promptMaxWidth: 70,  showsChevron: true),
         // Very narrow: prompt is dropped entirely, replaced by "…" —
         // the thread title still reads + chevron signals "there's more
         // under the hood, click to see the full prompt list."
-        Tier(threadMaxWidth: 160, promptMaxWidth: nil, showsChevron: true),
-        // Last resort: thread alone, no chevron. Popover still works
-        // via the thread button → user can navigate from here.
-        Tier(threadMaxWidth: 120, promptMaxWidth: nil, showsChevron: false),
+        Tier(threadMaxWidth: 120, promptMaxWidth: nil, showsChevron: true),
+        // Thread-only, still with chevron-like "…" affordance dropped.
+        Tier(threadMaxWidth: 90, promptMaxWidth: nil, showsChevron: false),
+        // Absolute last resort — barely-there sliver that just shows
+        // "…" truncation. Counter + right toolbar buttons stay visible.
+        Tier(threadMaxWidth: 48, promptMaxWidth: nil, showsChevron: false),
     ]
 
     private static let segmentHeight: CGFloat = 22
@@ -339,13 +348,13 @@ struct ReaderHeaderActivityPill: View {
             )
         }
         .buttonStyle(.plain)
-        // `maxWidth` is the tier's budget for this segment. No
-        // `minWidth` / `idealWidth` — SwiftUI's natural sizing under
-        // `lineLimit(1) + truncationMode(.tail)` already produces a
-        // well-behaved min (the tail ellipsis), and leaving `min/ideal`
-        // unset lets the HStack's layout-priority distribution actually
-        // take effect. Height is pinned so the capsule doesn't jump.
-        .frame(maxWidth: maxWidth)
+        // Pin the segment to the tier's width. See the comment on
+        // `Tier` / `tiers` — fixed widths let `ViewThatFits` actually
+        // distinguish tiers by reported ideal size. The inner Text
+        // uses `lineLimit(1) + truncationMode(.tail)`, so as the
+        // pinned frame shrinks, the label tail-truncates instead of
+        // blowing past.
+        .frame(width: maxWidth)
         .frame(minHeight: Self.segmentHeight, maxHeight: Self.segmentHeight)
         .background(segmentBackground(isHighlighted: isThreadHighlighted))
         .onHover { isHovering in
@@ -387,7 +396,9 @@ struct ReaderHeaderActivityPill: View {
             )
         }
         .buttonStyle(.plain)
-        .frame(maxWidth: maxWidth)
+        // Same fixed-width pattern as `threadMenu` — see the tier
+        // comment for why this is `width:` not `maxWidth:`.
+        .frame(width: maxWidth)
         .frame(minHeight: Self.segmentHeight, maxHeight: Self.segmentHeight)
         .background(segmentBackground(isHighlighted: isPromptHighlighted))
         .onHover { isHovering in

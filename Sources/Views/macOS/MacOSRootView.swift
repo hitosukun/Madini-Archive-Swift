@@ -497,26 +497,24 @@ struct MacOSRootView: View {
                 // each item's acceptable width range from the hosted
                 // view's intrinsic constraints rather than the
                 // deprecated `NSToolbarItem.minSize` / `.maxSize`
-                // properties. Without this hint, SwiftUI reports the
-                // HStack's ideal width (~500pt for the full sort chip
-                // + breadcrumb pill) as its natural size, and when
-                // the remaining window room drops below that ideal
-                // AppKit shunts the whole item to the » overflow menu
-                // in one step — which is exactly what we were seeing:
-                // breadcrumb vanishes from the titlebar the moment
-                // the window narrows.
+                // properties.
                 //
-                // Declaring `minWidth: 80` tells AppKit the content
-                // is happy compressing down to ~80pt (icon-only sort
-                // chip + a truncated-to-ellipsis breadcrumb pill), so
-                // the item stays visible across every practical
-                // window width. `idealWidth` is the same as the
-                // pill's natural width so the chrome still reads at
-                // its original proportions on normal-size windows;
-                // `maxWidth` caps growth so the principal doesn't
-                // greedily swallow the whole toolbar on ultra-wide
-                // displays.
-                .frame(minWidth: 80, idealWidth: 520, maxWidth: 720)
+                // We declare a low `idealWidth` on purpose. If the
+                // ideal is close to the natural width of the full
+                // breadcrumb (~500pt), AppKit hands the principal
+                // item that much space even when the window is
+                // narrow — which pushes the right-side primary
+                // actions (share, mode picker) off the toolbar.
+                // Setting `idealWidth` to something closer to a
+                // *narrow* breadcrumb state tells AppKit: "I'm happy
+                // living small; only give me more if you have
+                // slack." The principal's inner `ViewThatFits` then
+                // upgrades to a richer tier when space is actually
+                // available. `minWidth: 60` is the icon-only sort
+                // chip + the last-resort thread-only breadcrumb;
+                // `maxWidth: 720` just caps unchecked growth on
+                // ultra-wide displays.
+                .frame(minWidth: 60, idealWidth: 220, maxWidth: 720)
             }
             ToolbarItem(id: "share", placement: .primaryAction) {
                 WorkspaceFloatingExportButton(detail: tabManager.activeDetail)
