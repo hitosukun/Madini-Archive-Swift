@@ -98,6 +98,13 @@ struct MacOSRootView: View {
         // leaves AppKit's titlebar / toolbar geometry untouched.
         .background(WindowConfigurator { window in
             window.titleVisibility = .hidden
+            // Belt-and-suspenders: `.titleVisibility = .hidden` alone
+            // is sometimes overridden by SwiftUI writing a non-empty
+            // `window.title` from the app bundle name after a
+            // navigation state change. Blanking the title string
+            // itself guarantees no glyphs render even if the
+            // visibility bit gets flipped back.
+            window.title = ""
         })
         // Window-level JSON drop handler. Sits ABOVE the in-app tag /
         // conversation drop destinations (which live on specific rows
@@ -1387,7 +1394,18 @@ struct WindowConfigurator: NSViewRepresentable {
         return view
     }
 
-    func updateNSView(_ nsView: WindowAccessorView, context: Context) {}
+    // Re-apply `configure` on every SwiftUI update pass. The title
+    // state in particular needs this: SwiftUI's NavigationSplitView
+    // writes the window title back (from the sidebar content / app
+    // bundle name) after navigation state changes, so a one-shot
+    // `viewDidMoveToWindow` call gets overridden the next time the
+    // user picks a different sidebar row. Re-applying here is cheap
+    // — `titleVisibility = .hidden` is idempotent.
+    func updateNSView(_ nsView: WindowAccessorView, context: Context) {
+        if let window = nsView.window {
+            configure(window)
+        }
+    }
 
     final class WindowAccessorView: NSView {
         var onAttach: ((NSWindow) -> Void)?
