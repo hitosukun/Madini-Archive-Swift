@@ -280,7 +280,14 @@ private struct SidebarTagRow: View {
         // it doesn't fight with the +/− attach button or the menu.)
         .dropDestination(for: ConversationDragPayload.self) { payloads, _ in
             guard !payloads.isEmpty else { return false }
-            onAttachDroppedConversations(payloads.map { $0.id })
+            let conversationIDs = payloads
+                .flatMap(\.conversationIDs)
+                .reduce(into: [String]()) { partialResult, id in
+                    if !partialResult.contains(id) {
+                        partialResult.append(id)
+                    }
+                }
+            onAttachDroppedConversations(conversationIDs)
             return true
         } isTargeted: { newValue in
             if isDropTargeted != newValue { isDropTargeted = newValue }

@@ -1061,104 +1061,75 @@ private struct UnifiedConversationListView: View {
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                // Multi-select: using `selectedConversationIDs` (Set) drives
-                // the native Cmd/Shift-click multi-select for the card list.
-                // The detail pane / keyboard nav still peek at the scalar
-                // `selectedConversationId` (which returns `.first`), which
-                // is good enough when the user is picking one card; when
-                // they've selected many, none of the scalar consumers fire
-                // anything noisy — the primary purpose of multi-select is
-                // dragging a batch to a sidebar tag (see SidebarTagRow's
-                // drop destination, which now loops over payloads).
-                // Wrap in ScrollViewReader so external requests (the
-                // right-pane header's conversation-title button) can
-                // scroll the list back to the currently-open card. The
-                // proxy drives `proxy.scrollTo(id, anchor: .top)` keyed
-                // on the `.tag(conversation.id)` assigned per row.
-                ScrollViewReader { proxy in
-                List(viewModel.conversations, selection: $viewModel.selectedConversationIDs) { conversation in
-                    ConversationRowView(
-                        conversation: conversation,
-                        tags: viewModel.conversationTags[conversation.id] ?? [],
-                        onTapTag: onTapTag,
-                        onAttachTag: { tagName in
-                            Task {
-                                await viewModel.attachTag(
-                                    named: tagName,
-                                    toConversation: conversation.id
-                                )
-                            }
-                        }
-                    )
-                    // NOTE: `.equatable()` was tried here for tag-drop perf,
-                    // but it caused intermittent "card click doesn't open"
-                    // — `List` with a `selection:` binding does not play
-                    // well with `EquatableView` wrapping its rows. The
-                    // optimization isn't worth the broken primary action.
-                    .tag(conversation.id)
-                    .id(conversation.id)
-                    .onAppear {
-                        Task {
-                            await viewModel.loadMoreIfNeeded(currentItem: conversation)
-                        }
-                    }
-                }
-                // Hide the List's built-in opaque backdrop so the pane
-                // window material shows through behind rows.
-                .scrollContentBackground(.hidden)
-                // Mirror the bottom-fade inset so the last row can
-                // scroll UP past the bottom-fade zone and be read at
-                // full opacity. Without this the final card's title
-                // sits permanently under the fade mask.
-                .safeAreaInset(edge: .bottom, spacing: 0) {
-                    Color.clear
-                        .frame(height: WorkspaceLayoutMetrics.bottomFadeHeight)
-                        .allowsHitTesting(false)
-                }
-                .overlay(alignment: .bottom) {
-                    if viewModel.isLoadingMore {
-                        ProgressView()
-                            .padding()
-                    }
-                }
-                // External scroll requests (e.g. tapping the reader
-                // header's title pill). Clears the request after
-                // applying so setting the same id twice still fires
-                // both times.
-                .onChange(of: viewModel.pendingListScrollConversationID) { _, newValue in
-                    guard let id = newValue else { return }
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        proxy.scrollTo(id, anchor: .top)
-                    }
-                    Task { @MainActor in
-                        viewModel.pendingListScrollConversationID = nil
-                    }
-                }
-                // Scroll-on-mount: when this list appears (e.g. after
-                // a mode switch into `.default`), land on the active
-                // card immediately. The `.onChange` above only fires
-                // for *changes* after mount — if `revealConversation`
-                // had already set `pendingListScrollConversationID`
-                // before this view even existed, the scroll request
-                // would be silently lost. Reading on mount closes that
-                // race. Consumes the token so subsequent external
-                // reveals still fire through `.onChange`.
-                .task {
-                    let id = viewModel.pendingListScrollConversationID
-                        ?? viewModel.selectedConversationId
-                    guard let id else { return }
-                    try? await Task.sleep(nanoseconds: 40_000_000)
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        proxy.scrollTo(id, anchor: .top)
-                    }
-                    if viewModel.pendingListScrollConversationID == id {
-                        viewModel.pendingListScrollConversationID = nil
-                    }
-                }
-                } // ScrollViewReader
+                conversationList
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var conversationList: some View {
+        ScrollViewReader { proxy in
+            List(viewModel.conversations, selection: $viewModel.selectedConversationIDs) { conversation in
+                conversationRow(for: conversation)
+            }
+            .scrollContentBackground(.hidden)
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                Color.clear
+                    .frame(height: WorkspaceLayoutMetrics.bottomFadeHeight)
+                    .allowsHitTesting(false)
+            }
+            .overlay(alignment: .bottom) {
+                if viewModel.isLoadingMore {
+                    ProgressView()
+                        .padding()
+                }
+            }
+            .onChange(of: viewModel.pendingListScrollConversationID) { _, newValue in
+                guard let id = newValue else { return }
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    proxy.scrollTo(id, anchor: .top)
+                }
+                Task { @MainActor in
+                    viewModel.pendingListScrollConversationID = nil
+                }
+            }
+            .task {
+                let id = viewModel.pendingListScrollConversationID
+                    ?? viewModel.selectedConversationId
+                guard let id else { return }
+                try? await Task.sleep(nanoseconds: 40_000_000)
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    proxy.scrollTo(id, anchor: .top)
+                }
+                if viewModel.pendingListScrollConversationID == id {
+                    viewModel.pendingListScrollConversationID = nil
+                }
+            }
+        }
+    }
+
+    private func conversationRow(for conversation: ConversationSummary) -> some View {
+        ConversationRowView(
+            conversation: conversation,
+            tags: viewModel.conversationTags[conversation.id] ?? [],
+            onTapTag: onTapTag,
+            draggedConversationIDs: viewModel.draggedConversationIDs(for: conversation.id),
+            onAttachTag: { tagName in
+                Task {
+                    await viewModel.attachTag(
+                        named: tagName,
+                        toConversation: conversation.id
+                    )
+                }
+            }
+        )
+        .tag(conversation.id)
+        .id(conversation.id)
+        .onAppear {
+            Task {
+                await viewModel.loadMoreIfNeeded(currentItem: conversation)
+            }
+        }
     }
 }
 

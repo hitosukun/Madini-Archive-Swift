@@ -22,17 +22,28 @@ import UniformTypeIdentifiers
 struct ConversationDragPayload: Codable, Hashable, Transferable, Sendable {
     static let payloadKind = "madini.conversation"
 
-    let id: String
+    let ids: [String]
 
     private var kind: String { Self.payloadKind }
 
     init(id: String) {
-        self.id = id
+        self.ids = [id]
+    }
+
+    init(ids: [String]) {
+        let cleaned = Array(NSOrderedSet(array: ids)) as? [String] ?? ids
+        self.ids = cleaned.filter { !$0.isEmpty }
     }
 
     private enum CodingKeys: String, CodingKey {
         case kind
         case id
+        case ids
+    }
+
+    var conversationIDs: [String] {
+        if ids.isEmpty { return [] }
+        return ids
     }
 
     init(from decoder: Decoder) throws {
@@ -45,13 +56,18 @@ struct ConversationDragPayload: Codable, Hashable, Transferable, Sendable {
                 debugDescription: "Not a Madini conversation payload (got \(storedKind))."
             )
         }
-        self.id = try container.decode(String.self, forKey: .id)
+        if let ids = try container.decodeIfPresent([String].self, forKey: .ids) {
+            self.ids = ids
+        } else {
+            self.ids = [try container.decode(String.self, forKey: .id)]
+        }
     }
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(kind, forKey: .kind)
-        try container.encode(id, forKey: .id)
+        try container.encode(conversationIDs, forKey: .ids)
+        try container.encode(conversationIDs.first ?? "", forKey: .id)
     }
 
     static var transferRepresentation: some TransferRepresentation {

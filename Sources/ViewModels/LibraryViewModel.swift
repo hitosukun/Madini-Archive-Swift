@@ -1061,6 +1061,76 @@ final class LibraryViewModel {
     }
 }
 
+/// Shared, view-friendly projection of a conversation list entry.
+/// Used as the common "same data, different representation" row model
+/// for surfaces like the default list and the macOS table.
+struct LibraryConversationRow: Identifiable {
+    let id: String
+    let title: String
+    let dateSortKey: String
+    let dateDisplay: String
+    let model: String
+    let source: String?
+    let rawModel: String?
+    let tags: [String]
+    let tagsSortKey: String
+    let promptCount: Int
+    let isBookmarked: Bool
+
+    init(summary: ConversationSummary, tags: [TagEntry]) {
+        let names = tags.map(\.name).sorted()
+        let modelDisplay: String
+        if let model = summary.model, !model.isEmpty {
+            modelDisplay = model
+        } else if let source = summary.source, !source.isEmpty {
+            modelDisplay = source.capitalized
+        } else {
+            modelDisplay = "—"
+        }
+
+        id = summary.id
+        title = summary.displayTitle
+        dateSortKey = summary.primaryTime ?? ""
+        dateDisplay = Self.formatDate(summary.primaryTime)
+        model = modelDisplay
+        source = summary.source
+        rawModel = summary.model
+        self.tags = names
+        tagsSortKey = names.joined(separator: ",")
+        promptCount = summary.messageCount
+        isBookmarked = summary.isBookmarked
+    }
+
+    private static func formatDate(_ raw: String?) -> String {
+        guard let raw, !raw.isEmpty else { return "—" }
+        let trimmed = raw.replacingOccurrences(of: "T", with: " ")
+        if trimmed.count >= 16 {
+            return String(trimmed.prefix(16))
+        }
+        return trimmed
+    }
+}
+
+extension LibraryViewModel {
+    var conversationRows: [LibraryConversationRow] {
+        conversations.map { summary in
+            LibraryConversationRow(
+                summary: summary,
+                tags: conversationTags[summary.id] ?? []
+            )
+        }
+    }
+
+    func draggedConversationIDs(for conversationID: String) -> [String] {
+        guard selectedConversationIDs.contains(conversationID) else {
+            return [conversationID]
+        }
+
+        let ids = Array(selectedConversationIDs)
+        return ids.isEmpty ? [conversationID] : ids
+    }
+}
+
 struct LibrarySourceFacet: Identifiable, Hashable {
     let value: String
     let count: Int

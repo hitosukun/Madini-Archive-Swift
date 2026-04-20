@@ -4,6 +4,9 @@ struct ConversationRowView: View {
     let conversation: ConversationSummary
     var tags: [TagEntry] = []
     var onTapTag: ((TagEntry) -> Void)? = nil
+    /// Shared multi-select drag source. When this row is part of the
+    /// current selection, dragging it should carry the whole selected set.
+    var draggedConversationIDs: [String]? = nil
     /// Called when a `TagDragPayload` is dropped onto this row. When nil,
     /// the row does not install a drop destination (iOS / Browse where
     /// sidebar-tag drops don't apply).
@@ -67,11 +70,18 @@ struct ConversationRowView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            if let time = conversation.primaryTime {
-                Text(String(time.prefix(10)))
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-                    .monospacedDigit()
+            VStack(alignment: .trailing, spacing: 6) {
+                ConversationDragHandle(
+                    conversationIDs: effectiveDraggedConversationIDs,
+                    title: conversation.displayTitle
+                )
+
+                if let time = conversation.primaryTime {
+                    Text(String(time.prefix(10)))
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .monospacedDigit()
+                }
             }
         }
         .padding(.vertical, 2)
@@ -100,20 +110,34 @@ struct ConversationRowView: View {
                 onAttachTag: onAttachTag
             )
         )
-        .draggable(ConversationDragPayload(id: conversation.id)) {
-            // Compact drag preview: just the title so the user can see
-            // which card is being carried. Keeps the preview lightweight
-            // even when the source row has long tag chip rows.
-            Text(conversation.displayTitle)
-                .font(.caption)
-                .lineLimit(1)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(Color.accentColor.opacity(0.15))
-                )
-        }
+    }
+
+    private var effectiveDraggedConversationIDs: [String] {
+        let ids = draggedConversationIDs ?? [conversation.id]
+        return ids.isEmpty ? [conversation.id] : ids
+    }
+}
+
+private struct ConversationDragHandle: View {
+    let conversationIDs: [String]
+    let title: String
+
+    var body: some View {
+        Image(systemName: "line.3.horizontal")
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .frame(width: 24, height: 20)
+            .background(
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .fill(Color.secondary.opacity(0.12))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .stroke(Color.secondary.opacity(0.12), lineWidth: 0.5)
+            )
+            .contentShape(Rectangle())
+            .help(conversationIDs.count > 1 ? "\(conversationIDs.count) conversations" : "Drag conversation")
+            .conversationDragSource(ids: conversationIDs, previewTitle: title)
     }
 }
 

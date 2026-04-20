@@ -51,7 +51,7 @@ struct ConversationTableView: View {
     @AppStorage("conversationTable.sortColumn") private var sortColumnID: String = SortColumn.date.rawValue
     @AppStorage("conversationTable.sortAscending") private var sortAscending: Bool = false
 
-    @State private var sortOrder: [KeyPathComparator<Row>] = [
+    @State private var sortOrder: [KeyPathComparator<LibraryConversationRow>] = [
         KeyPathComparator(\.dateSortKey, order: .reverse)
     ]
 
@@ -77,14 +77,6 @@ struct ConversationTableView: View {
         let sortKey: ConversationSortKey
     }
 
-    /// Multi-selection for contiguous highlighting. The user's
-    /// primary action is a double-click (→ `onExitTableMode` + open
-    /// in reader), so the selection is mostly a visual anchor while
-    /// they browse / sort.
-    @State private var selection = Set<String>()
-
-    // MARK: - Rows
-
     var body: some View {
         // `Table` only *reports* the column-header click back through
         // the `sortOrder` binding — it does not sort the rows for us.
@@ -93,7 +85,7 @@ struct ConversationTableView: View {
         // a variadic `Sequence` of comparators; our binding is a
         // single-comparator array so the effective sort key is always
         // the most recently clicked column.
-        let rows = buildRows().sorted(using: sortOrder)
+        let rows = viewModel.conversationRows.sorted(using: sortOrder)
 
         // Active-filter chips used to render above the column headers
         // in this view's own VStack; they've moved to the unified top
@@ -116,7 +108,7 @@ struct ConversationTableView: View {
         // underlying `NSScrollView` when the target id matches a row's
         // `Identifiable.id`.
         ScrollViewReader { proxy in
-            Table(rows, selection: $selection, sortOrder: $sortOrder) {
+            Table(rows, selection: $viewModel.selectedConversationIDs, sortOrder: $sortOrder) {
                 tableColumns
             }
             // Horizontal swipe → `MiddlePaneMode` cascade is now handled
@@ -157,7 +149,7 @@ struct ConversationTableView: View {
             // realizes rows in the viewport plus a small buffer).
             .onChange(of: viewModel.pendingListScrollConversationID) { _, newValue in
                 guard let id = newValue else { return }
-                selection = [id]
+                viewModel.selectedConversationIDs = [id]
                 Task { @MainActor in
                     try? await Task.sleep(nanoseconds: 30_000_000)
                     withAnimation(.easeInOut(duration: 0.2)) {
@@ -206,7 +198,7 @@ struct ConversationTableView: View {
                 }
                 for delayMs: UInt64 in [80, 200, 500] {
                     try? await Task.sleep(nanoseconds: delayMs * 1_000_000)
-                    selection = [id]
+                    viewModel.selectedConversationIDs = [id]
                     proxy.scrollTo(id, anchor: .center)
                 }
                 if viewModel.pendingListScrollConversationID == id {
@@ -270,69 +262,32 @@ struct ConversationTableView: View {
 
     // MARK: - Columns
 
-    @TableColumnBuilder<Row, KeyPathComparator<Row>>
-    private var tableColumns: some TableColumnContent<Row, KeyPathComparator<Row>> {
-        TableColumn("タイトル", value: \Row.title) { (row: Row) in
+    @TableColumnBuilder<LibraryConversationRow, KeyPathComparator<LibraryConversationRow>>
+    private var tableColumns: some TableColumnContent<LibraryConversationRow, KeyPathComparator<LibraryConversationRow>> {
+        TableColumn("タイトル", value: \LibraryConversationRow.title) { (row: LibraryConversationRow) in
             TitleCell(row: row)
         }
         .width(min: 200, ideal: 360)
 
-        TableColumn("日付", value: \Row.dateSortKey) { (row: Row) in
+        TableColumn("日付", value: \LibraryConversationRow.dateSortKey) { (row: LibraryConversationRow) in
             DateCell(row: row)
         }
         .width(min: 110, ideal: 160, max: 220)
 
-        TableColumn("モデル", value: \Row.model) { (row: Row) in
+        TableColumn("モデル", value: \LibraryConversationRow.model) { (row: LibraryConversationRow) in
             ModelCell(row: row)
         }
         .width(min: 80, ideal: 140, max: 220)
 
-        TableColumn("タグ", value: \Row.tagsSortKey) { (row: Row) in
+        TableColumn("タグ", value: \LibraryConversationRow.tagsSortKey) { (row: LibraryConversationRow) in
             TagsCell(row: row)
         }
         .width(min: 100, ideal: 200)
 
-        TableColumn("プロンプト数", value: \Row.promptCount) { (row: Row) in
+        TableColumn("プロンプト数", value: \LibraryConversationRow.promptCount) { (row: LibraryConversationRow) in
             PromptCountCell(row: row)
         }
         .width(min: 80, ideal: 100, max: 140)
-    }
-
-    // MARK: - Row construction
-
-    private func buildRows() -> [Row] {
-        viewModel.conversations.map { summary in
-            let tags = (viewModel.conversationTags[summary.id] ?? [])
-                .map(\.name)
-                .sorted()
-            // Model column: prefer the concrete model string when
-            // present (e.g. "gpt-5-4-thinking"); fall back to the
-            // source brand (e.g. "claude", "gemini") so Claude/Gemini
-            // rows aren't all "—". Display text is capitalized when
-            // it came from the source so the column doesn't mix
-            // lowercase brand names with model version strings.
-            let modelDisplay: String
-            if let m = summary.model, !m.isEmpty {
-                modelDisplay = m
-            } else if let s = summary.source, !s.isEmpty {
-                modelDisplay = s.capitalized
-            } else {
-                modelDisplay = "—"
-            }
-            return Row(
-                id: summary.id,
-                title: summary.displayTitle,
-                dateSortKey: summary.primaryTime ?? "",
-                dateDisplay: Self.formatDate(summary.primaryTime),
-                model: modelDisplay,
-                source: summary.source,
-                rawModel: summary.model,
-                tags: tags,
-                tagsSortKey: tags.joined(separator: ","),
-                promptCount: summary.messageCount,
-                isBookmarked: summary.isBookmarked
-            )
-        }
     }
 
     // MARK: - Actions
@@ -352,96 +307,43 @@ struct ConversationTableView: View {
 
     // MARK: - Sort persistence
 
-    /// Convert the primitive `@AppStorage` values into the comparator
-    /// array SwiftUI `Table` binds to. Called once on first appear —
-    /// after that, user interactions flow the other direction
-    /// (`persistSortOrder` below).
     private func syncSortOrderFromStorage() {
         let column = SortColumn(rawValue: sortColumnID) ?? .date
         let order: SortOrder = sortAscending ? .forward : .reverse
         sortOrder = [comparator(for: column, order: order)]
     }
 
-    /// Decompose the current `KeyPathComparator` back into primitive
-    /// storage. The comparator's `keyPath` is `AnyKeyPath`; we match
-    /// against the known paths to recover the column identifier.
-    private func persistSortOrder(_ order: [KeyPathComparator<Row>]) {
+    private func persistSortOrder(_ order: [KeyPathComparator<LibraryConversationRow>]) {
         guard let first = order.first else { return }
         let column = columnID(for: first.keyPath)
         sortColumnID = column.rawValue
         sortAscending = (first.order == .forward)
     }
 
-    private func comparator(for column: SortColumn, order: SortOrder) -> KeyPathComparator<Row> {
+    private func comparator(for column: SortColumn, order: SortOrder) -> KeyPathComparator<LibraryConversationRow> {
         switch column {
         case .title:
-            return KeyPathComparator(\Row.title, order: order)
+            return KeyPathComparator(\LibraryConversationRow.title, order: order)
         case .date:
-            return KeyPathComparator(\Row.dateSortKey, order: order)
+            return KeyPathComparator(\LibraryConversationRow.dateSortKey, order: order)
         case .model:
-            return KeyPathComparator(\Row.model, order: order)
+            return KeyPathComparator(\LibraryConversationRow.model, order: order)
         case .tags:
-            return KeyPathComparator(\Row.tagsSortKey, order: order)
+            return KeyPathComparator(\LibraryConversationRow.tagsSortKey, order: order)
         case .promptCount:
-            return KeyPathComparator(\Row.promptCount, order: order)
+            return KeyPathComparator(\LibraryConversationRow.promptCount, order: order)
         }
     }
 
     private func columnID(for keyPath: AnyKeyPath) -> SortColumn {
         switch keyPath {
-        case \Row.title: return .title
-        case \Row.dateSortKey: return .date
-        case \Row.model: return .model
-        case \Row.tagsSortKey: return .tags
-        case \Row.promptCount: return .promptCount
+        case \LibraryConversationRow.title: return .title
+        case \LibraryConversationRow.dateSortKey: return .date
+        case \LibraryConversationRow.model: return .model
+        case \LibraryConversationRow.tagsSortKey: return .tags
+        case \LibraryConversationRow.promptCount: return .promptCount
         default: return .date
         }
-    }
-
-    // MARK: - Date formatting
-
-    /// Collapse the `primaryTime` ISO-ish string down to `YYYY-MM-DD
-    /// HH:MM`. Full second / timezone precision isn't useful in a
-    /// scannable table. Fallback to the raw string if parsing fails —
-    /// better than showing an empty cell.
-    private static func formatDate(_ raw: String?) -> String {
-        guard let raw, !raw.isEmpty else { return "—" }
-        let trimmed = raw.replacingOccurrences(of: "T", with: " ")
-        if trimmed.count >= 16 {
-            return String(trimmed.prefix(16))
-        }
-        return trimmed
-    }
-
-    // MARK: - Row model
-
-    /// Flattened, non-optional, `Comparable`-friendly projection of a
-    /// `ConversationSummary` for the SwiftUI `Table`. Built once per
-    /// render inside `buildRows()` — fast because the underlying
-    /// summary list is short (pageful, not the whole archive) and the
-    /// tag lookup is an O(1) dictionary hit.
-    struct Row: Identifiable {
-        let id: String
-        let title: String
-        let dateSortKey: String
-        let dateDisplay: String
-        /// Display text for the model column — already resolved to a
-        /// concrete string (model name, capitalized source brand, or
-        /// "—"). This is what the user sees AND sorts on.
-        let model: String
-        /// Original source brand ("chatgpt" / "claude" / "gemini" / …)
-        /// preserved separately so the cell can pick a color even when
-        /// `model` came from the source fallback.
-        let source: String?
-        /// Original model string (nil for source-only rows). Kept so
-        /// `SourceAppearance.color(forModel:)` can distinguish e.g.
-        /// `gpt-*` from `claude-*` when both would map to the same
-        /// source color family.
-        let rawModel: String?
-        let tags: [String]
-        let tagsSortKey: String
-        let promptCount: Int
-        let isBookmarked: Bool
     }
 }
 
@@ -555,22 +457,24 @@ private struct TableExitSwipeMonitor: NSViewRepresentable {
 // structs keeps each closure a one-liner and compiles fast.
 
 private struct TitleCell: View {
-    let row: ConversationTableView.Row
+    let row: LibraryConversationRow
 
     var body: some View {
         Text(row.title)
             .lineLimit(1)
             .truncationMode(.tail)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
     }
 }
 
 private struct DateCell: View {
-    let row: ConversationTableView.Row
+    let row: LibraryConversationRow
 
     var body: some View {
         Text(row.dateDisplay)
             .foregroundStyle(.secondary)
             .monospacedDigit()
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
     }
 }
 
@@ -578,12 +482,13 @@ private struct DateCell: View {
 /// gemini → blue) so the user can scan services at a glance. Falls back
 /// to `.secondary` for unknown entries and the en-dash placeholder.
 private struct ModelCell: View {
-    let row: ConversationTableView.Row
+    let row: LibraryConversationRow
 
     var body: some View {
         Text(row.model)
             .foregroundStyle(tint)
             .lineLimit(1)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
     }
 
     private var tint: Color {
@@ -606,12 +511,13 @@ private struct ModelCell: View {
 /// column sort alphabetically; these chips are the prettier
 /// presentation of the same data.
 private struct TagsCell: View {
-    let row: ConversationTableView.Row
+    let row: LibraryConversationRow
 
     var body: some View {
         if row.tags.isEmpty {
             Text("—")
                 .foregroundStyle(.tertiary)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
         } else {
             HStack(spacing: 4) {
                 ForEach(row.tags, id: \.self) { name in
@@ -625,17 +531,19 @@ private struct TagsCell: View {
                 }
             }
             .lineLimit(1)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
         }
     }
 }
 
 private struct PromptCountCell: View {
-    let row: ConversationTableView.Row
+    let row: LibraryConversationRow
 
     var body: some View {
         Text("\(row.promptCount)")
             .monospacedDigit()
             .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
     }
 }
 
