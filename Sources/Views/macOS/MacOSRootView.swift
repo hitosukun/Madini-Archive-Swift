@@ -445,37 +445,36 @@ struct MacOSRootView: View {
         // work will go in a separate pane-internal observer, not via
         // the AppKit-automatic titlebar path.
         .toolbar(id: "workspace") {
-            // Sort pulldown — leading edge of the toolbar, right after
-            // the sidebar toggle. Was previously mounted in the sidebar
-            // under the search field (`LibraryListHeaderBar`'s
-            // sort+date row), but the user asked to promote it into
-            // window chrome so the middle pane's sort state reads at
-            // the top-of-window level regardless of sidebar
-            // collapse/expand state. `.navigation` placement is the
-            // macOS slot for items that sit at the leading edge
-            // (conceptually: back-button / nav-action region), which
-            // is the behavior we want — opposite side from the share
-            // button + mode picker in `.primaryAction`. Date picker
-            // stays in the sidebar because it's a wider control that
-            // would cost too much toolbar real estate on narrow
-            // windows.
-            ToolbarItem(id: "sort-menu", placement: .navigation) {
-                LibraryListSortMenu(viewModel: libraryViewModel)
-            }
+            // Sort pulldown + cascade breadcrumb, grouped in the same
+            // `.principal` slot so they read as one centered navigation
+            // cluster (sort chip on the left, breadcrumb on the right).
+            //
+            // The sort pulldown used to live in the sidebar's
+            // search-row area; the user wanted it promoted into window
+            // chrome. First pass put it in a separate
+            // `.navigation`-placed ToolbarItem, which planted it at the
+            // far-leading edge — past the window title / sidebar toggle
+            // — far away from the breadcrumb it semantically belongs
+            // next to. Folding both into the same principal item lets
+            // macOS center the whole cluster and keeps sort adjacent
+            // to the breadcrumb regardless of window width.
             ToolbarItem(id: "navigation-bar", placement: .principal) {
-                ReaderHeaderActivityPill(
-                    activeDetail: tabManager.activeDetail,
-                    promptOutline: tabManager.promptOutline,
-                    selectedPromptID: tabManager.selectedPromptID,
-                    onSelectPrompt: { id in
-                        tabManager.requestPromptSelection(id)
-                    },
-                    conversations: libraryViewModel.conversations,
-                    onSelectConversation: { id in
-                        libraryViewModel.selectedConversationId = id
-                    },
-                    onTitlePulldownOpen: revealActiveConversationInMiddlePane
-                )
+                HStack(spacing: 10) {
+                    LibraryListSortMenu(viewModel: libraryViewModel)
+                    ReaderHeaderActivityPill(
+                        activeDetail: tabManager.activeDetail,
+                        promptOutline: tabManager.promptOutline,
+                        selectedPromptID: tabManager.selectedPromptID,
+                        onSelectPrompt: { id in
+                            tabManager.requestPromptSelection(id)
+                        },
+                        conversations: libraryViewModel.conversations,
+                        onSelectConversation: { id in
+                            libraryViewModel.selectedConversationId = id
+                        },
+                        onTitlePulldownOpen: revealActiveConversationInMiddlePane
+                    )
+                }
             }
             ToolbarItem(id: "share", placement: .primaryAction) {
                 WorkspaceFloatingExportButton(detail: tabManager.activeDetail)
