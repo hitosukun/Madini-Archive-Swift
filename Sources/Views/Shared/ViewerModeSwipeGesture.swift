@@ -106,10 +106,15 @@ struct ViewerModeSwipeGesture: ViewModifier {
     /// always allowed; over-swiping is idempotent at the cascade ends
     /// so there's nothing to gate.
     let canEnterViewer: Bool
+    /// Allows call sites to temporarily suppress the workspace-level
+    /// monitor when a child view installs its own specialized swipe
+    /// handling (currently the macOS table mode).
+    let isEnabled: Bool
 
     func body(content: Content) -> some View {
+        guard isEnabled else { return AnyView(content) }
         #if os(macOS)
-        content.background(
+        return AnyView(content.background(
             SwipeScrollMonitor(
                 viewMode: $viewMode,
                 canEnterViewer: canEnterViewer
@@ -120,9 +125,9 @@ struct ViewerModeSwipeGesture: ViewModifier {
                 // hit-testing.
                 .frame(width: 0, height: 0)
                 .allowsHitTesting(false)
-        )
+        ))
         #else
-        content.simultaneousGesture(
+        return AnyView(content.simultaneousGesture(
             DragGesture(minimumDistance: 20)
                 .onEnded { value in
                     let dx = value.translation.width
@@ -137,12 +142,12 @@ struct ViewerModeSwipeGesture: ViewModifier {
                         viewMode = viewMode.stepTowardOverview()
                     }
                 }
-        )
+        ))
         #endif
     }
 
-    fileprivate static let triggerThreshold: CGFloat = 100
-    fileprivate static let dominanceRatio: CGFloat = 3
+    static let triggerThreshold: CGFloat = 100
+    static let dominanceRatio: CGFloat = 3
 }
 
 #if os(macOS)
@@ -314,12 +319,14 @@ extension View {
     /// one fluent modifier in the chain.
     func viewerModeSwipeGesture(
         viewMode: Binding<MiddlePaneMode>,
-        canEnterViewer: Bool
+        canEnterViewer: Bool,
+        isEnabled: Bool = true
     ) -> some View {
         modifier(
             ViewerModeSwipeGesture(
                 viewMode: viewMode,
-                canEnterViewer: canEnterViewer
+                canEnterViewer: canEnterViewer,
+                isEnabled: isEnabled
             )
         )
     }

@@ -254,6 +254,17 @@ struct ConversationTableView: View {
                     .frame(width: 0, height: 0)
                     .opacity(0)
             )
+            // `Table`'s internal `NSScrollView` handles horizontal
+            // trackpad swipes aggressively enough that the workspace-
+            // level monitor can miss them when focus sits inside the
+            // table. Install a table-local monitor here so "left swipe
+            // to go back to default mode" still works while the grid is
+            // first responder.
+            .background(
+                TableExitSwipeMonitor(onTrigger: onExitTableMode)
+                    .frame(width: 0, height: 0)
+                    .allowsHitTesting(false)
+            )
         } // ScrollViewReader
     }
 
@@ -431,6 +442,105 @@ struct ConversationTableView: View {
         let tagsSortKey: String
         let promptCount: Int
         let isBookmarked: Bool
+    }
+}
+
+private struct TableExitSwipeMonitor: NSViewRepresentable {
+    let onTrigger: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onTrigger: onTrigger)
+    }
+
+    func makeNSView(context: Context) -> NSView {
+        context.coordinator.install()
+        return NSView(frame: .zero)
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        context.coordinator.onTrigger = onTrigger
+    }
+
+    static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
+        coordinator.uninstall()
+    }
+
+    final class Coordinator {
+        var onTrigger: () -> Void
+        private var monitor: Any?
+        private var accumulatedDX: CGFloat = 0
+        private var accumulatedDY: CGFloat = 0
+        private var hasArmedThisGesture = false
+
+        init(onTrigger: @escaping () -> Void) {
+            self.onTrigger = onTrigger
+        }
+
+        deinit { uninstall() }
+
+        func install() {
+            guard monitor == nil else { return }
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+                guard let self else { return event }
+                return self.handle(event)
+            }
+        }
+
+        func uninstall() {
+            if let monitor {
+                NSEvent.removeMonitor(monitor)
+                self.monitor = nil
+            }
+        }
+
+        private func handle(_ event: NSEvent) -> NSEvent? {
+            // This monitor exists only while table mode is mounted, so
+            // we don't need an additional "is the table focused?"
+            // gate here. In practice that focus check was too brittle:
+            // the first responder often sat on an internal clip/scroll
+            // view while the user was clearly interacting with the
+            // table, so left swipes only produced rubber-banding and
+            // never armed the exit transition.
+            guard event.hasPreciseScrollingDeltas else {
+                return event
+            }
+
+            switch event.phase {
+            case .began:
+                accumulatedDX = event.scrollingDeltaX
+                accumulatedDY = event.scrollingDeltaY
+                hasArmedThisGesture = false
+            case .changed:
+                accumulatedDX += event.scrollingDeltaX
+                accumulatedDY += event.scrollingDeltaY
+            case .ended, .cancelled:
+                let armed = hasArmedThisGesture
+                accumulatedDX = 0
+                accumulatedDY = 0
+                hasArmedThisGesture = false
+                if armed {
+                    DispatchQueue.main.async { [weak self] in
+                        self?.onTrigger()
+                    }
+                }
+                return armed ? nil : event
+            default:
+                return event
+            }
+
+            if hasArmedThisGesture {
+                return nil
+            }
+
+            guard accumulatedDX < 0,
+                  abs(accumulatedDX) >= ViewerModeSwipeGesture.triggerThreshold,
+                  abs(accumulatedDX) > abs(accumulatedDY) * ViewerModeSwipeGesture.dominanceRatio else {
+                return event
+            }
+
+            hasArmedThisGesture = true
+            return nil
+        }
     }
 }
 

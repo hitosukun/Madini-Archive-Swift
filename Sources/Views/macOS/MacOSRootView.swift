@@ -466,7 +466,8 @@ struct MacOSRootView: View {
         // are always allowed regardless.
         .viewerModeSwipeGesture(
             viewMode: $viewMode,
-            canEnterViewer: tabManager.activeTab != nil
+            canEnterViewer: tabManager.activeTab != nil,
+            isEnabled: viewMode != .table
         )
     }
 
