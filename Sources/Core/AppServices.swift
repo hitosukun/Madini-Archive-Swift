@@ -7,6 +7,7 @@ final class AppServices: ObservableObject {
     let search: any SearchRepository
     let bookmarks: any BookmarkRepository
     let tags: any TagRepository
+    let projects: any ProjectRepository
     let views: any ViewService
     let dataSource: DataSource
 
@@ -20,6 +21,7 @@ final class AppServices: ObservableObject {
         search: any SearchRepository,
         bookmarks: any BookmarkRepository,
         tags: any TagRepository,
+        projects: any ProjectRepository,
         views: any ViewService,
         dataSource: DataSource
     ) {
@@ -27,6 +29,7 @@ final class AppServices: ObservableObject {
         self.search = search
         self.bookmarks = bookmarks
         self.tags = tags
+        self.projects = projects
         self.views = views
         self.dataSource = dataSource
     }
@@ -44,6 +47,7 @@ final class AppServices: ObservableObject {
                     search: GRDBSearchRepository(dbQueue: dbQueue),
                     bookmarks: GRDBBookmarkRepository(dbQueue: dbQueue),
                     tags: GRDBTagRepository(dbQueue: dbQueue),
+                    projects: GRDBProjectRepository(dbQueue: dbQueue),
                     views: GRDBViewService(dbQueue: dbQueue),
                     dataSource: .database(path: dbPath)
                 )
@@ -62,6 +66,7 @@ final class AppServices: ObservableObject {
             ),
             bookmarks: MockBookmarkRepository(),
             tags: MockTagRepository(),
+            projects: MockProjectRepository(),
             views: MockViewService(),
             dataSource: .mock
         )
@@ -272,6 +277,29 @@ final class AppServices: ObservableObject {
                     DELETE FROM bookmarks WHERE target_type = 'prompt'
                     """)
                 try db.execute(sql: "PRAGMA user_version = 2")
+            }
+
+            // Migration 3: project-based organization schema.
+            //
+            // Adds `project` / `project_membership` / `project_suggestion`
+            // tables that back the 2026-04 spec's project-based tag
+            // replacement. Delegates the DDL itself to
+            // `ProjectSchemaDraft.allStatements` so the schema text can
+            // be reviewed and evolved independently of this migration
+            // list — see that file for the rationale on each index and
+            // the 1-thread-1-project invariant.
+            //
+            // `CREATE TABLE IF NOT EXISTS` means a re-run on an already-
+            // migrated DB is a no-op, so bumping user_version is the
+            // authoritative signal. Kept on a separate `if` (not an
+            // `else if` chain) so a future migration 4 that edits one
+            // of these tables doesn't have to reason about whether the
+            // base tables exist yet.
+            if userVersion < 3 {
+                for sql in ProjectSchemaDraft.allStatements {
+                    try db.execute(sql: sql)
+                }
+                try db.execute(sql: "PRAGMA user_version = 3")
             }
         }
     }

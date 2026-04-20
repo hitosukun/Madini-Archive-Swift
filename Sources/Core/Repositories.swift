@@ -579,3 +579,162 @@ protocol ViewService: Sendable {
         targetType: ViewTargetType
     ) async throws -> VirtualThread
 }
+
+// MARK: - Project system
+//
+// Companion to `TagRepository` for the project-based tag replacement
+// (2026-04 spec). Surface area intentionally mirrors the mock's
+// accept / dismiss / re-import flows, so the UI wiring is
+// mechanical once the GRDB impl lands.
+//
+// Every thread has at most one `ProjectMembership` row (the
+// 1-thread-1-project invariant). Unassigned threads are represented
+// by the absence of a row; downstream callers never encode
+// "unassigned" as a sentinel membership value.
+//
+// See `Sources/Models/ProjectMembership.swift` for the model types
+// this protocol operates on.
+
+enum ProjectRepositoryError: Error, LocalizedError {
+    case emptyName
+    case notFound
+    case invariantViolated(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .emptyName:
+            return "Project name cannot be empty."
+        case .notFound:
+            return "Project not found."
+        case .invariantViolated(let detail):
+            return "Project invariant violated: \(detail)"
+        }
+    }
+}
+
+/// Snapshot of (membership, top suggestion) for one thread. The
+/// repository pre-joins these so the UI doesn't have to issue two
+/// queries per row when rendering a table. For threads with neither
+/// assigned project nor actionable suggestion, both fields are nil
+/// (= `.unassigned` in `ProjectCellState`).
+struct ProjectThreadStatus: Hashable, Sendable {
+    let threadID: String
+    let membership: ProjectMembership?
+    let topSuggestion: ProjectSuggestion?
+}
+
+/// Count buckets for the sidebar's PROJECTS + TRIAGE sections. One
+/// repository call populates every badge: avoids the N+1 pattern of
+/// asking "how many threads are in Project X?" once per project.
+struct ProjectSidebarCounts: Hashable, Sendable {
+    /// Per-project thread counts, keyed by `ProjectID`. Empty
+    /// projects are present with a zero value so the sidebar still
+    /// renders them.
+    let perProject: [ProjectID: Int]
+    /// Threads with no membership AND ≥1 suggestion above
+    /// `SuggestionPolicy.minScore`.
+    let inbox: Int
+    /// Threads with no membership AND no actionable suggestion.
+    let orphans: Int
+    /// Total thread count across the whole archive. Drives the "All
+    /// threads" row under LIBRARY.
+    let all: Int
+}
+
+protocol ProjectRepository: Sendable {
+    // MARK: Projects
+
+    /// All projects the user can scope to, in their persisted
+    /// sidebar order. Includes both external-seeded and Madini-local
+    /// projects; the caller distinguishes via `Project.externalSource`.
+    func listProjects() async throws -> [Project]
+
+    /// Create a Madini-local project (no external folder binding).
+    /// Names are case-insensitive-unique per the schema; collisions
+    /// throw `notFound` or `invariantViolated` depending on the
+    /// existing row's state.
+    func createProject(name: String) async throws -> Project
+
+    func renameProject(id: ProjectID, name: String) async throws -> Project
+
+    /// Delete a project. Threads currently assigned to it become
+    /// unassigned. External-bound projects can be deleted locally,
+    /// but a subsequent re-import of the matching external folder
+    /// will re-create the project and re-assign its threads
+    /// (canonical_import wins — see spec decision #5).
+    func deleteProject(id: ProjectID) async throws
+
+    // MARK: Memberships
+
+    /// Look up one thread's current membership, if any.
+    func membership(for threadID: String) async throws -> ProjectMembership?
+
+    /// Pre-joined (membership?, topSuggestion?) for the given thread
+    /// IDs. Returned dict is keyed by `threadID`; absent threads
+    /// yield `ProjectThreadStatus` with both slots nil.
+    func statuses(forThreadIDs ids: [String]) async throws -> [String: ProjectThreadStatus]
+
+    /// Manually assign a thread to a project. Upserts the row,
+    /// always producing `MembershipType.manualAdd`. If the thread
+    /// already had a `canonicalImport` membership this still
+    /// overwrites — manual actions beat the LLM within a session,
+    /// until the next re-import swings back to canonical (#5).
+    @discardableResult
+    func setManualMembership(threadID: String, projectID: ProjectID) async throws -> ProjectMembership
+
+    /// Drop a thread's membership. Leaves any outstanding
+    /// suggestions in place — the thread may re-appear in the Inbox
+    /// under its highest-scoring candidate.
+    func clearMembership(threadID: String) async throws
+
+    // MARK: Suggestions
+
+    /// Top-scoring `ProjectSuggestion` for the thread, or nil if no
+    /// candidate passes `SuggestionPolicy.minScore`. Used by the
+    /// Inbox row renderer and the viewer-card's `pending_suggestion`
+    /// state.
+    func topSuggestion(for threadID: String) async throws -> ProjectSuggestion?
+
+    /// Accept a suggestion: creates a `MembershipType.acceptedSuggestion`
+    /// row carrying the score + reason summary from the suggestion.
+    /// The suggestion row itself is deleted (rationale: once the
+    /// user has ruled on the candidate, keeping the row around would
+    /// re-surface it on the next recompute).
+    @discardableResult
+    func acceptSuggestion(_ suggestion: ProjectSuggestion) async throws -> ProjectMembership
+
+    /// Dismiss a suggestion: deletes only that suggestion row, does
+    /// not touch the thread's membership (which is nil anyway —
+    /// dismissed threads move from Inbox to Orphans). If the thread
+    /// has other candidates below `minScore`, those are unaffected
+    /// and a future threshold lowering could re-promote one of them.
+    func dismissSuggestion(_ suggestion: ProjectSuggestion) async throws
+
+    // MARK: Import
+
+    /// Apply a fresh set of external folder memberships. For each
+    /// folder-thread pair in `folders`, upserts a membership row of
+    /// type `canonicalImport` — this OVERWRITES any prior membership
+    /// (including `manualAdd`), which is the explicit 2026-04 spec
+    /// decision #5 ("external LLM latest wins"). Folders not
+    /// present in the payload are NOT touched here — a cleaner
+    /// "deleted on source" pass belongs to the importer.
+    func applyCanonicalImport(_ folders: [ImportedExternalFolder]) async throws
+
+    // MARK: Sidebar
+
+    /// Counts used by the sidebar's PROJECTS + TRIAGE sections.
+    /// Computed in one pass so the sidebar doesn't N+1 the DB.
+    func sidebarCounts(policy: SuggestionPolicy) async throws -> ProjectSidebarCounts
+}
+
+/// Payload the importer hands to `applyCanonicalImport`. One entry
+/// per (folder, thread) pair. `folderName` drives the project name
+/// if the folder is new; existing projects keep their user-edited
+/// names (rename on the Madini side is preserved across re-imports).
+struct ImportedExternalFolder: Hashable, Sendable {
+    let source: Project.ExternalLLMSource
+    let externalFolderID: String
+    let folderName: String
+    let threadIDs: [String]
+}
