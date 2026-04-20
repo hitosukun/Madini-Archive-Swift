@@ -170,10 +170,13 @@ struct ReaderWorkspaceView: View {
 ///      `ViewThatFits` can make a clean choice based on the proposed
 ///      width from the toolbar.
 ///
-/// Mounted into the native window toolbar's `.principal` slot by
+/// Mounted into the native window toolbar's `.navigation` slot
+/// (leading-edge cluster, right after the sidebar toggle) by
 /// `MacOSRootView.workspaceSplitView` so it's present in every mode
 /// and its x-coordinate doesn't jump as the user cascades through
-/// middle-pane modes.
+/// middle-pane modes. See that call site for why it is NOT in
+/// `.principal` — the centered slot reserves symmetric width on
+/// both sides, which crowded the trailing primary-action cluster.
 struct ReaderHeaderActivityPill: View {
     private enum HoveredSegment {
         case thread

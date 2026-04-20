@@ -443,7 +443,11 @@ struct MacOSRootView: View {
         // Window toolbar — the single home for window-chrome controls.
         //
         // Responsibility split:
-        //   * `.principal`: navigation bar (title + prompt pulldown).
+        //   * `.navigation`: navigation bar (sort chip + title +
+        //     prompt pulldown). Placed on the leading edge so it
+        //     flows rightward from the sidebar toggle without the
+        //     symmetric-reservation cost that `.principal` (center)
+        //     imposes on the trailing cluster.
         //   * `.primaryAction`: share button (standalone) + mode
         //     picker (a real `NSSegmentedControl` wrapped as one
         //     `NSToolbarItem`). See `MiddlePaneModePicker`.
@@ -471,7 +475,18 @@ struct MacOSRootView: View {
             // next to. Folding both into the same principal item lets
             // macOS center the whole cluster and keeps sort adjacent
             // to the breadcrumb regardless of window width.
-            ToolbarItem(id: "navigation-bar", placement: .principal) {
+            // Navigation cluster (sort + breadcrumb). Placed in
+            // `.navigation` rather than `.principal` on purpose:
+            // `.principal` centers the item, which makes AppKit reserve
+            // symmetric toolbar space on both sides — so even when the
+            // cluster is narrow, the mirror space on the right pushes
+            // the primary-action buttons off. `.navigation` anchors it
+            // to the leading side, just after the sidebar toggle, and
+            // lets it flow naturally from there. The right-hand
+            // primary-action cluster (share, mode picker) stays pinned
+            // to the trailing edge and never competes with an
+            // imaginary centered reservation.
+            ToolbarItem(id: "navigation-bar", placement: .navigation) {
                 HStack(spacing: 10) {
                     // `compressible: true` — the toolbar competes with
                     // the breadcrumb and the right-side action cluster
@@ -492,39 +507,19 @@ struct MacOSRootView: View {
                         onTitlePulldownOpen: revealActiveConversationInMiddlePane
                     )
                 }
-                // Frame hint for NSToolbar's size measurement.
-                // AppKit's modern (macOS 12+) toolbar sizing derives
-                // each item's acceptable width range from the hosted
-                // view's intrinsic constraints rather than the
-                // deprecated `NSToolbarItem.minSize` / `.maxSize`
-                // properties.
-                //
-                // Width hint for NSToolbar:
-                //
-                // * No `idealWidth`. A fixed ideal means AppKit will
-                //   only grant that much — the content can't grow on
-                //   wide windows even when there's slack, so the
-                //   breadcrumb stays stuck on a narrow tier. Letting
-                //   the ideal default to the content's natural size
-                //   (the first tier of `ViewThatFits` ~ 560pt) makes
-                //   AppKit grant a generous allocation when the
-                //   window is wide; `ViewThatFits` then happily
-                //   picks tier 0.
-                //
-                // * `minWidth: 60` is the compression floor — AppKit
-                //   is allowed to squeeze the principal all the way
-                //   down to an icon-only sort chip + a thread sliver
-                //   tier before overflowing the item. Without this
-                //   floor AppKit sends the whole item to the » menu
-                //   the moment the proposed width drops below the
-                //   natural ideal.
-                //
-                // * `maxWidth: .infinity` lets the principal flex
-                //   into whatever toolbar slack remains, which pairs
-                //   with the tier-descending `ViewThatFits` so
-                //   narrower windows cascade through tiers cleanly
-                //   instead of getting shunted to overflow.
-                .frame(minWidth: 60, maxWidth: .infinity)
+                // No frame hint: in the leading (`.navigation`) slot
+                // the toolbar lays items out left-to-right from the
+                // sidebar toggle, so the content's natural ideal size
+                // (= the first tier of `ViewThatFits`, ~560pt) is
+                // exactly what we want AppKit to grant when there's
+                // room. When the window narrows, AppKit proposes less
+                // width and `ViewThatFits` walks the tier ladder down.
+                // The outer frame is intentionally absent —
+                // `minWidth: …` is unnecessary because `ViewThatFits`
+                // already provides a well-defined minimum (the
+                // tightest tier), and `maxWidth: .infinity` would
+                // make the principal eat whatever slack was meant for
+                // the primary-action cluster.
             }
             ToolbarItem(id: "share", placement: .primaryAction) {
                 WorkspaceFloatingExportButton(detail: tabManager.activeDetail)
