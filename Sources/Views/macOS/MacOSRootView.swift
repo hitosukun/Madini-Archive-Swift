@@ -638,6 +638,34 @@ struct MacOSRootView: View {
             for item in toolbar.items {
                 item.visibilityPriority = .high
             }
+
+            // Kill the toolbar's persisted configuration. SwiftUI's
+            // `.toolbar(id: "workspace")` wires up a customizable
+            // NSToolbar that autosaves its item set / overflow
+            // arrangement to UserDefaults. Once AppKit decides — on a
+            // single bad frame where an item reports zero size — that
+            // an item belongs in the overflow menu, that decision
+            // sticks across relaunches and the item never reappears
+            // in the toolbar proper even after the underlying
+            // measurement bug is fixed. Disabling autosaves and
+            // customization each pass forces AppKit to rebuild the
+            // layout from the SwiftUI declaration every time.
+            toolbar.autosavesConfiguration = false
+            toolbar.allowsUserCustomization = false
+
+            // Diagnostic so we can tell from the console whether the
+            // mode-picker item is even being registered, and if so
+            // whether AppKit is routing it to the overflow menu.
+            // `toolbar.items` is the full registered set including
+            // overflow; `visibleItems` is only what's rendered in the
+            // toolbar row. Subtract visible from registered → the
+            // hidden/overflowed ones. Logs on every `updateNSView`
+            // pass (cheap) and we'll strip it once the cause is
+            // confirmed.
+            let allIDs = toolbar.items.map(\.itemIdentifier.rawValue)
+            let visIDs = (toolbar.visibleItems ?? []).map(\.itemIdentifier.rawValue)
+            let overflowed = allIDs.filter { !visIDs.contains($0) }
+            NSLog("[MadiniToolbar] all=\(allIDs) visible=\(visIDs) overflowed=\(overflowed)")
         }
     }
 
