@@ -167,29 +167,31 @@ struct ReaderHeaderActivityPill: View {
         case prompt
     }
 
-    // Minimum widths are intentionally narrow so the whole breadcrumb
-    // can compress when the window narrows. SwiftUI's toolbar layout
-    // treats the `.principal` item's natural width as a hard floor —
-    // whatever we declare here is what the toolbar insists on keeping
-    // between the sidebar toggle and the `.primaryAction` cluster, so
-    // any min greater than "a few truncated characters + chevron"
-    // would push the share / mode-picker buttons off into the »
-    // overflow menu on narrow windows.
+    // Minimum widths are pushed down to "barely usable" floors so
+    // the whole breadcrumb can compress aggressively under window
+    // pressure. SwiftUI's toolbar layout treats the `.principal`
+    // item's natural / minimum width as what the toolbar insists on
+    // keeping between the sidebar toggle and the `.primaryAction`
+    // cluster, so any floor above a few truncated glyphs pushes the
+    // share / mode-picker buttons off into the » overflow menu on
+    // narrow windows. The user's rule: primaryAction never overflows,
+    // no matter how narrow the window gets.
     //
-    // The `segmentLabel` helper already truncates via
-    // `.lineLimit(1) + .truncationMode(.tail)`, so a 70pt min still
-    // reads as a usable breadcrumb — the user sees the first few
-    // characters + "…" and can still click to open the popover.
-    // Ideal / max stay at the previous comfortable values so the pill
-    // only shrinks under pressure and otherwise reads at its
-    // original proportions.
-    private static let titleSegmentMinWidth: CGFloat = 70
+    // The `segmentLabel` helper truncates via
+    // `.lineLimit(1) + .truncationMode(.tail)`, so a ~36pt segment
+    // floor still renders as `X…` + chevron — ugly but still a
+    // clickable target that opens the popover for the full list. At
+    // the pill level, ~100pt accommodates two truncated segments and
+    // a chevron divider. Ideal / max stay at the previous comfortable
+    // values so the pill only shrinks under pressure and reads at its
+    // original proportions on normal-width windows.
+    private static let titleSegmentMinWidth: CGFloat = 36
     private static let titleSegmentIdealWidth: CGFloat = 220
     private static let titleSegmentMaxWidth: CGFloat = 300
-    private static let promptSegmentMinWidth: CGFloat = 70
+    private static let promptSegmentMinWidth: CGFloat = 36
     private static let promptSegmentIdealWidth: CGFloat = 230
     private static let promptSegmentMaxWidth: CGFloat = 320
-    private static let pillMinWidth: CGFloat = 180
+    private static let pillMinWidth: CGFloat = 100
     private static let pillIdealWidth: CGFloat = 472
     private static let pillMaxWidth: CGFloat = 626
     private static let segmentHeight: CGFloat = 22
