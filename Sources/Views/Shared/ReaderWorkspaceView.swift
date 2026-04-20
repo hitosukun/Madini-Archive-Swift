@@ -167,31 +167,37 @@ struct ReaderHeaderActivityPill: View {
         case prompt
     }
 
-    // Minimum widths are pushed down to "barely usable" floors so
-    // the whole breadcrumb can compress aggressively under window
-    // pressure. SwiftUI's toolbar layout treats the `.principal`
-    // item's natural / minimum width as what the toolbar insists on
-    // keeping between the sidebar toggle and the `.primaryAction`
-    // cluster, so any floor above a few truncated glyphs pushes the
-    // share / mode-picker buttons off into the » overflow menu on
-    // narrow windows. The user's rule: primaryAction never overflows,
-    // no matter how narrow the window gets.
+    // Minimum widths are pushed to the actual floor — the pill is
+    // allowed to compress to "just a chevron-sized nub" so the
+    // right-hand `.primaryAction` cluster (share button + mode
+    // picker) stays visible even when the window is dragged almost
+    // down to the sidebar's own minimum width.
     //
-    // The `segmentLabel` helper truncates via
-    // `.lineLimit(1) + .truncationMode(.tail)`, so a ~36pt segment
-    // floor still renders as `X…` + chevron — ugly but still a
-    // clickable target that opens the popover for the full list. At
-    // the pill level, ~100pt accommodates two truncated segments and
-    // a chevron divider. Ideal / max stay at the previous comfortable
-    // values so the pill only shrinks under pressure and reads at its
-    // original proportions on normal-width windows.
-    private static let titleSegmentMinWidth: CGFloat = 36
+    // Why this aggressive. SwiftUI's toolbar layout treats the
+    // `.principal` item's minimum width as a hard floor: whatever we
+    // declare here is what the toolbar insists on reserving between
+    // the sidebar toggle and the `.primaryAction` cluster. Any floor
+    // above a few glyphs pushes share / mode picker into the »
+    // overflow menu. The user's explicit rule is "primaryAction
+    // buttons must not disappear no matter how narrow the window
+    // gets," so we take the pill's compressibility as far as it
+    // goes.
+    //
+    // The `segmentLabel` helper already truncates via
+    // `.lineLimit(1) + .truncationMode(.tail)`, so a ~20pt segment
+    // renders as `…` + chevron — it looks like a nub, but it's
+    // still a clickable target that opens the popover with the full
+    // list. At the pill level, ~40pt holds one truncated segment +
+    // chevron divider. Ideal / max are unchanged so the pill reads
+    // at its original proportions on normal-width windows and only
+    // compresses under real pressure.
+    private static let titleSegmentMinWidth: CGFloat = 20
     private static let titleSegmentIdealWidth: CGFloat = 220
     private static let titleSegmentMaxWidth: CGFloat = 300
-    private static let promptSegmentMinWidth: CGFloat = 36
+    private static let promptSegmentMinWidth: CGFloat = 20
     private static let promptSegmentIdealWidth: CGFloat = 230
     private static let promptSegmentMaxWidth: CGFloat = 320
-    private static let pillMinWidth: CGFloat = 100
+    private static let pillMinWidth: CGFloat = 40
     private static let pillIdealWidth: CGFloat = 472
     private static let pillMaxWidth: CGFloat = 626
     private static let segmentHeight: CGFloat = 22
