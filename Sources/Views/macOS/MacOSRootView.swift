@@ -442,20 +442,29 @@ struct MacOSRootView: View {
         }
         // Window toolbar — the single home for window-chrome controls.
         //
-        // Responsibility split:
-        //   * `.principal`: navigation bar (sort chip + title +
-        //     prompt pulldown). `.navigation` placement was tried
-        //     but in `NavigationSplitView` it gets distributed to a
-        //     per-column toolbar region (our sort+breadcrumb landed
-        //     inside the middle-pane column, not the window
-        //     toolbar), and the trailing primary actions got
-        //     crowded out anyway. `.principal` keeps the cluster in
-        //     the window toolbar as one item — the centering cost is
-        //     acceptable when the content's own natural ideal is
-        //     modest.
-        //   * `.primaryAction`: share button (standalone) + mode
-        //     picker (a real `NSSegmentedControl` wrapped as one
-        //     `NSToolbarItem`). See `MiddlePaneModePicker`.
+        // All three toolbar items live in the trailing `.primaryAction`
+        // cluster:
+        //   1. `navigation-bar` — sort chip + breadcrumb (leading-most
+        //      of the trailing cluster).
+        //   2. `share` — ShareLink for the active conversation.
+        //   3. `mode-picker` — 4-segment NSSegmentedControl, trailing-
+        //      most of the cluster.
+        //
+        // Why not `.principal` for the navigation bar: principal
+        // centers the item, which makes AppKit reserve symmetric
+        // toolbar space on both sides — producing the "big gap on
+        // each side of the nav cluster" the user flagged. Why not
+        // `.navigation`: inside `NavigationSplitView` that placement
+        // routes items into per-column headers, which split our
+        // cluster across columns and introduced an even weirder gap
+        // in the middle of the titlebar.
+        //
+        // Having everything on the trailing side avoids both
+        // failure modes. AppKit lays primary-action items out in
+        // declaration order (leading-to-trailing within the cluster),
+        // so the nav bar ends up just to the right of the sidebar /
+        // titlebar area while share + mode picker stay pinned to the
+        // trailing edge.
         //
         // `.toolbarBackground(.automatic, for: .windowToolbar)` is
         // set explicitly (rather than left implicit) so the chrome
@@ -467,29 +476,14 @@ struct MacOSRootView: View {
         // work will go in a separate pane-internal observer, not via
         // the AppKit-automatic titlebar path.
         .toolbar(id: "workspace") {
-            // Sort pulldown + cascade breadcrumb, grouped in the same
-            // `.principal` slot so they read as one centered navigation
-            // cluster (sort chip on the left, breadcrumb on the right).
-            //
-            // The sort pulldown used to live in the sidebar's
-            // search-row area; the user wanted it promoted into window
-            // chrome. First pass put it in a separate
-            // `.navigation`-placed ToolbarItem, which planted it at the
-            // far-leading edge — past the window title / sidebar toggle
-            // — far away from the breadcrumb it semantically belongs
-            // next to. Folding both into the same principal item lets
-            // macOS center the whole cluster and keeps sort adjacent
-            // to the breadcrumb regardless of window width.
-            // Navigation cluster (sort + breadcrumb) in the window
-            // toolbar's `.principal` slot. `.navigation` was tried —
-            // inside `NavigationSplitView` it distributes to per-
-            // column toolbars (our cluster ended up pinned to the
-            // middle-pane column's header, the primary-action items
-            // ended up in a different column, and a large empty
-            // "between-columns" strip appeared in the title bar).
-            // `.principal` keeps all three of our custom items on the
-            // same window-toolbar surface, which is what we want.
-            ToolbarItem(id: "navigation-bar", placement: .principal) {
+            // Navigation cluster (sort + breadcrumb), leading-most
+            // within the trailing primary-action cluster. See the
+            // comment block at the top of the `.toolbar {}` for why
+            // all three items are in `.primaryAction` (short version:
+            // `.principal` centers and creates symmetric gaps,
+            // `.navigation` routes to per-column headers inside
+            // `NavigationSplitView`).
+            ToolbarItem(id: "navigation-bar", placement: .primaryAction) {
                 HStack(spacing: 10) {
                     // `compressible: true` — the toolbar competes with
                     // the breadcrumb and the right-side action cluster
@@ -516,15 +510,15 @@ struct MacOSRootView: View {
                 //   grant me this much" — even on wide windows, the
                 //   content can't grow beyond that, and `ViewThatFits`
                 //   gets stuck on a narrow tier. Letting the ideal
-                //   default to the content's intrinsic size
-                //   (= tier 0 ~ 560pt + sort chip ~ 80pt) lets AppKit
-                //   grant a generous allocation when there's slack.
+                //   default to the content's intrinsic size (= tier 0
+                //   ~ 560pt + sort chip ~ 80pt) lets AppKit grant a
+                //   generous allocation when there's slack.
                 //
-                // * NO `maxWidth: .infinity`. That flag makes AppKit
-                //   treat the principal as "eat all remaining space,"
-                //   which crowds the trailing primary-action cluster
-                //   right off the toolbar (the bug where the mode
-                //   picker disappeared).
+                // * NO `maxWidth: .infinity`. That flag would make
+                //   AppKit treat the item as "happy to eat all
+                //   remaining toolbar space," crowding its sibling
+                //   primary-action items (share + mode picker) off
+                //   the trailing edge.
                 //
                 // * `maxWidth: 640` caps growth at just above the
                 //   natural tier-0 size, so AppKit never allocates
@@ -614,13 +608,17 @@ struct MacOSRootView: View {
         // the SwiftUI intrinsic size. So we don't touch those and
         // rely on the SwiftUI content alone.
         if let toolbar = window.toolbar {
+            // Pin every toolbar item we own to `.high` so AppKit
+            // treats them as equally important under overflow
+            // pressure. Previously we switched on specific item IDs,
+            // which created a race: if a SwiftUI toolbar refresh
+            // added (or re-added) an item AFTER this pass ran, that
+            // new item entered the toolbar at the default `.standard`
+            // priority and AppKit overflowed it on first display.
+            // Unconditionally `.high` covers late-arriving items on
+            // subsequent `updateNSView` passes.
             for item in toolbar.items {
-                switch item.itemIdentifier.rawValue {
-                case "navigation-bar", "share", "mode-picker":
-                    item.visibilityPriority = .high
-                default:
-                    break
-                }
+                item.visibilityPriority = .high
             }
         }
     }
@@ -1418,6 +1416,17 @@ struct MiddlePaneModePicker: NSViewRepresentable {
         if let index = modes.firstIndex(of: selection) {
             control.selectedSegment = index
         }
+
+        // Make the segmented control measure its own size now. Without
+        // this, the control can report a zero intrinsic size to the
+        // hosting NSToolbarItem before layout settles — AppKit then
+        // sends the "zero-sized" item to the overflow menu on first
+        // display, and on subsequent passes the item is marked as
+        // overflow-eligible even after it reports a real size, so it
+        // never reappears in the toolbar proper. `sizeToFit()` seeds a
+        // non-zero intrinsic size up front so the toolbar-item's
+        // measurement lands correctly on the first pass.
+        control.sizeToFit()
         return control
     }
 
