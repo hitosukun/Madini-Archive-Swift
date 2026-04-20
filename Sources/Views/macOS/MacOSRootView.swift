@@ -442,29 +442,35 @@ struct MacOSRootView: View {
         }
         // Window toolbar — the single home for window-chrome controls.
         //
-        // All three toolbar items live in the trailing `.primaryAction`
-        // cluster:
-        //   1. `navigation-bar` — sort chip + breadcrumb (leading-most
-        //      of the trailing cluster).
-        //   2. `share` — ShareLink for the active conversation.
-        //   3. `mode-picker` — 4-segment NSSegmentedControl, trailing-
-        //      most of the cluster.
+        // Placement strategy (per a design review that pushed back on
+        // the earlier "everything in `.primaryAction`" fallback):
         //
-        // Why not `.principal` for the navigation bar: principal
-        // centers the item, which makes AppKit reserve symmetric
-        // toolbar space on both sides — producing the "big gap on
-        // each side of the nav cluster" the user flagged. Why not
-        // `.navigation`: inside `NavigationSplitView` that placement
-        // routes items into per-column headers, which split our
-        // cluster across columns and introduced an even weirder gap
-        // in the middle of the titlebar.
+        //   * `.principal`: sort chip + breadcrumb capsule
+        //     (`ReaderHeaderActivityPill`). The principal slot is the
+        //     correct semantic home for "the main navigation affordance
+        //     of this window." Centering is the natural consequence,
+        //     and the cluster is allowed to shrink via its internal
+        //     `ViewThatFits` tier ladder rather than by hunting for a
+        //     placement that happens to avoid centering.
+        //   * `.primaryAction` cluster (declaration order — AppKit
+        //     places them leading-to-trailing):
+        //       1. `prompt-counter` — the "N / M" position annotation,
+        //          separated out from the breadcrumb so it doesn't
+        //          fight the capsule for width inside a shared HStack.
+        //       2. `share` — ShareLink for the active conversation.
+        //       3. `mode-picker` — 4-segment NSSegmentedControl,
+        //          trailing-most of the cluster.
         //
-        // Having everything on the trailing side avoids both
-        // failure modes. AppKit lays primary-action items out in
-        // declaration order (leading-to-trailing within the cluster),
-        // so the nav bar ends up just to the right of the sidebar /
-        // titlebar area while share + mode picker stay pinned to the
-        // trailing edge.
+        // Why we don't put the whole nav cluster in `.primaryAction`
+        // anymore: that was a layout hack to dodge `.principal`'s
+        // centering. It worked visually but used placements in a way
+        // that didn't match their semantic intent, and was fragile
+        // under SDK updates.
+        //
+        // Why we don't use `.navigation`: inside `NavigationSplitView`
+        // that placement routes items into per-column headers, which
+        // split our cluster across the middle-pane and detail-pane
+        // column headers rather than into the window toolbar.
         //
         // `.toolbarBackground(.automatic, for: .windowToolbar)` is
         // set explicitly (rather than left implicit) so the chrome
@@ -476,14 +482,15 @@ struct MacOSRootView: View {
         // work will go in a separate pane-internal observer, not via
         // the AppKit-automatic titlebar path.
         .toolbar(id: "workspace") {
-            // Navigation cluster (sort + breadcrumb), leading-most
-            // within the trailing primary-action cluster. See the
-            // comment block at the top of the `.toolbar {}` for why
-            // all three items are in `.primaryAction` (short version:
-            // `.principal` centers and creates symmetric gaps,
-            // `.navigation` routes to per-column headers inside
-            // `NavigationSplitView`).
-            ToolbarItem(id: "navigation-bar", placement: .primaryAction) {
+            // Principal cluster: sort chip + breadcrumb capsule. The
+            // sort chip is co-located with the breadcrumb (rather than
+            // split into its own item) because they're semantically
+            // one thing — "how the main list is organized." Width
+            // safety is purely on the breadcrumb side (tiered
+            // `ViewThatFits`); the outer `maxWidth: 640` is a
+            // soft-cap that prevents the cluster from consuming the
+            // entire toolbar on very wide windows.
+            ToolbarItem(id: "navigation-bar", placement: .principal) {
                 HStack(spacing: 10) {
                     // `compressible: true` — the toolbar competes with
                     // the breadcrumb and the right-side action cluster
@@ -504,30 +511,41 @@ struct MacOSRootView: View {
                         onTitlePulldownOpen: revealActiveConversationInMiddlePane
                     )
                 }
-                // Width hint rationale:
+                // Outer soft-cap on the principal slot:
                 //
-                // * NO `idealWidth`. A fixed ideal tells AppKit "only
-                //   grant me this much" — even on wide windows, the
-                //   content can't grow beyond that, and `ViewThatFits`
-                //   gets stuck on a narrow tier. Letting the ideal
-                //   default to the content's intrinsic size (= tier 0
-                //   ~ 560pt + sort chip ~ 80pt) lets AppKit grant a
-                //   generous allocation when there's slack.
+                // * NO `idealWidth`. A fixed ideal would tell AppKit
+                //   "only grant me this much" — even on wide windows
+                //   the content couldn't grow, and `ViewThatFits`
+                //   would stay stuck on a narrow tier. Letting the
+                //   ideal default to the content's intrinsic size
+                //   (= tier-0 ~ 560pt + sort chip ~ 80pt) lets AppKit
+                //   grant a roomy allocation when there's slack.
                 //
-                // * NO `maxWidth: .infinity`. That flag would make
-                //   AppKit treat the item as "happy to eat all
-                //   remaining toolbar space," crowding its sibling
-                //   primary-action items (share + mode picker) off
-                //   the trailing edge.
+                // * `maxWidth: 640` just above the natural tier-0
+                //   size, so AppKit never allocates more than the
+                //   breadcrumb can actually use. Real width arbitration
+                //   happens inside `ReaderHeaderActivityPill` via the
+                //   tier-descending `ViewThatFits` ladder.
                 //
-                // * `maxWidth: 640` caps growth at just above the
-                //   natural tier-0 size, so AppKit never allocates
-                //   more than the breadcrumb can actually use.
-                //   `minWidth: 60` is the compression floor — below
+                // * `minWidth: 60` is the compression floor — below
                 //   that AppKit sends the item to the » overflow menu
                 //   (`ViewThatFits` already descends to a thread-only
                 //   sliver tier before that point).
                 .frame(minWidth: 60, maxWidth: 640)
+            }
+            // "N / M" prompt-position counter as its own ToolbarItem.
+            // Pulled out of the breadcrumb capsule because the
+            // counter's `fixedSize` claim was muddling the tier-
+            // descending layout inside the principal: the counter and
+            // the capsule were competing for width in a shared HStack,
+            // which made the capsule's `ViewThatFits` proposals less
+            // predictable. Separate ToolbarItem = separate layout
+            // context = each can size cleanly on its own terms.
+            ToolbarItem(id: "prompt-counter", placement: .primaryAction) {
+                ReaderPromptCounterView(
+                    promptOutline: tabManager.promptOutline,
+                    selectedPromptID: tabManager.selectedPromptID
+                )
             }
             ToolbarItem(id: "share", placement: .primaryAction) {
                 WorkspaceFloatingExportButton(detail: tabManager.activeDetail)

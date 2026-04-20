@@ -142,42 +142,38 @@ struct ReaderWorkspaceView: View {
 
 }
 
-/// **The navigation bar.** Xcode-style cascade breadcrumb rendered
-/// inside a soft capsule: `[thread] > [prompt]`, with the "1 / N"
-/// prompt counter hanging off outside the capsule as a separate
-/// sibling.
+/// **The navigation breadcrumb.** Xcode-style cascade rendered inside
+/// a soft capsule: `[thread] > [prompt]`. The "1 / N" counter is a
+/// separate sibling ToolbarItem (see `ReaderPromptCounterView`), NOT
+/// part of this capsule.
 ///
 /// **Design rules (anchored in this order):**
 ///
-///   1. Right-side toolbar buttons never disappear. This pill is the
-///      only part of the toolbar that compresses under window-width
-///      pressure. The `.primaryAction` cluster (share, mode picker)
-///      stays pinned at its natural size.
-///   2. The pill shrinks via *truncation*, not via layout break. Text
-///      gets `lineLimit(1) + .truncationMode(.tail)`, and the chevron
-///      and counter are `fixedSize()` so they never distort.
-///   3. Within the pill, the prompt half yields first (lower
+///   1. Right-side toolbar buttons never disappear. This capsule is
+///      the only part of the toolbar that compresses under window-
+///      width pressure. The `.primaryAction` cluster (counter, share,
+///      mode picker) stays pinned at its natural size.
+///   2. The capsule shrinks via *truncation*, not via layout break.
+///      Text gets `lineLimit(1) + .truncationMode(.tail)`; the
+///      chevron is `fixedSize()` so it never distorts.
+///   3. Within a tier, the prompt half yields first (lower
 ///      `layoutPriority`), the thread half yields second, the chevron
 ///      never yields.
-///   4. The "1 / N" counter is external to the breadcrumb capsule so
-///      it stays readable even when the thread/prompt labels are
-///      ellipsized. It's a higher `layoutPriority` sibling so it
-///      survives longer than the capsule body.
-///   5. The capsule itself uses `ViewThatFits` with 4 tiers
-///      (full → medium → compact → thread-only) to gracefully fall
-///      back when even tail-truncation would produce unreadable
-///      output. Each tier has bounded segment max widths so
-///      `ViewThatFits` can make a clean choice based on the proposed
-///      width from the toolbar.
+///   4. Across tiers, the capsule uses `ViewThatFits` with 5 tiers
+///      (full → medium → compact → prompt-ellipsis → thread-only) to
+///      gracefully fall back when even tail-truncation would produce
+///      unreadable output. Each tier has bounded segment widths
+///      (`.frame(width:)` not `maxWidth:`) so `ViewThatFits` can make
+///      a clean choice based on the proposed width from the toolbar.
 ///
-/// Mounted into the native window toolbar's trailing `.primaryAction`
-/// cluster by `MacOSRootView.workspaceSplitView` so it's present in
-/// every mode and its x-coordinate doesn't jump as the user cascades
-/// through middle-pane modes. See the `.toolbar {}` header comment at
-/// the call site for why we ended up in `.primaryAction` after trying
-/// `.principal` (centered — symmetric gaps on both sides) and
-/// `.navigation` (split into per-column headers by
-/// `NavigationSplitView`).
+/// Mounted into the native window toolbar's `.principal` slot by
+/// `MacOSRootView.workspaceSplitView` so it's present in every mode
+/// and its x-coordinate doesn't jump as the user cascades through
+/// middle-pane modes. See the `.toolbar {}` header comment at the
+/// call site for why this is `.principal` (semantic home of the main
+/// navigation affordance) — the width-safety story lives entirely
+/// in this file's tier ladder, not in a placement-chosen-to-dodge-
+/// centering.
 struct ReaderHeaderActivityPill: View {
     private enum HoveredSegment {
         case thread
@@ -203,21 +199,21 @@ struct ReaderHeaderActivityPill: View {
     // there's no room for it). Fixed widths give `ViewThatFits` a
     // clean ideal-size ladder to descend.
     private static let tiers: [Tier] = [
-        // Comfortable width: both segments have room to breathe.
+        // 1. Full — both segments have room to breathe.
         Tier(threadMaxWidth: 260, promptMaxWidth: 280, showsChevron: true),
-        // Medium width: segments cap earlier → tail-truncation kicks in.
+        // 2. Medium — segments cap earlier → tail-truncation kicks in.
         Tier(threadMaxWidth: 180, promptMaxWidth: 160, showsChevron: true),
-        // Compact width: prompt half is aggressively squeezed first.
+        // 3. Compact — prompt half is aggressively squeezed first.
         Tier(threadMaxWidth: 120, promptMaxWidth: 70,  showsChevron: true),
-        // Very narrow: prompt is dropped entirely, replaced by "…" —
-        // the thread title still reads + chevron signals "there's more
-        // under the hood, click to see the full prompt list."
+        // 4. Prompt-ellipsis — prompt is dropped entirely, replaced by
+        //    "…" — the thread title still reads + chevron signals
+        //    "there's more under the hood, click to see the full
+        //    prompt list."
         Tier(threadMaxWidth: 120, promptMaxWidth: nil, showsChevron: true),
-        // Thread-only, still with chevron-like "…" affordance dropped.
+        // 5. Thread-only — last-resort sliver; chevron gone, prompt
+        //    gone, just a tail-truncated thread title. Popover still
+        //    reachable by clicking the thread segment.
         Tier(threadMaxWidth: 90, promptMaxWidth: nil, showsChevron: false),
-        // Absolute last resort — barely-there sliver that just shows
-        // "…" truncation. Counter + right toolbar buttons stay visible.
-        Tier(threadMaxWidth: 48, promptMaxWidth: nil, showsChevron: false),
     ]
 
     private static let segmentHeight: CGFloat = 22
@@ -250,33 +246,18 @@ struct ReaderHeaderActivityPill: View {
     @State private var hoveredSegment: HoveredSegment?
 
     var body: some View {
-        // Two siblings in one horizontal stack:
-        //   * `breadcrumbCapsule` — the shrinkable part. `ViewThatFits`
-        //     picks a tier based on the width the toolbar proposes.
-        //   * `counterView` — a `fixedSize`, high-`layoutPriority`
-        //     annotation that rides alongside. It survives every
-        //     reasonable shrink, so "how far in am I" stays legible
-        //     even when the thread/prompt labels are ellipsized.
-        //
-        // `layoutPriority` difference (capsule 1 vs counter 2) tells
-        // SwiftUI: if there's not enough room for both at their ideal
-        // widths, give the counter its natural size first and squeeze
-        // the capsule. The capsule's internal `ViewThatFits` then
-        // picks the tightest tier that fits the squeezed width.
-        HStack(spacing: 8) {
-            breadcrumbCapsule
-                .layoutPriority(1)
-
-            if !promptOutline.isEmpty {
-                counterView
-                    .layoutPriority(2)
-                    .fixedSize()
-            }
-        }
-        .animation(.easeInOut(duration: 0.12), value: hoveredSegment == .thread)
-        .animation(.easeInOut(duration: 0.12), value: hoveredSegment == .prompt)
-        .animation(.easeInOut(duration: 0.12), value: isThreadPopoverPresented)
-        .animation(.easeInOut(duration: 0.12), value: isPromptPopoverPresented)
+        // Just the breadcrumb capsule. The "1 / N" counter is now a
+        // separate sibling ToolbarItem mounted by MacOSRootView — see
+        // `ReaderPromptCounterView` below. Keeping the counter out of
+        // this capsule means it can't compete with the breadcrumb for
+        // width inside a shared layout context; the capsule is free to
+        // descend through its tier ladder without the counter's
+        // fixedSize claim reshaping the remainder.
+        breadcrumbCapsule
+            .animation(.easeInOut(duration: 0.12), value: hoveredSegment == .thread)
+            .animation(.easeInOut(duration: 0.12), value: hoveredSegment == .prompt)
+            .animation(.easeInOut(duration: 0.12), value: isThreadPopoverPresented)
+            .animation(.easeInOut(duration: 0.12), value: isPromptPopoverPresented)
     }
 
     // MARK: - Breadcrumb capsule (tiered)
@@ -466,19 +447,6 @@ struct ReaderHeaderActivityPill: View {
         }
     }
 
-    // MARK: - Counter (independent sibling)
-
-    /// Positional meta outside the breadcrumb capsule. Tabular digits
-    /// keep the column width stable as the numerator grows past single
-    /// digits. `fixedSize()` + higher `layoutPriority` at the call
-    /// site keeps it visible as the capsule shrinks.
-    private var counterView: some View {
-        Text(promptCounterText)
-            .font(.caption.monospacedDigit())
-            .foregroundStyle(.secondary)
-            .lineLimit(1)
-    }
-
     // MARK: - Chevron divider
 
     private var chevron: some View {
@@ -551,8 +519,35 @@ struct ReaderHeaderActivityPill: View {
         return selectedPrompt.label
     }
 
-    private var promptCounterText: String {
-        guard !promptOutline.isEmpty else { return "—" }
+}
+
+/// "1 / N" prompt-position counter. Mounted as its own ToolbarItem
+/// (sibling of the principal breadcrumb) rather than folded inside
+/// `ReaderHeaderActivityPill` — the previous design had the counter
+/// fighting the breadcrumb for width inside a single HStack, which
+/// blurred the tier-descending logic. Separating responsibilities
+/// lets the breadcrumb shrink freely via `ViewThatFits` while the
+/// counter simply pins itself at its intrinsic, tabular-digit width.
+///
+/// Renders `EmptyView` when there are no prompts so the ToolbarItem
+/// collapses instead of showing a stale "— / —" placeholder.
+struct ReaderPromptCounterView: View {
+    let promptOutline: [ConversationPromptOutlineItem]
+    let selectedPromptID: String?
+
+    var body: some View {
+        if promptOutline.isEmpty {
+            EmptyView()
+        } else {
+            Text(counterText)
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .fixedSize()
+        }
+    }
+
+    private var counterText: String {
         let current = promptOutline.firstIndex(where: { $0.id == selectedPromptID }).map { $0 + 1 } ?? 1
         return "\(current) / \(promptOutline.count)"
     }
