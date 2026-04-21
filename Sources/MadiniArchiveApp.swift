@@ -53,7 +53,7 @@ struct RootView: View {
 
     var body: some View {
         #if os(macOS)
-        MacOSRootView(services: services)
+        DesignMockRootView()
         #else
         IOSRootView(services: services)
         #endif

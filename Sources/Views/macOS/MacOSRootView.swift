@@ -83,7 +83,9 @@ struct MacOSRootView: View {
         // `WindowConfigurator` itself is kept for future AppKit
         // tweaks that don't disturb the split view (traffic-light
         // behavior, window appearance, etc.).
-        .background(WindowConfigurator { _ in })
+        .background(WindowConfigurator { window in
+            window.titleVisibility = .hidden
+        })
         // Window-level JSON drop handler. Sits ABOVE the in-app tag /
         // conversation drop destinations (which live on specific rows
         // further down the view tree) so an external file drag lands
@@ -1333,11 +1335,9 @@ struct MiddlePaneModePicker: NSViewRepresentable {
 // MARK: - Window configuration
 
 /// Walks up to the hosting `NSWindow` on first layout and applies the
-/// window-level chrome settings SwiftUI doesn't expose: toolbar style
-/// (`.unified` — merges title bar + toolbar into one Finder-style
-/// region), full-size content view toggle, and any future AppKit-only
-/// tweaks. Attached via `.background(WindowConfigurator { … })` at the
-/// root of `MacOSRootView.body`.
+/// small window-level chrome settings SwiftUI doesn't expose directly.
+/// Keep this deliberately narrow: more invasive titlebar changes broke
+/// `NavigationSplitView` layout on the current SDK.
 ///
 /// **Why `viewDidMoveToWindow` rather than a `DispatchQueue.main.async`
 /// poke from `makeNSView`.** The representable is built before the
