@@ -2,7 +2,6 @@
 import SwiftUI
 
 struct DesignMockRootView: View {
-    @State private var isSidebarVisible = true
     @State private var selectedMode: DesignMockMode = .default
     @State private var selectedProjectID: String?
     @State private var selectedConversationID = DesignMockData.conversations.first?.id
@@ -17,26 +16,26 @@ struct DesignMockRootView: View {
             ZStack {
                 DesignMockLiquidBackground()
 
-                VStack(spacing: 0) {
-                    toolbar(width: geometry.size.width)
+                HStack(spacing: 0) {
+                    sidebar
+                        .frame(width: sidebarWidth)
 
-                    HStack(spacing: 0) {
-                        if isSidebarVisible {
-                            sidebar
-                                .frame(width: sidebarWidth)
-                                .transition(.move(edge: .leading).combined(with: .opacity))
+                    VStack(spacing: 0) {
+                        toolbar(width: max(0, geometry.size.width - sidebarWidth))
+
+                        HStack(spacing: 0) {
+                            middlePane
+                                .frame(width: middleWidth(totalWidth: geometry.size.width - sidebarWidth))
+
+                            if selectedMode != .table {
+                                readerPane
+                                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            }
                         }
-
-                        middlePane
-                            .frame(width: middleWidth(totalWidth: geometry.size.width))
-
-                        if selectedMode != .table {
-                            readerPane
-                                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .foregroundStyle(DesignMockColors.primaryText)
         }
@@ -49,61 +48,25 @@ struct DesignMockRootView: View {
     }
 
     private func toolbar(width: CGFloat) -> some View {
-        HStack(spacing: 0) {
-            HStack(spacing: 6) {
-                Button {
-                    withAnimation(.easeOut(duration: 0.14)) {
-                        isSidebarVisible.toggle()
-                    }
-                } label: {
-                    Image(systemName: "sidebar.left")
-                        .font(.system(size: 15, weight: .medium))
-                        .frame(width: 30, height: 30)
-                }
-                .buttonStyle(.plain)
-                .contentShape(Rectangle())
-                .help("Toggle sidebar")
-            }
-            .padding(.leading, 72)
-            .padding(.trailing, 12)
-            .frame(width: isSidebarVisible ? sidebarWidth : 126, alignment: .leading)
-            .overlay(alignment: .trailing) {
-                if isSidebarVisible {
-                    Rectangle()
-                        .fill(DesignMockColors.border)
-                        .frame(width: 1)
-                }
-            }
-
-            HStack(spacing: 8) {
-                Spacer(minLength: 6)
-
-                HStack(spacing: 10) {
-                    sortChip
-                        .layoutPriority(1)
-
-                    breadcrumb
-                        .layoutPriority(1)
-                }
-                .frame(minWidth: 0, alignment: .leading)
-                .frame(maxWidth: min(900, max(60, width - 420)), alignment: .leading)
-
-                Spacer(minLength: 6)
-
-                HStack(spacing: 6) {
-                    Button {
-                    } label: {
-                        Image(systemName: "square.and.arrow.up")
-                            .frame(width: 30, height: 30)
-                    }
-                    .buttonStyle(.plain)
-
-                    modePicker
-                }
+        HStack(spacing: 12) {
+            sortChip
                 .layoutPriority(4)
+
+            Spacer(minLength: 8)
+
+            breadcrumb
+                .frame(maxWidth: min(760, max(80, width - 260)), alignment: .center)
+                .layoutPriority(2)
+
+            Spacer(minLength: 8)
+
+            HStack(spacing: 6) {
+                toolbarIconButton("square.and.arrow.up")
+                modePicker
             }
-            .padding(.horizontal, 12)
+                .layoutPriority(5)
         }
+        .padding(.horizontal, 12)
         .frame(height: toolbarHeight)
         .background(.ultraThinMaterial)
         .background(DesignMockColors.toolbarTint)
@@ -138,7 +101,7 @@ struct DesignMockRootView: View {
             }
             .padding(.horizontal, 10)
             .frame(minWidth: 30)
-            .frame(height: 30)
+            .frame(height: 24)
             .clipShape(Capsule())
             .background(.thinMaterial, in: Capsule())
             .background(DesignMockColors.glassWash, in: Capsule())
@@ -156,13 +119,13 @@ struct DesignMockRootView: View {
 
     private var breadcrumb: some View {
         ViewThatFits(in: .horizontal) {
-            breadcrumbCapsule(titleWidth: 260, promptWidth: 280, promptStyle: .full, showsCounter: true)
-            breadcrumbCapsule(titleWidth: 180, promptWidth: 160, promptStyle: .full, showsCounter: true)
-            breadcrumbCapsule(titleWidth: 120, promptWidth: 70, promptStyle: .full, showsCounter: true)
-            breadcrumbCapsule(titleWidth: 120, promptWidth: 24, promptStyle: .ellipsis, showsCounter: true)
-            breadcrumbCapsule(titleWidth: 90, promptWidth: 0, promptStyle: .hidden, showsCounter: false)
+            breadcrumbCapsule(titleWidth: 260, promptWidth: 260, promptStyle: .full, showsCounter: true)
+            breadcrumbCapsule(titleWidth: 190, promptWidth: 170, promptStyle: .full, showsCounter: true)
+            breadcrumbCapsule(titleWidth: 130, promptWidth: 92, promptStyle: .full, showsCounter: true)
+            breadcrumbCapsule(titleWidth: 130, promptWidth: 24, promptStyle: .ellipsis, showsCounter: true)
+            breadcrumbCapsule(titleWidth: 96, promptWidth: 0, promptStyle: .hidden, showsCounter: false)
         }
-        .frame(minWidth: 0, alignment: .leading)
+        .frame(minWidth: 0, alignment: .center)
     }
 
     private func breadcrumbCapsule(
@@ -171,9 +134,8 @@ struct DesignMockRootView: View {
         promptStyle: DesignMockPromptBreadcrumbStyle,
         showsCounter: Bool
     ) -> some View {
-        HStack(spacing: 2) {
-            breadcrumbSegment("自作小説アルラウネの執筆支援", weight: .semibold, segment: .title)
-                .frame(width: titleWidth, alignment: .leading)
+        HStack(spacing: 0) {
+            breadcrumbSegment("自作小説アルラウネの執筆支援", weight: .semibold, segment: .title, width: titleWidth)
 
             if promptStyle != .hidden {
                 Image(systemName: "chevron.right")
@@ -183,23 +145,12 @@ struct DesignMockRootView: View {
 
                 switch promptStyle {
                 case .full:
-                    breadcrumbSegment("自作小説アルラウネを執筆支援", weight: .regular, segment: .prompt)
-                        .foregroundStyle(DesignMockColors.secondaryText)
-                        .frame(width: promptWidth, alignment: .leading)
+                    breadcrumbPromptSegment(width: promptWidth, showsCounter: showsCounter)
                 case .ellipsis:
-                    breadcrumbPromptStub
-                        .frame(width: promptWidth, alignment: .center)
+                    breadcrumbPromptSegment(width: promptWidth, promptStyle: .ellipsis, showsCounter: showsCounter)
                 case .hidden:
                     EmptyView()
                 }
-            }
-
-            if showsCounter {
-                Text("1 / 42")
-                    .font(.caption2)
-                    .monospacedDigit()
-                    .foregroundStyle(DesignMockColors.secondaryText)
-                    .padding(.horizontal, 6)
             }
         }
         .padding(.horizontal, 4)
@@ -215,21 +166,53 @@ struct DesignMockRootView: View {
         .shadow(color: DesignMockColors.glassShadow, radius: 10, y: 4)
     }
 
-    private var breadcrumbPromptStub: some View {
+    private var promptCounter: some View {
+        Text("1 / 42")
+            .font(.caption2)
+            .monospacedDigit()
+            .foregroundStyle(DesignMockColors.secondaryText)
+            .padding(.trailing, 4)
+    }
+
+    private func breadcrumbPromptSegment(
+        width: CGFloat,
+        promptStyle: DesignMockPromptBreadcrumbStyle = .full,
+        showsCounter: Bool
+    ) -> some View {
         Menu {
             ForEach(DesignMockData.promptSnippets.indices, id: \.self) { index in
                 Button("プロンプト \(index + 1)") {}
             }
         } label: {
-            Text("…")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(DesignMockColors.secondaryText)
-                .frame(width: 24, height: 22)
-                .background(
-                    hoveredBreadcrumbSegment == .prompt ? DesignMockColors.segmentHover : Color.clear,
-                    in: RoundedRectangle(cornerRadius: 9, style: .continuous)
-                )
-                .contentShape(Rectangle())
+            HStack(spacing: 6) {
+                switch promptStyle {
+                case .full:
+                    Text("自作小説アルラウネを執筆支援")
+                        .font(.system(size: 13))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .foregroundStyle(DesignMockColors.secondaryText)
+                        .frame(width: width, alignment: .leading)
+                case .ellipsis:
+                    Text("…")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(DesignMockColors.secondaryText)
+                        .frame(width: width, alignment: .center)
+                case .hidden:
+                    EmptyView()
+                }
+
+                if showsCounter {
+                    promptCounter
+                }
+            }
+            .padding(.horizontal, 6)
+            .frame(height: 22)
+            .background(
+                hoveredBreadcrumbSegment == .prompt ? DesignMockColors.segmentHover : Color.clear,
+                in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+            )
+            .contentShape(Rectangle())
         }
         .menuStyle(.button)
         .buttonStyle(.plain)
@@ -239,7 +222,7 @@ struct DesignMockRootView: View {
         }
     }
 
-    private func breadcrumbSegment(_ title: String, weight: Font.Weight, segment: DesignMockBreadcrumbSegment) -> some View {
+    private func breadcrumbSegment(_ title: String, weight: Font.Weight, segment: DesignMockBreadcrumbSegment, width: CGFloat? = nil) -> some View {
         Menu {
             ForEach(DesignMockData.conversations.prefix(8)) { item in
                 Button(item.title) {
@@ -258,7 +241,7 @@ struct DesignMockRootView: View {
                     .opacity(hoveredBreadcrumbSegment == segment ? 1 : 0)
             }
             .padding(.horizontal, 6)
-            .frame(height: 22)
+            .frame(width: width, height: 22, alignment: .leading)
             .background(
                 hoveredBreadcrumbSegment == segment ? DesignMockColors.segmentHover : Color.clear,
                 in: RoundedRectangle(cornerRadius: 9, style: .continuous)
@@ -292,6 +275,25 @@ struct DesignMockRootView: View {
             }
         }
         .padding(2)
+        .clipShape(Capsule())
+        .background(.thinMaterial, in: Capsule())
+        .background(DesignMockColors.glassWash, in: Capsule())
+        .overlay {
+            Capsule()
+                .stroke(DesignMockColors.glassStroke, lineWidth: 0.7)
+        }
+        .shadow(color: DesignMockColors.glassShadow, radius: 8, y: 3)
+    }
+
+    private func toolbarIconButton(_ systemName: String) -> some View {
+        Button {
+        } label: {
+            Image(systemName: systemName)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(DesignMockColors.secondaryText)
+                .frame(width: 30, height: 28)
+        }
+        .buttonStyle(.plain)
         .clipShape(Capsule())
         .background(.thinMaterial, in: Capsule())
         .background(DesignMockColors.glassWash, in: Capsule())
