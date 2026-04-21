@@ -1,83 +1,734 @@
 #if os(macOS)
+import AppKit
 import SwiftUI
 
 struct DesignMockRootView: View {
-    @State private var selectedMode: DesignMockMode = .default
-    @State private var selectedProjectID: String?
-    @State private var selectedConversationID = DesignMockData.conversations.first?.id
+    @Environment(\.isSearching) private var isSearching
+    @State private var selectedSidebarItemID: DesignMockSidebarItem.ID? = DesignMockSidebarItem.allThreads.id
+    @State private var selectedConversationID: DesignMockConversation.ID? = DesignMockData.conversations.first?.id
+    @State private var selectedLayoutMode: DesignMockLayoutMode = .default
+    @State private var selectedCenterDisplayMode: DesignMockCenterDisplayMode = .cards
     @State private var sortKey: DesignMockSortKey = .newest
-    @State private var hoveredBreadcrumbSegment: DesignMockBreadcrumbSegment?
-
-    private let sidebarWidth: CGFloat = 260
-    private let toolbarHeight: CGFloat = 52
+    @State private var searchText = ""
+    @State private var selectedPromptIndex = 0
+    @State private var expandedPromptConversationID: DesignMockConversation.ID?
 
     var body: some View {
-        GeometryReader { geometry in
-            ZStack {
-                DesignMockLiquidBackground()
+        rootSplitView
+        .searchable(text: $searchText, prompt: "検索")
+        .navigationTitle("")
+        .toolbar {
+            ToolbarItem(placement: .navigation) {
+                HStack(spacing: 10) {
+                    DesignMockSortMenu(sortKey: $sortKey)
 
-                HStack(spacing: 0) {
-                    sidebar
-                        .frame(width: sidebarWidth)
-
-                    VStack(spacing: 0) {
-                        toolbar(width: max(0, geometry.size.width - sidebarWidth))
-
-                        HStack(spacing: 0) {
-                            middlePane
-                                .frame(width: middleWidth(totalWidth: geometry.size.width - sidebarWidth))
-
-                            if selectedMode != .table {
-                                readerPane
-                                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                            }
+                    DesignMockBreadcrumbBar(
+                        conversation: selectedConversation,
+                        promptTitle: currentPromptTitle,
+                        promptIndex: selectedPromptIndex,
+                        promptCount: DesignMockData.promptSnippets.count,
+                        conversations: filteredConversations,
+                        prompts: DesignMockData.promptSnippets,
+                        onSelectConversation: { id in
+                            selectedConversationID = id
+                            selectedPromptIndex = 0
+                        },
+                        onSelectPrompt: { index in
+                            selectedPromptIndex = index
                         }
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    }
+                    )
+                    .frame(minWidth: 90, idealWidth: 584, maxWidth: 584, alignment: .leading)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            .foregroundStyle(DesignMockColors.primaryText)
+
+            ToolbarItem(placement: .primaryAction) {
+                DesignMockLayoutModePicker(selection: $selectedLayoutMode, isCompact: isSearching || !searchText.isEmpty)
+            }
+
+            ToolbarItem(placement: .primaryAction) {
+                DesignMockToolbarIconButton(systemImage: "square.and.arrow.up", help: "Share")
+            }
         }
         .background(
             WindowConfigurator { window in
                 window.titleVisibility = .hidden
-                window.isMovableByWindowBackground = true
+                window.subtitle = ""
+                window.title = ""
+                window.representedURL = nil
+                window.minSize = NSSize(width: 980, height: 640)
             }
         )
     }
 
-    private func toolbar(width: CGFloat) -> some View {
-        HStack(spacing: 12) {
-            sortChip
-                .layoutPriority(4)
-
-            Spacer(minLength: 8)
-
-            breadcrumb
-                .frame(maxWidth: min(760, max(80, width - 260)), alignment: .center)
-                .layoutPriority(2)
-
-            Spacer(minLength: 8)
-
-            HStack(spacing: 6) {
-                toolbarIconButton("square.and.arrow.up")
-                modePicker
+    @ViewBuilder
+    private var rootSplitView: some View {
+        switch selectedLayoutMode {
+        case .table:
+            NavigationSplitView {
+                DesignMockSidebar(selection: $selectedSidebarItemID)
+                    .navigationSplitViewColumnWidth(min: 240, ideal: 270, max: 320)
+            } detail: {
+                DesignMockThreadTablePane(
+                    conversations: sortedConversations,
+                    selection: $selectedConversationID
+                )
             }
-                .layoutPriority(5)
-        }
-        .padding(.horizontal, 12)
-        .frame(height: toolbarHeight)
-        .background(.ultraThinMaterial)
-        .background(DesignMockColors.toolbarTint)
-        .overlay(alignment: .bottom) {
-            Rectangle()
-                .fill(DesignMockColors.border)
-                .frame(height: 1)
+        case .default:
+            NavigationSplitView {
+                DesignMockSidebar(selection: $selectedSidebarItemID)
+                    .navigationSplitViewColumnWidth(min: 240, ideal: 270, max: 320)
+            } content: {
+                DesignMockDefaultContentPane(
+                    displayMode: $selectedCenterDisplayMode,
+                    conversations: sortedConversations,
+                    conversationSelection: $selectedConversationID,
+                    selectedPromptIndex: $selectedPromptIndex,
+                    expandedPromptConversationID: $expandedPromptConversationID
+                )
+                .navigationSplitViewColumnWidth(min: 360, ideal: 460, max: 760)
+            } detail: {
+                DesignMockReaderPane(
+                    conversation: selectedConversation,
+                    promptTitle: currentPromptTitle
+                )
+            }
+        case .viewer:
+            NavigationSplitView {
+                DesignMockSidebar(selection: $selectedSidebarItemID)
+                    .navigationSplitViewColumnWidth(min: 240, ideal: 270, max: 320)
+            } detail: {
+                DesignMockReaderPane(
+                    conversation: selectedConversation,
+                    promptTitle: currentPromptTitle
+                )
+            }
         }
     }
 
-    private var sortChip: some View {
+    private var currentPromptTitle: String {
+        guard DesignMockData.promptSnippets.indices.contains(selectedPromptIndex) else {
+            return "Prompt"
+        }
+        return DesignMockData.promptSnippets[selectedPromptIndex]
+    }
+
+    private var selectedConversation: DesignMockConversation? {
+        guard let selectedConversationID else { return sortedConversations.first }
+        return DesignMockData.conversations.first { $0.id == selectedConversationID } ?? sortedConversations.first
+    }
+
+    private var filteredConversations: [DesignMockConversation] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return DesignMockData.conversations.filter { item in
+            matchesSidebarFilter(item) && matchesSearch(item, query: query)
+        }
+    }
+
+    private var sortedConversations: [DesignMockConversation] {
+        filteredConversations.sorted { lhs, rhs in
+            switch sortKey {
+            case .newest:
+                lhs.sortRank < rhs.sortRank
+            case .oldest:
+                lhs.sortRank > rhs.sortRank
+            case .mostPrompts:
+                lhs.prompts > rhs.prompts
+            case .fewestPrompts:
+                lhs.prompts < rhs.prompts
+            }
+        }
+    }
+
+    private func matchesSidebarFilter(_ item: DesignMockConversation) -> Bool {
+        guard let selectedSidebarItemID else { return true }
+        switch DesignMockSidebarItem.kind(for: selectedSidebarItemID) {
+        case .all:
+            return true
+        case .project(let id):
+            return item.projectID == id
+        case .suggested:
+            if case .suggested = item.projectState { return true }
+            return false
+        case .unassigned:
+            if case .none = item.projectState { return true }
+            return false
+        case .source(let source):
+            return item.source.lowercased() == source.lowercased()
+        }
+    }
+
+    private func matchesSearch(_ item: DesignMockConversation, query: String) -> Bool {
+        guard !query.isEmpty else { return true }
+        return item.title.localizedCaseInsensitiveContains(query)
+            || item.projectLabel.localizedCaseInsensitiveContains(query)
+            || item.source.localizedCaseInsensitiveContains(query)
+    }
+}
+
+private struct DesignMockSidebar: View {
+    @Binding var selection: DesignMockSidebarItem.ID?
+
+    var body: some View {
+        List(selection: $selection) {
+            Section("Library") {
+                sidebarRow(DesignMockSidebarItem.allThreads)
+                sidebarRow(.init(id: "archive-db", title: "archive.db", subtitle: "Local SQLite archive", systemImage: "externaldrive", kind: .all))
+            }
+
+            Section("Projects") {
+                ForEach(DesignMockData.projects.map(DesignMockSidebarItem.project)) { item in
+                    sidebarRow(item)
+                }
+            }
+
+            Section("Triage") {
+                sidebarRow(.init(id: "suggested", title: "Needs review", subtitle: "Suggested project links", systemImage: "tray.and.arrow.down", kind: .suggested))
+                sidebarRow(.init(id: "unassigned", title: "Unassigned", subtitle: "No project yet", systemImage: "circle.dashed", kind: .unassigned))
+            }
+
+            Section("Sources") {
+                ForEach(DesignMockData.sources, id: \.name) { source in
+                    sidebarRow(.init(
+                        id: "source-\(source.name)",
+                        title: source.name,
+                        subtitle: "\(source.count) threads",
+                        systemImage: "circle.fill",
+                        kind: .source(source.name)
+                    ))
+                }
+            }
+        }
+        .listStyle(.sidebar)
+    }
+
+    private func sidebarRow(_ item: DesignMockSidebarItem) -> some View {
+        Label {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(item.title)
+                    .lineLimit(1)
+                if let subtitle = item.subtitle {
+                    Text(subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+        } icon: {
+            Image(systemName: item.systemImage)
+                .foregroundStyle(item.iconStyle)
+                .frame(width: 17)
+        }
+        .tag(item.id)
+    }
+}
+
+private struct DesignMockThreadListPane: View {
+    let conversations: [DesignMockConversation]
+    @Binding var selection: DesignMockConversation.ID?
+    @Binding var selectedPromptIndex: Int
+    @Binding var expandedPromptConversationID: DesignMockConversation.ID?
+
+    var body: some View {
+        if let expandedConversation {
+            pinnedPromptView(for: expandedConversation)
+        } else {
+            cardList
+        }
+    }
+
+    private var cardList: some View {
+        List {
+            ForEach(conversations) { conversation in
+                DesignMockConversationListRow(conversation: conversation)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        withAnimation(.easeOut(duration: 0.16)) {
+                            selectOrToggle(conversation)
+                        }
+                    }
+                .padding(.vertical, 6)
+                .listRowBackground(rowBackground(for: conversation))
+            }
+        }
+        .listStyle(.inset)
+        .scrollContentBackground(.hidden)
+        .background(.regularMaterial)
+    }
+
+    private func pinnedPromptView(for conversation: DesignMockConversation) -> some View {
+        VStack(spacing: 0) {
+            Button {
+                withAnimation(.easeOut(duration: 0.16)) {
+                    expandedPromptConversationID = nil
+                }
+            } label: {
+                DesignMockConversationListRow(conversation: conversation)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.accentColor.opacity(0.14))
+            }
+            .buttonStyle(.plain)
+
+            Divider()
+
+            ScrollView {
+                DesignMockExpandedPromptList(selectedPromptIndex: $selectedPromptIndex)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .scrollContentBackground(.hidden)
+        }
+        .background(.regularMaterial)
+    }
+
+    private func selectOrToggle(_ conversation: DesignMockConversation) {
+        if selection == conversation.id {
+            expandedPromptConversationID = expandedPromptConversationID == conversation.id ? nil : conversation.id
+        } else {
+            selection = conversation.id
+            expandedPromptConversationID = nil
+            selectedPromptIndex = 0
+        }
+    }
+
+    private func rowBackground(for conversation: DesignMockConversation) -> Color {
+        conversation.id == selection ? Color.accentColor.opacity(0.14) : Color.clear
+    }
+
+    private var expandedConversation: DesignMockConversation? {
+        guard let expandedPromptConversationID else { return nil }
+        return conversations.first { $0.id == expandedPromptConversationID }
+    }
+}
+
+private struct DesignMockDefaultContentPane: View {
+    @Binding var displayMode: DesignMockCenterDisplayMode
+    let conversations: [DesignMockConversation]
+    @Binding var conversationSelection: DesignMockConversation.ID?
+    @Binding var selectedPromptIndex: Int
+    @Binding var expandedPromptConversationID: DesignMockConversation.ID?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Picker("Center View", selection: $displayMode) {
+                    ForEach(DesignMockCenterDisplayMode.allCases) { mode in
+                        Image(systemName: mode.symbol)
+                            .accessibilityLabel(Text(mode.title))
+                            .tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .controlSize(.small)
+                .frame(width: 92)
+
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+
+            Divider()
+
+            contentView
+        }
+    }
+
+    @ViewBuilder
+    private var contentView: some View {
+        switch displayMode {
+        case .table:
+            DesignMockThreadTablePane(
+                conversations: conversations,
+                selection: $conversationSelection
+            )
+        case .cards:
+            DesignMockThreadListPane(
+                conversations: conversations,
+                selection: $conversationSelection,
+                selectedPromptIndex: $selectedPromptIndex,
+                expandedPromptConversationID: $expandedPromptConversationID
+            )
+        }
+    }
+}
+
+private struct DesignMockThreadTablePane: View {
+    let conversations: [DesignMockConversation]
+    @Binding var selection: DesignMockConversation.ID?
+
+    var body: some View {
+        Table(conversations, selection: $selection) {
+            TableColumn("Title") { conversation in
+                Text(conversation.title)
+                    .lineLimit(1)
+            }
+            TableColumn("Project") { conversation in
+                Text(conversation.projectLabel)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            TableColumn("Updated") { conversation in
+                Text(conversation.updated)
+                    .foregroundStyle(.secondary)
+            }
+            .width(82)
+            TableColumn("Prompts") { conversation in
+                Text("\(conversation.prompts)")
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+            .width(70)
+            TableColumn("Source") { conversation in
+                Text(conversation.source)
+                    .foregroundStyle(conversation.sourceColor)
+            }
+            .width(82)
+        }
+    }
+}
+
+private struct DesignMockExpandedPromptList: View {
+    @Binding var selectedPromptIndex: Int
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(DesignMockData.promptSnippets.indices, id: \.self) { index in
+                Button {
+                    selectedPromptIndex = index
+                } label: {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Image(systemName: "text.bubble")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(width: 16)
+
+                        Text(DesignMockData.promptSnippets[index])
+                            .font(.caption)
+                            .lineLimit(1)
+
+                        Spacer(minLength: 8)
+
+                        Text("\(index + 1)")
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                }
+                    .padding(.vertical, 4)
+                    .padding(.horizontal, 8)
+                    .background(
+                        selectedPromptIndex == index ? Color.accentColor.opacity(0.12) : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    )
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.leading, 22)
+        .padding(.trailing, 2)
+    }
+}
+
+private struct DesignMockReaderPane: View {
+    let conversation: DesignMockConversation?
+    let promptTitle: String
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                DesignMockReaderTitle(conversation: conversation, promptTitle: promptTitle)
+
+                VStack(alignment: .leading, spacing: 14) {
+                    Text("Original-preserving reader mock")
+                        .font(.title3.weight(.semibold))
+
+                    Text("This area stands in for the eventual conversation renderer. The chrome is intentionally native: the sidebar keeps source-list behavior, the window toolbar owns global actions, and the breadcrumb stays centered as the window resizes.")
+                        .lineSpacing(5)
+
+                    Text("Project hints, source metadata, and prompt position are shown as reading context rather than written back into canonical message bodies.")
+                        .foregroundStyle(.secondary)
+                        .lineSpacing(5)
+                }
+                .padding(18)
+                .frame(maxWidth: 760, alignment: .leading)
+                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(.quaternary, lineWidth: 0.7)
+                }
+            }
+            .padding(.horizontal, 28)
+            .padding(.vertical, 26)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .background(.background)
+    }
+}
+
+private struct DesignMockReaderTitle: View {
+    let conversation: DesignMockConversation?
+    let promptTitle: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(conversation?.title ?? "Select a conversation")
+                .font(.largeTitle.weight(.semibold))
+                .lineLimit(2)
+                .textSelection(.enabled)
+
+            HStack(spacing: 8) {
+                Label(conversation?.source ?? "source", systemImage: "tray.full")
+                    .foregroundStyle(conversation?.sourceColor ?? .secondary)
+                Text("·")
+                    .foregroundStyle(.tertiary)
+                Label(promptTitle, systemImage: "text.bubble")
+                    .lineLimit(1)
+                Text("·")
+                    .foregroundStyle(.tertiary)
+                Text(conversation?.projectLabel ?? "No project")
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .font(.callout)
+        }
+    }
+}
+
+private struct DesignMockConversationListRow: View {
+    let conversation: DesignMockConversation
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(conversation.title)
+                    .font(.callout.weight(.medium))
+                    .lineLimit(1)
+
+                Spacer(minLength: 8)
+
+                Text(conversation.updated)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            HStack(spacing: 8) {
+                Label(conversation.projectLabel, systemImage: conversation.projectSymbol)
+                    .lineLimit(1)
+                Text("\(conversation.prompts) prompts")
+                    .monospacedDigit()
+                Text(conversation.source)
+                    .foregroundStyle(conversation.sourceColor)
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 6)
+    }
+}
+
+private struct DesignMockBreadcrumbBar: View {
+    private enum Metrics {
+        static let capsuleHeight: CGFloat = 24
+        static let capsulePadH: CGFloat = 4
+        static let capsuleGap: CGFloat = 2
+        static let segmentHeight: CGFloat = 22
+        static let segmentPadH: CGFloat = 6
+        static let segmentGap: CGFloat = 4
+        static let segmentRadius: CGFloat = 9
+        static let labelFont: Font = .system(size: 13)
+        static let counterFont: Font = .system(size: 12)
+        static let disclosureFont: Font = .system(size: 9, weight: .semibold)
+        static let chevronFont: Font = .system(size: 10, weight: .semibold)
+        static let chevronWidth: CGFloat = 16
+        static let counterWidth: CGFloat = 28
+        static let stubWidth: CGFloat = 24
+    }
+
+    private struct TierWidths {
+        var thread: (min: CGFloat, ideal: CGFloat)
+        var prompt: (min: CGFloat, ideal: CGFloat)?
+        var showsStub: Bool
+        var showsCounter: Bool
+
+        static let tier1 = TierWidths(thread: (200, 260), prompt: (200, 280), showsStub: false, showsCounter: true)
+        static let tier2 = TierWidths(thread: (120, 180), prompt: (120, 160), showsStub: false, showsCounter: true)
+        static let tier3 = TierWidths(thread: (80, 120), prompt: (62, 70), showsStub: false, showsCounter: true)
+        static let tier4 = TierWidths(thread: (80, 120), prompt: nil, showsStub: true, showsCounter: true)
+        static let tier5 = TierWidths(thread: (50, 90), prompt: nil, showsStub: false, showsCounter: false)
+    }
+
+    let conversation: DesignMockConversation?
+    let promptTitle: String
+    let promptIndex: Int
+    let promptCount: Int
+    let conversations: [DesignMockConversation]
+    let prompts: [String]
+    let onSelectConversation: (DesignMockConversation.ID) -> Void
+    let onSelectPrompt: (Int) -> Void
+
+    var body: some View {
+        HStack(spacing: 0) {
+            ViewThatFits(in: .horizontal) {
+                tierView(.tier1)
+                tierView(.tier2)
+                tierView(.tier3)
+                tierView(.tier4)
+                tierView(.tier5)
+            }
+        }
+        .frame(height: Metrics.capsuleHeight)
+        .padding(.horizontal, Metrics.capsulePadH)
+        .background(capsuleBackground)
+        .clipShape(Capsule())
+    }
+
+    @ViewBuilder
+    private func tierView(_ tier: TierWidths) -> some View {
+        HStack(spacing: Metrics.capsuleGap) {
+            threadSegment(min: tier.thread.min, ideal: tier.thread.ideal)
+
+            if let prompt = tier.prompt {
+                chevronDivider
+                promptSegment(min: prompt.min, ideal: prompt.ideal)
+                if tier.showsCounter {
+                    counterView
+                }
+            } else if tier.showsStub {
+                chevronDivider
+                promptStub
+                if tier.showsCounter {
+                    counterView
+                }
+            }
+        }
+        .frame(height: Metrics.capsuleHeight)
+    }
+
+    private func threadSegment(min: CGFloat, ideal: CGFloat) -> some View {
+        Menu {
+            ForEach(conversations.prefix(10)) { item in
+                Button {
+                    onSelectConversation(item.id)
+                } label: {
+                    Label(item.title, systemImage: item.id == conversation?.id ? "checkmark" : item.projectSymbol)
+                }
+            }
+        } label: {
+            HStack(spacing: Metrics.segmentGap) {
+                Text(conversation?.title ?? "No conversation")
+                    .font(Metrics.labelFont.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                disclosureChevron
+            }
+            .padding(.horizontal, Metrics.segmentPadH)
+            .frame(height: Metrics.segmentHeight)
+            .frame(minWidth: min, idealWidth: ideal, maxWidth: ideal)
+            .contentShape(RoundedRectangle(cornerRadius: Metrics.segmentRadius, style: .continuous))
+        }
+        .menuStyle(.button)
+        .menuIndicator(.hidden)
+        .buttonStyle(.plain)
+    }
+
+    private func promptSegment(min: CGFloat, ideal: CGFloat) -> some View {
+        Menu {
+            ForEach(prompts.indices, id: \.self) { index in
+                Button {
+                    onSelectPrompt(index)
+                } label: {
+                    Label("Prompt \(index + 1)", systemImage: index == promptIndex ? "checkmark" : "text.bubble")
+                }
+            }
+        } label: {
+            HStack(spacing: Metrics.segmentGap) {
+                Text(promptTitle)
+                    .font(Metrics.labelFont)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                disclosureChevron
+            }
+            .padding(.horizontal, Metrics.segmentPadH)
+            .frame(height: Metrics.segmentHeight)
+            .frame(minWidth: min, idealWidth: ideal, maxWidth: ideal)
+            .contentShape(RoundedRectangle(cornerRadius: Metrics.segmentRadius, style: .continuous))
+        }
+        .menuStyle(.button)
+        .menuIndicator(.hidden)
+        .buttonStyle(.plain)
+    }
+
+    private var promptStub: some View {
+        Menu {
+            ForEach(prompts.indices, id: \.self) { index in
+                Button {
+                    onSelectPrompt(index)
+                } label: {
+                    Label("Prompt \(index + 1)", systemImage: index == promptIndex ? "checkmark" : "text.bubble")
+                }
+            }
+        } label: {
+            Text("…")
+                .font(Metrics.labelFont)
+                .foregroundStyle(.secondary)
+                .frame(width: Metrics.stubWidth, height: Metrics.segmentHeight)
+                .contentShape(RoundedRectangle(cornerRadius: Metrics.segmentRadius, style: .continuous))
+        }
+        .menuStyle(.button)
+        .menuIndicator(.hidden)
+        .buttonStyle(.plain)
+    }
+
+    private var chevronDivider: some View {
+        Image(systemName: "chevron.forward")
+            .font(Metrics.chevronFont)
+            .foregroundStyle(.tertiary)
+            .frame(width: Metrics.chevronWidth)
+    }
+
+    @ViewBuilder
+    private var counterView: some View {
+        if promptCount > 1 {
+            HStack(spacing: 3) {
+                Circle()
+                    .fill(Color.secondary.opacity(0.4))
+                    .frame(width: 2, height: 2)
+                Text("\(min(promptIndex + 1, promptCount)) / \(promptCount)")
+                    .font(Metrics.counterFont)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+            .frame(width: Metrics.counterWidth, height: Metrics.segmentHeight, alignment: .trailing)
+            .padding(.trailing, 2)
+        }
+    }
+
+    private var disclosureChevron: some View {
+        Image(systemName: "chevron.down")
+            .font(Metrics.disclosureFont)
+            .foregroundStyle(.tertiary)
+    }
+
+    private var capsuleBackground: some View {
+        Capsule()
+            .fill(.black.opacity(0.25))
+            .overlay(
+                Capsule()
+                    .strokeBorder(.white.opacity(0.06), lineWidth: 0.5)
+            )
+    }
+}
+
+private struct DesignMockSortMenu: View {
+    @Binding var sortKey: DesignMockSortKey
+
+    var body: some View {
         Menu {
             ForEach(DesignMockSortKey.allCases) { key in
                 Button {
@@ -87,734 +738,126 @@ struct DesignMockRootView: View {
                 }
             }
         } label: {
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: 4) {
-                    Image(systemName: sortKey.symbol)
-                        .font(.system(size: 12, weight: .semibold))
-                    Text(sortKey.shortTitle)
-                        .font(.caption2)
-                        .lineLimit(1)
-                }
-
-                Image(systemName: sortKey.symbol)
-                    .font(.system(size: 12, weight: .semibold))
-            }
-            .padding(.horizontal, 10)
-            .frame(minWidth: 30)
-            .frame(height: 24)
-            .clipShape(Capsule())
-            .background(.thinMaterial, in: Capsule())
-            .background(DesignMockColors.glassWash, in: Capsule())
-            .overlay {
-                Capsule()
-                    .stroke(DesignMockColors.glassStroke, lineWidth: 0.7)
-            }
-            .shadow(color: DesignMockColors.glassShadow, radius: 8, y: 3)
+            Image(systemName: "arrow.up.arrow.down")
         }
-        .menuStyle(.button)
-        .buttonStyle(.plain)
-        .menuIndicator(.hidden)
-        .fixedSize(horizontal: true, vertical: false)
-    }
-
-    private var breadcrumb: some View {
-        ViewThatFits(in: .horizontal) {
-            breadcrumbCapsule(titleWidth: 260, promptWidth: 260, promptStyle: .full, showsCounter: true)
-            breadcrumbCapsule(titleWidth: 190, promptWidth: 170, promptStyle: .full, showsCounter: true)
-            breadcrumbCapsule(titleWidth: 130, promptWidth: 92, promptStyle: .full, showsCounter: true)
-            breadcrumbCapsule(titleWidth: 130, promptWidth: 24, promptStyle: .ellipsis, showsCounter: true)
-            breadcrumbCapsule(titleWidth: 96, promptWidth: 0, promptStyle: .hidden, showsCounter: false)
-        }
-        .frame(minWidth: 0, alignment: .center)
-    }
-
-    private func breadcrumbCapsule(
-        titleWidth: CGFloat,
-        promptWidth: CGFloat,
-        promptStyle: DesignMockPromptBreadcrumbStyle,
-        showsCounter: Bool
-    ) -> some View {
-        HStack(spacing: 0) {
-            breadcrumbSegment("自作小説アルラウネの執筆支援", weight: .semibold, segment: .title, width: titleWidth)
-
-            if promptStyle != .hidden {
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 9, weight: .semibold))
-                    .foregroundStyle(hoveredBreadcrumbSegment == .title ? DesignMockColors.tertiaryText.opacity(0.35) : DesignMockColors.tertiaryText)
-                    .padding(.horizontal, 2)
-
-                switch promptStyle {
-                case .full:
-                    breadcrumbPromptSegment(width: promptWidth, showsCounter: showsCounter)
-                case .ellipsis:
-                    breadcrumbPromptSegment(width: promptWidth, promptStyle: .ellipsis, showsCounter: showsCounter)
-                case .hidden:
-                    EmptyView()
-                }
-            }
-        }
-        .padding(.horizontal, 4)
-        .frame(height: 24)
-        .fixedSize(horizontal: true, vertical: false)
-        .clipShape(Capsule())
-        .background(.thinMaterial, in: Capsule())
-        .background(DesignMockColors.glassWash.opacity(0.8), in: Capsule())
-        .overlay {
-            Capsule()
-                .stroke(DesignMockColors.glassStroke.opacity(0.75), lineWidth: 0.6)
-        }
-        .shadow(color: DesignMockColors.glassShadow, radius: 10, y: 4)
-    }
-
-    private var promptCounter: some View {
-        Text("1 / 42")
-            .font(.caption2)
-            .monospacedDigit()
-            .foregroundStyle(DesignMockColors.secondaryText)
-            .padding(.trailing, 4)
-    }
-
-    private func breadcrumbPromptSegment(
-        width: CGFloat,
-        promptStyle: DesignMockPromptBreadcrumbStyle = .full,
-        showsCounter: Bool
-    ) -> some View {
-        Menu {
-            ForEach(DesignMockData.promptSnippets.indices, id: \.self) { index in
-                Button("プロンプト \(index + 1)") {}
-            }
-        } label: {
-            HStack(spacing: 6) {
-                switch promptStyle {
-                case .full:
-                    Text("自作小説アルラウネを執筆支援")
-                        .font(.system(size: 13))
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .foregroundStyle(DesignMockColors.secondaryText)
-                        .frame(width: width, alignment: .leading)
-                case .ellipsis:
-                    Text("…")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(DesignMockColors.secondaryText)
-                        .frame(width: width, alignment: .center)
-                case .hidden:
-                    EmptyView()
-                }
-
-                if showsCounter {
-                    promptCounter
-                }
-            }
-            .padding(.horizontal, 6)
-            .frame(height: 22)
-            .background(
-                hoveredBreadcrumbSegment == .prompt ? DesignMockColors.segmentHover : Color.clear,
-                in: RoundedRectangle(cornerRadius: 9, style: .continuous)
-            )
-            .contentShape(Rectangle())
-        }
-        .menuStyle(.button)
-        .buttonStyle(.plain)
-        .menuIndicator(.hidden)
-        .onHover { isHovering in
-            hoveredBreadcrumbSegment = isHovering ? .prompt : (hoveredBreadcrumbSegment == .prompt ? nil : hoveredBreadcrumbSegment)
-        }
-    }
-
-    private func breadcrumbSegment(_ title: String, weight: Font.Weight, segment: DesignMockBreadcrumbSegment, width: CGFloat? = nil) -> some View {
-        Menu {
-            ForEach(DesignMockData.conversations.prefix(8)) { item in
-                Button(item.title) {
-                    selectedConversationID = item.id
-                }
-            }
-        } label: {
-            HStack(spacing: 6) {
-                Text(title)
-                    .font(.system(size: 13, weight: weight))
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 8, weight: .bold))
-                    .foregroundStyle(DesignMockColors.secondaryText)
-                    .opacity(hoveredBreadcrumbSegment == segment ? 1 : 0)
-            }
-            .padding(.horizontal, 6)
-            .frame(width: width, height: 22, alignment: .leading)
-            .background(
-                hoveredBreadcrumbSegment == segment ? DesignMockColors.segmentHover : Color.clear,
-                in: RoundedRectangle(cornerRadius: 9, style: .continuous)
-            )
-            .contentShape(Rectangle())
-        }
-        .menuStyle(.button)
-        .buttonStyle(.plain)
-        .menuIndicator(.hidden)
-        .onHover { isHovering in
-            hoveredBreadcrumbSegment = isHovering ? segment : (hoveredBreadcrumbSegment == segment ? nil : hoveredBreadcrumbSegment)
-        }
-    }
-
-    private var modePicker: some View {
-        HStack(spacing: 0) {
-            ForEach(DesignMockMode.allCases) { mode in
-                Button {
-                    withAnimation(.easeOut(duration: 0.12)) {
-                        selectedMode = mode
-                    }
-                } label: {
-                    Image(systemName: mode.symbol)
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(selectedMode == mode ? DesignMockColors.primaryText : DesignMockColors.secondaryText)
-                        .frame(width: 30, height: 24)
-                        .background(selectedMode == mode ? DesignMockColors.segmentSelected : Color.clear, in: Capsule())
-                }
-                .buttonStyle(.plain)
-                .help(mode.title)
-            }
-        }
-        .padding(2)
-        .clipShape(Capsule())
-        .background(.thinMaterial, in: Capsule())
-        .background(DesignMockColors.glassWash, in: Capsule())
-        .overlay {
-            Capsule()
-                .stroke(DesignMockColors.glassStroke, lineWidth: 0.7)
-        }
-        .shadow(color: DesignMockColors.glassShadow, radius: 8, y: 3)
-    }
-
-    private func toolbarIconButton(_ systemName: String) -> some View {
-        Button {
-        } label: {
-            Image(systemName: systemName)
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(DesignMockColors.secondaryText)
-                .frame(width: 30, height: 28)
-        }
-        .buttonStyle(.plain)
-        .clipShape(Capsule())
-        .background(.thinMaterial, in: Capsule())
-        .background(DesignMockColors.glassWash, in: Capsule())
-        .overlay {
-            Capsule()
-                .stroke(DesignMockColors.glassStroke, lineWidth: 0.7)
-        }
-        .shadow(color: DesignMockColors.glassShadow, radius: 8, y: 3)
-    }
-
-    private var sidebar: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                Spacer()
-                    .frame(height: 14)
-
-                sidebarSection("LIBRARY") {
-                    sidebarRow(id: "__all", glyph: "circle.grid.2x2.fill", title: "All threads", count: 629)
-                    sidebarSubtleRow(glyph: "externaldrive", title: "archive.db")
-                }
-
-                sidebarSection("PROJECTS") {
-                    ForEach(DesignMockData.projects) { project in
-                        sidebarRow(id: project.id, glyph: "folder.fill", title: project.title, count: project.count)
-                    }
-                }
-
-                sidebarSection("TRIAGE") {
-                    sidebarRow(id: "__inbox", glyph: "tray.and.arrow.down.fill", title: "Inbox", count: 12)
-                    sidebarRow(id: "__orphans", glyph: "circle", title: "Orphans", count: 517)
-                }
-
-                sidebarSection("SOURCES") {
-                    sidebarSubtleRow(glyph: "circle.fill", title: "chatgpt", count: "547")
-                    sidebarSubtleRow(glyph: "circle.fill", title: "gemini", count: "55")
-                    sidebarSubtleRow(glyph: "circle.fill", title: "claude", count: "27")
-                }
-            }
-            .padding(.horizontal, 12)
-            .padding(.bottom, 20)
-        }
-        .scrollContentBackground(.hidden)
-        .background(.ultraThinMaterial)
-        .background(DesignMockColors.sidebarTint)
-        .overlay(alignment: .trailing) {
-            Rectangle()
-                .fill(DesignMockColors.border)
-                .frame(width: 1)
-        }
-    }
-
-    private func sidebarSection<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(title)
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(DesignMockColors.tertiaryText)
-                .tracking(0.6)
-            VStack(alignment: .leading, spacing: 3) {
-                content()
-            }
-        }
-    }
-
-    private func sidebarRow(id: String, glyph: String, title: String, count: Int) -> some View {
-        Button {
-            selectedProjectID = selectedProjectID == id ? nil : id
-        } label: {
-            HStack(spacing: 8) {
-                Image(systemName: glyph)
-                    .font(.system(size: 12, weight: .medium))
-                    .frame(width: 18)
-                    .foregroundStyle(isProjectSelected(id) ? DesignMockColors.primaryText : DesignMockColors.secondaryText)
-                Text(title)
-                    .lineLimit(1)
-                Spacer()
-                Text("\(count)")
-                    .font(.caption2)
-                    .monospacedDigit()
-                    .foregroundStyle(isProjectSelected(id) ? DesignMockColors.primaryText.opacity(0.65) : DesignMockColors.tertiaryText)
-            }
-            .font(.callout)
-            .padding(.horizontal, 8)
-            .frame(height: 28)
-            .background(isProjectSelected(id) ? DesignMockColors.sidebarSelection : Color.clear, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .overlay {
-                if isProjectSelected(id) {
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .stroke(DesignMockColors.glassStroke.opacity(0.6), lineWidth: 0.5)
-                }
-            }
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func sidebarSubtleRow(glyph: String, title: String, count: String? = nil) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: glyph)
-                .font(.system(size: 11, weight: .medium))
-                .frame(width: 18)
-                .foregroundStyle(DesignMockColors.tertiaryText)
-            Text(title)
-                .lineLimit(1)
-            Spacer()
-            if let count {
-                Text(count)
-                    .font(.caption2)
-                    .foregroundStyle(DesignMockColors.tertiaryText)
-            }
-        }
-        .font(.callout)
-        .foregroundStyle(DesignMockColors.secondaryText)
-        .padding(.horizontal, 8)
-        .frame(height: 26)
-    }
-
-    private var middlePane: some View {
-        Group {
-            switch selectedMode {
-            case .viewer:
-                viewerIndex
-            case .focus:
-                EmptyView()
-            case .table, .default:
-                conversationTable
-            }
-        }
-        .background(.regularMaterial)
-        .background(DesignMockColors.middleTint)
-        .overlay(alignment: .trailing) {
-            if selectedMode != .table {
-                Rectangle()
-                    .fill(DesignMockColors.border)
-                    .frame(width: 1)
-            }
-        }
-    }
-
-    private var conversationTable: some View {
-        VStack(spacing: 0) {
-            Spacer()
-                .frame(height: 14)
-
-            HStack(spacing: 0) {
-                tableHeader("Title", width: nil, alignment: .leading)
-                tableHeader("Project", width: 210, alignment: .leading)
-                if selectedMode == .table {
-                    tableHeader("Updated", width: 92, alignment: .leading)
-                }
-                tableHeader("Prompts", width: 72, alignment: .trailing)
-                if selectedMode == .table {
-                    tableHeader("Source", width: 86, alignment: .leading)
-                }
-            }
-            .padding(.horizontal, 12)
-            .frame(height: 28)
-            .background(.thinMaterial)
-            .background(DesignMockColors.headerTint)
-            .overlay(alignment: .bottom) {
-                Rectangle()
-                    .fill(DesignMockColors.border)
-                    .frame(height: 1)
-            }
-
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    ForEach(filteredConversations) { item in
-                        tableRow(item)
-                    }
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 4)
-            }
-            .scrollContentBackground(.hidden)
-        }
-    }
-
-    @ViewBuilder
-    private func tableHeader(_ text: String, width: CGFloat?, alignment: Alignment) -> some View {
-        let label = Text(text)
-            .font(.caption.weight(.semibold))
-            .foregroundStyle(DesignMockColors.secondaryText)
-        if let width {
-            label.frame(width: width, alignment: alignment)
-        } else {
-            label.frame(maxWidth: .infinity, alignment: alignment)
-        }
-    }
-
-    private func tableRow(_ item: DesignMockConversation) -> some View {
-        Button {
-            selectedConversationID = item.id
-        } label: {
-            HStack(spacing: 0) {
-                Text(item.title)
-                    .font(.callout.weight(item.id == selectedConversationID ? .semibold : .regular))
-                    .lineLimit(1)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-
-                projectCell(item)
-                    .frame(width: 210, alignment: .leading)
-
-                if selectedMode == .table {
-                    Text(item.updated)
-                        .foregroundStyle(DesignMockColors.secondaryText)
-                        .frame(width: 92, alignment: .leading)
-                }
-
-                Text("\(item.prompts)")
-                    .monospacedDigit()
-                    .foregroundStyle(DesignMockColors.secondaryText)
-                    .frame(width: 72, alignment: .trailing)
-
-                if selectedMode == .table {
-                    Text(item.source)
-                        .foregroundStyle(sourceColor(item.source))
-                        .frame(width: 86, alignment: .leading)
-                }
-            }
-            .font(.callout)
-            .padding(.horizontal, 8)
-            .frame(height: 32)
-            .background(
-                item.id == selectedConversationID ? DesignMockColors.tableSelection : rowStripe(for: item),
-                in: RoundedRectangle(cornerRadius: 7, style: .continuous)
-            )
-            .overlay {
-                if item.id == selectedConversationID {
-                    RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        .stroke(DesignMockColors.glassStroke.opacity(0.55), lineWidth: 0.5)
-                }
-            }
-            .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func projectCell(_ item: DesignMockConversation) -> some View {
-        HStack(spacing: 5) {
-            switch item.projectState {
-            case .assigned(let title, let kind):
-                Image(systemName: "folder.fill")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(DesignMockColors.tertiaryText)
-                Text(title)
-                    .lineLimit(1)
-                if kind == .manual {
-                    Image(systemName: "pencil")
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundStyle(DesignMockColors.tertiaryText)
-                }
-            case .suggested(let title, let score, _):
-                Image(systemName: "arrow.right")
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundStyle(DesignMockColors.tertiaryText)
-                Text(title)
-                    .lineLimit(1)
-                Text(String(format: "%.2f", score))
-                    .font(.caption2)
-                    .foregroundStyle(DesignMockColors.tertiaryText)
-            case .none:
-                Text("—")
-                    .foregroundStyle(DesignMockColors.tertiaryText)
-            }
-        }
-        .font(.caption)
-        .foregroundStyle(DesignMockColors.secondaryText)
-    }
-
-    private var viewerIndex: some View {
-        VStack(spacing: 0) {
-            Spacer()
-                .frame(height: 14)
-
-            viewerCard
-                .padding(12)
-
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    ForEach(0..<18, id: \.self) { index in
-                        HStack(alignment: .firstTextBaseline, spacing: 10) {
-                            Text("\(index + 1)")
-                                .font(.caption2)
-                                .monospacedDigit()
-                                .foregroundStyle(DesignMockColors.tertiaryText)
-                                .frame(width: 28, alignment: .trailing)
-                            Text(DesignMockData.promptSnippets[index % DesignMockData.promptSnippets.count])
-                                .font(.callout)
-                                .lineLimit(1)
-                            Spacer()
-                        }
-                        .padding(.horizontal, 14)
-                        .frame(height: 34)
-                        .background(index == 0 ? DesignMockColors.tableSelection.opacity(0.22) : Color.clear)
-                        .overlay(alignment: .leading) {
-                            if index == 0 {
-                                Rectangle()
-                                    .fill(DesignMockColors.selection)
-                                    .frame(width: 2)
-                            }
-                        }
-                    }
-                }
-            }
-            .scrollContentBackground(.hidden)
-        }
-    }
-
-    private var viewerCard: some View {
-        HStack(alignment: .top, spacing: 14) {
-            VStack(alignment: .leading, spacing: 7) {
-                Text(selectedConversation?.title ?? "自作小説アルラウネの執筆支援")
-                    .font(.headline)
-                    .lineLimit(2)
-                HStack(spacing: 5) {
-                    Text(selectedConversation?.source ?? "chatgpt")
-                        .foregroundStyle(sourceColor(selectedConversation?.source ?? "chatgpt"))
-                    Text("·")
-                        .foregroundStyle(DesignMockColors.tertiaryText)
-                    Image(systemName: "bubble.left")
-                    Text("\(selectedConversation?.prompts ?? 42)")
-                    Text("·")
-                        .foregroundStyle(DesignMockColors.tertiaryText)
-                    Text(selectedConversation?.updated ?? "Apr 18")
-                }
-                .font(.caption)
-                .foregroundStyle(DesignMockColors.secondaryText)
-            }
-
-            Spacer()
-
-            VStack(alignment: .trailing, spacing: 4) {
-                projectCell(selectedConversation ?? DesignMockData.conversations[0])
-                Text("真夜・錫花・アビエニア")
-                    .font(.caption2)
-                    .foregroundStyle(DesignMockColors.tertiaryText)
-            }
-        }
-        .padding(14)
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .background(DesignMockColors.glassWash, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(DesignMockColors.glassStroke, lineWidth: 0.7)
-        }
-        .shadow(color: DesignMockColors.glassShadow, radius: 12, y: 5)
-    }
-
-    private var readerPane: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                Spacer()
-                    .frame(height: 22)
-
-                Text("Reader pane")
-                    .font(.title3.weight(.semibold))
-
-                Text("Resize and switch modes to exercise the new shell. This pane is intentionally static for now; later we can connect the real reader and repositories into this surface.")
-                    .foregroundStyle(DesignMockColors.secondaryText)
-                    .lineSpacing(4)
-
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("自作小説アルラウネの執筆支援")
-                        .font(.title2.weight(.semibold))
-                    Text("ここはあとで実データの会話本文を流し込む場所。今は見た目のリズム、余白、プロジェクト表示、toolbar の優先度だけを見るための静的プロトタイプにしているよ。")
-                        .lineSpacing(6)
-                    Text("プロジェクトはタグではなく、取り込み元フォルダとユーザー判断から生まれる読み返し用の軸として扱う想定。")
-                        .foregroundStyle(DesignMockColors.secondaryText)
-                        .lineSpacing(6)
-                }
-                .padding(20)
-                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-                .background(DesignMockColors.glassWash, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .stroke(DesignMockColors.glassStroke, lineWidth: 0.7)
-                }
-                .shadow(color: DesignMockColors.glassShadow, radius: 16, y: 7)
-            }
-            .padding(.horizontal, 26)
-            .padding(.bottom, 32)
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .scrollContentBackground(.hidden)
-        .background(.regularMaterial)
-        .background(DesignMockColors.readerTint)
-    }
-
-    private var filteredConversations: [DesignMockConversation] {
-        let selected = selectedProjectID
-        return DesignMockData.conversations.filter { item in
-            guard let selected else { return true }
-            if selected == "__all" { return true }
-            if selected == "__inbox" {
-                if case .suggested = item.projectState { return true }
-                return false
-            }
-            if selected == "__orphans" {
-                if case .none = item.projectState { return true }
-                return false
-            }
-            return item.projectID == selected
-        }
-    }
-
-    private var selectedConversation: DesignMockConversation? {
-        DesignMockData.conversations.first { $0.id == selectedConversationID }
-    }
-
-    private func middleWidth(totalWidth: CGFloat) -> CGFloat? {
-        guard selectedMode != .focus else { return 0 }
-        if selectedMode == .table { return nil }
-        return max(380, min(560, totalWidth * 0.38))
-    }
-
-    private func isProjectSelected(_ id: String) -> Bool {
-        if id == "__all" {
-            return selectedProjectID == "__all"
-        }
-        return selectedProjectID == id
-    }
-
-    private func sourceColor(_ source: String) -> Color {
-        switch source.lowercased() {
-        case "chatgpt": return .green
-        case "claude": return .orange
-        case "gemini": return .blue
-        default: return DesignMockColors.secondaryText
-        }
-    }
-
-    private func rowStripe(for item: DesignMockConversation) -> Color {
-        guard let index = DesignMockData.conversations.firstIndex(where: { $0.id == item.id }) else {
-            return Color.clear
-        }
-        return index.isMultiple(of: 2) ? Color.white.opacity(0.035) : Color.clear
+        .help("Sort: \(sortKey.shortTitle)")
     }
 }
 
-private enum DesignMockColors {
-    static let toolbarTint = Color.white.opacity(0.16)
-    static let sidebarTint = Color.white.opacity(0.10)
-    static let middleTint = Color.white.opacity(0.28)
-    static let readerTint = Color.white.opacity(0.34)
-    static let headerTint = Color.white.opacity(0.20)
-    static let glassWash = Color.white.opacity(0.18)
-    static let glassStroke = Color.white.opacity(0.34)
-    static let glassShadow = Color.black.opacity(0.10)
-    static let segmentHover = Color.primary.opacity(0.08)
-    static let segmentSelected = Color.white.opacity(0.38)
-    static let selection = Color.accentColor
-    static let sidebarSelection = Color.white.opacity(0.30)
-    static let tableSelection = Color.accentColor.opacity(0.82)
-    static let border = Color.primary.opacity(0.10)
-    static let primaryText = Color.primary.opacity(0.92)
-    static let secondaryText = Color.secondary.opacity(0.82)
-    static let tertiaryText = Color.secondary.opacity(0.50)
-}
+private struct DesignMockLayoutModePicker: View {
+    @Binding var selection: DesignMockLayoutMode
+    let isCompact: Bool
 
-private enum DesignMockBreadcrumbSegment {
-    case title
-    case prompt
-}
-
-private enum DesignMockPromptBreadcrumbStyle {
-    case full
-    case ellipsis
-    case hidden
-}
-
-private struct DesignMockLiquidBackground: View {
     var body: some View {
-        ZStack {
-            LinearGradient(
-                colors: [
-                    Color(nsColor: .windowBackgroundColor),
-                    Color.accentColor.opacity(0.10),
-                    Color(nsColor: .textBackgroundColor)
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-
-            Circle()
-                .fill(Color.blue.opacity(0.13))
-                .frame(width: 520, height: 520)
-                .blur(radius: 80)
-                .offset(x: -360, y: -260)
-
-            Circle()
-                .fill(Color.cyan.opacity(0.10))
-                .frame(width: 460, height: 460)
-                .blur(radius: 90)
-                .offset(x: 420, y: -190)
-
-            Circle()
-                .fill(Color.orange.opacity(0.08))
-                .frame(width: 420, height: 420)
-                .blur(radius: 110)
-                .offset(x: 360, y: 360)
+        Picker("Layout", selection: $selection) {
+            ForEach(DesignMockLayoutMode.allCases) { mode in
+                Image(systemName: mode.symbol)
+                    .accessibilityLabel(Text(mode.title))
+                    .tag(mode)
+            }
         }
-        .ignoresSafeArea()
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .controlSize(isCompact ? .small : .regular)
+        .help("Layout mode")
     }
 }
 
-private enum DesignMockMode: String, CaseIterable, Identifiable {
+private struct DesignMockToolbarIconButton: View {
+    let systemImage: String
+    let help: String
+    var action: () -> Void = {}
+
+    init(systemImage: String, help: String, action: @escaping () -> Void = {}) {
+        self.systemImage = systemImage
+        self.help = help
+        self.action = action
+    }
+
+    var body: some View {
+        Button {
+            action()
+        } label: {
+            Image(systemName: systemImage)
+                .font(DesignMockToolbarMetrics.iconFont)
+                .foregroundStyle(.primary)
+        }
+        .help(help)
+    }
+}
+
+private enum DesignMockToolbarMetrics {
+    static let iconFont: Font = .system(size: 14, weight: .semibold)
+}
+
+private struct DesignMockSidebarItem: Identifiable {
+    enum Kind: Equatable {
+        case all
+        case project(String)
+        case suggested
+        case unassigned
+        case source(String)
+    }
+
+    let id: String
+    let title: String
+    let subtitle: String?
+    let systemImage: String
+    let kind: Kind
+
+    static let allThreads = DesignMockSidebarItem(
+        id: "all",
+        title: "All Threads",
+        subtitle: "629 threads",
+        systemImage: "rectangle.stack",
+        kind: .all
+    )
+
+    static func project(_ project: DesignMockProject) -> DesignMockSidebarItem {
+        DesignMockSidebarItem(
+            id: "project-\(project.id)",
+            title: project.title,
+            subtitle: "\(project.count) threads",
+            systemImage: "folder",
+            kind: .project(project.id)
+        )
+    }
+
+    static func kind(for id: String) -> Kind {
+        if id == allThreads.id || id == "archive-db" { return .all }
+        if id == "suggested" { return .suggested }
+        if id == "unassigned" { return .unassigned }
+        if let project = DesignMockData.projects.first(where: { "project-\($0.id)" == id }) {
+            return .project(project.id)
+        }
+        if let source = DesignMockData.sources.first(where: { "source-\($0.name)" == id }) {
+            return .source(source.name)
+        }
+        return .all
+    }
+
+    var iconStyle: AnyShapeStyle {
+        switch kind {
+        case .source(let source):
+            AnyShapeStyle(DesignMockSource(name: source, count: 0).color)
+        default:
+            AnyShapeStyle(.secondary)
+        }
+    }
+}
+
+private enum DesignMockLayoutMode: String, CaseIterable, Identifiable {
     case table
     case `default`
     case viewer
-    case focus
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
-        case .table: return "テーブル"
-        case .default: return "デフォルト"
-        case .viewer: return "ビューアー"
-        case .focus: return "フォーカス"
+        case .table: return "Table"
+        case .default: return "Default"
+        case .viewer: return "Viewer"
         }
     }
 
@@ -822,8 +865,28 @@ private enum DesignMockMode: String, CaseIterable, Identifiable {
         switch self {
         case .table: return "tablecells"
         case .default: return "rectangle.split.3x1"
-        case .viewer: return "book.pages"
-        case .focus: return "doc.plaintext"
+        case .viewer: return "doc.plaintext"
+        }
+    }
+}
+
+private enum DesignMockCenterDisplayMode: String, CaseIterable, Identifiable {
+    case table
+    case cards
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .cards: return "Cards"
+        case .table: return "Table"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .cards: return "rectangle.stack"
+        case .table: return "tablecells"
         }
     }
 }
@@ -870,14 +933,55 @@ private struct DesignMockProject: Identifiable {
     let count: Int
 }
 
+private struct DesignMockSource {
+    let name: String
+    let count: Int
+
+    var color: Color {
+        switch name.lowercased() {
+        case "chatgpt": return .green
+        case "claude": return .orange
+        case "gemini": return .blue
+        default: return .secondary
+        }
+    }
+}
+
 private struct DesignMockConversation: Identifiable {
     let id: String
     let title: String
     let projectID: String?
     let projectState: DesignMockProjectState
     let updated: String
+    let sortRank: Int
     let prompts: Int
     let source: String
+
+    var projectLabel: String {
+        switch projectState {
+        case .assigned(let title, _):
+            return title
+        case .suggested(let title, _, _):
+            return "Suggested: \(title)"
+        case .none:
+            return "Unassigned"
+        }
+    }
+
+    var projectSymbol: String {
+        switch projectState {
+        case .assigned(_, let kind):
+            return kind == .manual ? "folder.badge.gearshape" : "folder"
+        case .suggested:
+            return "wand.and.stars"
+        case .none:
+            return "circle.dashed"
+        }
+    }
+
+    var sourceColor: Color {
+        DesignMockSource(name: source, count: 0).color
+    }
 }
 
 private enum DesignMockProjectState {
@@ -900,17 +1004,23 @@ private enum DesignMockData {
         .init(id: "reading", title: "読書メモ", count: 9)
     ]
 
+    static let sources: [DesignMockSource] = [
+        .init(name: "chatgpt", count: 547),
+        .init(name: "gemini", count: 55),
+        .init(name: "claude", count: 27)
+    ]
+
     static let conversations: [DesignMockConversation] = [
-        .init(id: "c1", title: "自作小説アルラウネの執筆支援", projectID: "alraune", projectState: .assigned(title: "アルラウネ執筆", kind: .imported), updated: "Apr 18", prompts: 42, source: "chatgpt"),
-        .init(id: "c2", title: "アルラウネ 設定まとめ", projectID: "alraune", projectState: .assigned(title: "アルラウネ執筆", kind: .imported), updated: "Apr 12", prompts: 23, source: "chatgpt"),
-        .init(id: "c3", title: "続きの話を聞く", projectID: "alraune", projectState: .assigned(title: "アルラウネ執筆", kind: .suggested), updated: "Apr 08", prompts: 15, source: "chatgpt"),
-        .init(id: "c4", title: "Opusの意味とモデル名の由来", projectID: nil, projectState: .suggested(title: "Madini Archive", score: 0.62, reason: "SwiftUI・モデル名・アプリ命名"), updated: "Apr 02", prompts: 7, source: "claude"),
-        .init(id: "c5", title: "ファンタジー百合小説の設定と脚本管理", projectID: "yuri", projectState: .assigned(title: "ファンタジー百合小説", kind: .imported), updated: "Mar 28", prompts: 31, source: "chatgpt"),
-        .init(id: "c6", title: "輪行で運動習慣", projectID: nil, projectState: .suggested(title: "読書メモ", score: 0.48, reason: "運動・習慣・記録"), updated: "Mar 22", prompts: 11, source: "gemini"),
-        .init(id: "c7", title: "README 改善提案", projectID: "madini", projectState: .assigned(title: "Madini Archive", kind: .manual), updated: "Mar 15", prompts: 6, source: "claude"),
-        .init(id: "c8", title: "複利の仕組み", projectID: nil, projectState: .none, updated: "Mar 09", prompts: 4, source: "gemini"),
-        .init(id: "c9", title: "会話統計と傾向分析", projectID: "madini", projectState: .assigned(title: "Madini Archive", kind: .imported), updated: "Mar 01", prompts: 18, source: "chatgpt"),
-        .init(id: "c10", title: "転校生の逆の表現", projectID: nil, projectState: .none, updated: "Feb 26", prompts: 5, source: "claude")
+        .init(id: "c1", title: "自作小説アルラウネの執筆支援", projectID: "alraune", projectState: .assigned(title: "アルラウネ執筆", kind: .imported), updated: "Apr 18", sortRank: 1, prompts: 42, source: "chatgpt"),
+        .init(id: "c2", title: "アルラウネ 設定まとめ", projectID: "alraune", projectState: .assigned(title: "アルラウネ執筆", kind: .imported), updated: "Apr 12", sortRank: 2, prompts: 23, source: "chatgpt"),
+        .init(id: "c3", title: "続きの話を聞く", projectID: "alraune", projectState: .assigned(title: "アルラウネ執筆", kind: .suggested), updated: "Apr 08", sortRank: 3, prompts: 15, source: "chatgpt"),
+        .init(id: "c4", title: "Opusの意味とモデル名の由来", projectID: nil, projectState: .suggested(title: "Madini Archive", score: 0.62, reason: "SwiftUI・モデル名・アプリ命名"), updated: "Apr 02", sortRank: 4, prompts: 7, source: "claude"),
+        .init(id: "c5", title: "ファンタジー百合小説の設定と脚本管理", projectID: "yuri", projectState: .assigned(title: "ファンタジー百合小説", kind: .imported), updated: "Mar 28", sortRank: 5, prompts: 31, source: "chatgpt"),
+        .init(id: "c6", title: "輪行で運動習慣", projectID: nil, projectState: .suggested(title: "読書メモ", score: 0.48, reason: "運動・習慣・記録"), updated: "Mar 22", sortRank: 6, prompts: 11, source: "gemini"),
+        .init(id: "c7", title: "README 改善提案", projectID: "madini", projectState: .assigned(title: "Madini Archive", kind: .manual), updated: "Mar 15", sortRank: 7, prompts: 6, source: "claude"),
+        .init(id: "c8", title: "複利の仕組み", projectID: nil, projectState: .none, updated: "Mar 09", sortRank: 8, prompts: 4, source: "gemini"),
+        .init(id: "c9", title: "会話統計と傾向分析", projectID: "madini", projectState: .assigned(title: "Madini Archive", kind: .imported), updated: "Mar 01", sortRank: 9, prompts: 18, source: "chatgpt"),
+        .init(id: "c10", title: "転校生の逆の表現", projectID: nil, projectState: .none, updated: "Feb 26", sortRank: 10, prompts: 5, source: "claude")
     ]
 
     static let promptSnippets = [
