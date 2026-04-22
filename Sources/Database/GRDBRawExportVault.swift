@@ -43,6 +43,20 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
         let data: Data
     }
 
+    private struct IndexedDocument {
+        let blobHash: String
+        let provider: RawExportProvider
+        let relativePath: String
+        let content: String
+    }
+
+    private struct AssetLink {
+        let sourceRelativePath: String
+        let assetRelativePath: String
+        let blobHash: String
+        let kind: String
+    }
+
     private let dbQueue: DatabaseQueue
     private let fileManager: FileManager
 
@@ -66,6 +80,7 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
         let importedAt = GRDBProjectDateCodec.string(from: Date())
         var storedFiles: [StoredFile] = []
         var blobWrites: [BlobWrite] = []
+        var indexedDocuments: [IndexedDocument] = []
         var seenHashes = Set<String>()
         var newBlobCount = 0
         var reusedBlobCount = 0
@@ -77,6 +92,16 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
             let hash = Self.sha256Hex(original)
             let originalSize = Int64(original.count)
             originalBytes += originalSize
+            if let searchable = searchableText(from: original, candidate: candidate) {
+                indexedDocuments.append(
+                    IndexedDocument(
+                        blobHash: hash,
+                        provider: provider,
+                        relativePath: candidate.relativePath,
+                        content: searchable
+                    )
+                )
+            }
 
             let prepared = prepareBlobData(original, mimeType: candidate.mimeType, relativePath: candidate.relativePath)
             let storedURL = blobURL(hash: hash, compression: prepared.compression)
@@ -205,6 +230,47 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
                 )
             }
 
+            for indexedDocument in indexedDocuments {
+                try db.execute(
+                    sql: """
+                        INSERT INTO raw_export_search_idx (
+                            snapshot_id, blob_hash, provider, relative_path, content
+                        )
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                    arguments: [
+                        snapshotID,
+                        indexedDocument.blobHash,
+                        indexedDocument.provider.rawValue,
+                        indexedDocument.relativePath,
+                        indexedDocument.content
+                    ]
+                )
+            }
+
+            let assetLinks = self.assetLinks(
+                snapshotFiles: storedFiles,
+                indexedDocuments: indexedDocuments
+            )
+            for assetLink in assetLinks {
+                try db.execute(
+                    sql: """
+                        INSERT OR IGNORE INTO raw_export_asset_links (
+                            snapshot_id, source_relative_path, asset_relative_path,
+                            blob_hash, kind, created_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                    arguments: [
+                        snapshotID,
+                        assetLink.sourceRelativePath,
+                        assetLink.assetRelativePath,
+                        assetLink.blobHash,
+                        assetLink.kind,
+                        importedAt
+                    ]
+                )
+            }
             return snapshotID
         }
 
@@ -218,6 +284,98 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
             storedBytes: storedBytes,
             manifestURL: manifestURL
         )
+    }
+
+    func listSnapshots(offset: Int, limit: Int) async throws -> [RawExportSnapshotSummary] {
+        let boundedLimit = max(0, min(limit, 500))
+        let boundedOffset = max(0, offset)
+        guard boundedLimit > 0 else {
+            return []
+        }
+
+        return try await GRDBAsync.read(from: dbQueue) { db in
+            let rows = try Row.fetchAll(
+                db,
+                sql: """
+                    SELECT
+                        id, provider, source_root, imported_at, manifest_hash, file_count,
+                        new_blob_count, reused_blob_count, original_bytes, stored_bytes, manifest_path
+                    FROM raw_export_snapshots
+                    ORDER BY imported_at DESC, id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                arguments: [boundedLimit, boundedOffset]
+            )
+
+            return rows.map { row in
+                RawExportSnapshotSummary(
+                    id: row["id"],
+                    provider: RawExportProvider(rawValue: row["provider"] ?? "") ?? .unknown,
+                    sourceRoot: row["source_root"],
+                    importedAt: row["imported_at"],
+                    manifestHash: row["manifest_hash"],
+                    fileCount: row["file_count"],
+                    newBlobCount: row["new_blob_count"],
+                    reusedBlobCount: row["reused_blob_count"],
+                    originalBytes: row["original_bytes"],
+                    storedBytes: row["stored_bytes"],
+                    manifestPath: row["manifest_path"]
+                )
+            }
+        }
+    }
+
+    func search(
+        query: String,
+        provider: RawExportProvider?,
+        offset: Int,
+        limit: Int
+    ) async throws -> [RawExportSearchResult] {
+        let normalized = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let boundedLimit = max(0, min(limit, 200))
+        let boundedOffset = max(0, offset)
+        guard !normalized.isEmpty, boundedLimit > 0 else {
+            return []
+        }
+
+        return try await GRDBAsync.read(from: dbQueue) { db in
+            var filters = ["raw_export_search_idx MATCH ?"]
+            var arguments = StatementArguments()
+            arguments += [Self.makeMatchQuery(from: normalized)]
+
+            if let provider {
+                filters.append("provider = ?")
+                arguments += [provider.rawValue]
+            }
+
+            let rows = try Row.fetchAll(
+                db,
+                sql: """
+                    SELECT
+                        snapshot_id,
+                        blob_hash,
+                        provider,
+                        relative_path,
+                        snippet(raw_export_search_idx, 4, '[', ']', ' … ', 16) AS snippet,
+                        bm25(raw_export_search_idx) AS rank
+                    FROM raw_export_search_idx
+                    WHERE \(filters.joined(separator: " AND "))
+                    ORDER BY rank ASC, snapshot_id DESC, relative_path ASC
+                    LIMIT ? OFFSET ?
+                    """,
+                arguments: arguments + [boundedLimit, boundedOffset]
+            )
+
+            return rows.map { row in
+                RawExportSearchResult(
+                    snapshotID: row["snapshot_id"],
+                    blobHash: row["blob_hash"],
+                    provider: RawExportProvider(rawValue: row["provider"] ?? "") ?? .unknown,
+                    relativePath: row["relative_path"],
+                    snippet: row["snippet"] ?? ""
+                )
+            }
+        }
     }
 
     private func collectFiles(from urls: [URL], root: URL?) -> [CandidateFile] {
@@ -322,6 +480,89 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
             return (original, "none")
         }
         return (compressed, "lzfse")
+    }
+
+    private func searchableText(from original: Data, candidate: CandidateFile) -> String? {
+        guard shouldIndex(candidate: candidate, byteCount: original.count),
+              let text = String(data: original, encoding: .utf8) else {
+            return nil
+        }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private func shouldIndex(candidate: CandidateFile, byteCount: Int) -> Bool {
+        switch candidate.role {
+        case "conversation", "metadata", "manifest":
+            return byteCount <= 200_000_000
+        default:
+            break
+        }
+
+        guard byteCount <= 20_000_000 else {
+            return false
+        }
+        if let mimeType = candidate.mimeType, mimeType.hasPrefix("text/") {
+            return true
+        }
+        let lower = candidate.relativePath.lowercased()
+        return lower.hasSuffix(".md")
+            || lower.hasSuffix(".txt")
+            || lower.hasSuffix(".csv")
+            || lower.hasSuffix(".xml")
+    }
+
+    private func assetLinks(
+        snapshotFiles: [StoredFile],
+        indexedDocuments: [IndexedDocument]
+    ) -> [AssetLink] {
+        let assetsByName = Dictionary(
+            grouping: snapshotFiles.filter { $0.role == "asset" },
+            by: { URL(fileURLWithPath: $0.relativePath).lastPathComponent.lowercased() }
+        )
+        guard !assetsByName.isEmpty else {
+            return []
+        }
+
+        var links: [AssetLink] = []
+        var seen = Set<String>()
+        for document in indexedDocuments where document.content.count <= 20_000_000 {
+            for name in referencedAssetNames(in: document.content) {
+                guard let assets = assetsByName[name] else {
+                    continue
+                }
+                for asset in assets {
+                    let key = "\(document.relativePath)\u{0}\(asset.relativePath)"
+                    guard seen.insert(key).inserted else {
+                        continue
+                    }
+                    links.append(
+                        AssetLink(
+                            sourceRelativePath: document.relativePath,
+                            assetRelativePath: asset.relativePath,
+                            blobHash: asset.blobHash,
+                            kind: "reference"
+                        )
+                    )
+                }
+            }
+        }
+        return links
+    }
+
+    private func referencedAssetNames(in text: String) -> Set<String> {
+        let pattern = #"[A-Za-z0-9._%+\-]+(?:\.(?:png|jpe?g|gif|webp|heic|pdf|mp4|mov|webm))"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            return []
+        }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        let matches = regex.matches(in: text, options: [], range: range)
+        return Set(matches.compactMap { match in
+            guard let matchRange = Range(match.range, in: text) else {
+                return nil
+            }
+            return URL(fileURLWithPath: String(text[matchRange])).lastPathComponent.lowercased()
+        })
     }
 
     private func shouldCompress(mimeType: String?, relativePath: String, byteCount: Int) -> Bool {
@@ -481,6 +722,23 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
     private func safeTimestamp(_ value: String) -> String {
         value.replacingOccurrences(of: ":", with: "-")
             .replacingOccurrences(of: " ", with: "T")
+    }
+
+    private static func makeMatchQuery(from rawValue: String) -> String {
+        let tokens = rawValue
+            .split(whereSeparator: \.isWhitespace)
+            .map { token in
+                token.replacingOccurrences(of: "\"", with: "\"\"")
+            }
+            .filter { !$0.isEmpty }
+
+        if tokens.isEmpty {
+            return "\"\(rawValue.replacingOccurrences(of: "\"", with: "\"\""))\""
+        }
+
+        return tokens
+            .map { "\"\($0)\"" }
+            .joined(separator: " AND ")
     }
 
     private static func sha256Hex(_ data: Data) -> String {

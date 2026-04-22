@@ -544,6 +544,32 @@ struct RawExportVaultResult: Hashable, Sendable {
     let manifestURL: URL
 }
 
+struct RawExportSnapshotSummary: Identifiable, Hashable, Sendable {
+    let id: Int64
+    let provider: RawExportProvider
+    let sourceRoot: String?
+    let importedAt: String
+    let manifestHash: String
+    let fileCount: Int
+    let newBlobCount: Int
+    let reusedBlobCount: Int
+    let originalBytes: Int64
+    let storedBytes: Int64
+    let manifestPath: String
+}
+
+struct RawExportSearchResult: Identifiable, Hashable, Sendable {
+    let snapshotID: Int64
+    let blobHash: String
+    let provider: RawExportProvider
+    let relativePath: String
+    let snippet: String
+
+    var id: String {
+        "\(snapshotID):\(relativePath):\(blobHash)"
+    }
+}
+
 protocol ConversationRepository: Sendable {
     func fetchIndex(query: ConversationListQuery) async throws -> [ConversationSummary]
     func fetchDetail(id: String) async throws -> ConversationDetail?
@@ -606,6 +632,13 @@ protocol ProjectSuggestionRepository: Sendable {
 
 protocol RawExportVault: Sendable {
     func ingest(_ urls: [URL]) async throws -> RawExportVaultResult?
+    func listSnapshots(offset: Int, limit: Int) async throws -> [RawExportSnapshotSummary]
+    func search(
+        query: String,
+        provider: RawExportProvider?,
+        offset: Int,
+        limit: Int
+    ) async throws -> [RawExportSearchResult]
 }
 
 protocol BookmarkRepository: Sendable {

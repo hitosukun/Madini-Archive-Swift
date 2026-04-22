@@ -290,6 +290,33 @@ final class AppServices: ObservableObject {
                 CREATE INDEX IF NOT EXISTS idx_raw_export_files_blob
                 ON raw_export_files(blob_hash)
                 """)
+            try db.execute(sql: """
+                CREATE VIRTUAL TABLE IF NOT EXISTS raw_export_search_idx
+                USING fts5(
+                    snapshot_id UNINDEXED,
+                    blob_hash UNINDEXED,
+                    provider UNINDEXED,
+                    relative_path,
+                    content,
+                    tokenize="unicode61"
+                )
+                """)
+            try db.execute(sql: """
+                CREATE TABLE IF NOT EXISTS raw_export_asset_links (
+                    snapshot_id INTEGER NOT NULL,
+                    source_relative_path TEXT NOT NULL,
+                    asset_relative_path TEXT NOT NULL,
+                    blob_hash TEXT,
+                    kind TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (snapshot_id, source_relative_path, asset_relative_path),
+                    FOREIGN KEY(snapshot_id) REFERENCES raw_export_snapshots(id) ON DELETE CASCADE
+                )
+                """)
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS idx_raw_export_asset_links_asset
+                ON raw_export_asset_links(snapshot_id, asset_relative_path)
+                """)
 
             // Seed the Trash system tag. Trash is a "rescue lane" — when a
             // user-defined tag is deleted, the conversations that had it get
