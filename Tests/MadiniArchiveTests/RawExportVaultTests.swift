@@ -283,6 +283,80 @@ final class RawExportVaultTests: XCTestCase {
         }
     }
 
+    func testListFilesThrowsSnapshotNotFoundForUnknownSnapshot() async throws {
+        let (vault, _) = try makeVault()
+        // No ingest: every snapshotID is unknown.
+        do {
+            _ = try await vault.listFiles(
+                snapshotID: 999_999,
+                offset: 0,
+                limit: 10
+            )
+            XCTFail("expected RawExportVaultError.snapshotNotFound")
+        } catch let error as RawExportVaultError {
+            guard case .snapshotNotFound(let snapshotID) = error else {
+                XCTFail("expected .snapshotNotFound, got \(error)")
+                return
+            }
+            XCTAssertEqual(snapshotID, 999_999)
+        }
+    }
+
+    func testLoadFileThrowsSnapshotNotFoundForUnknownSnapshot() async throws {
+        let (vault, _) = try makeVault()
+        // Even ingesting something doesn't make a bogus ID resolvable.
+        _ = try await vault.ingest([try makeChatGPTExport()])
+        do {
+            _ = try await vault.loadFile(
+                snapshotID: 999_999,
+                relativePath: "anything.json"
+            )
+            XCTFail("expected RawExportVaultError.snapshotNotFound")
+        } catch let error as RawExportVaultError {
+            guard case .snapshotNotFound(let snapshotID) = error else {
+                XCTFail("expected .snapshotNotFound (not .fileNotFound), got \(error)")
+                return
+            }
+            XCTAssertEqual(snapshotID, 999_999)
+        }
+    }
+
+    func testLoadBlobResolvesCanonicalPathEvenWhenStoredPathIsStale() async throws {
+        // Vault must be portable: if the data directory moves between machines
+        // the absolute `stored_path` recorded at ingest becomes stale, but the
+        // canonical `blobs/<prefix>/<hash>.<ext>` layout under the current
+        // `Storage.blobsDir` still resolves. loadBlob should honour that.
+        let (vault, dbQueue) = try makeVault()
+        let result = try await vault.ingest([try makeChatGPTExport()])
+        let unwrapped = try XCTUnwrap(result)
+
+        let files = try await vault.listFiles(
+            snapshotID: unwrapped.snapshotID,
+            offset: 0,
+            limit: 100
+        )
+        let target = try XCTUnwrap(files.first)
+
+        // Clobber the DB's stored_path so the legacy fallback points at a
+        // nonexistent location. The on-disk blob under `storage.blobsDir`
+        // is untouched — canonical resolution should still find it.
+        let bogusPath = "/does/not/exist/\(target.blobHash).blob"
+        try await GRDBAsync.write(to: dbQueue) { db in
+            try db.execute(
+                sql: "UPDATE raw_export_blobs SET stored_path = ? WHERE hash = ?",
+                arguments: [bogusPath, target.blobHash]
+            )
+        }
+
+        // Still readable, because we derive the path from hash + compression
+        // against the current Storage.
+        let restored = try await vault.loadBlob(hash: target.blobHash)
+        let originalURL = tempRoot
+            .appendingPathComponent("chatgpt-export", isDirectory: true)
+            .appendingPathComponent(target.relativePath)
+        XCTAssertEqual(restored, try Data(contentsOf: originalURL))
+    }
+
     func testLoadBlobDetectsHashMismatchAfterTampering() async throws {
         let (vault, _) = try makeVault()
         let root = try makeChatGPTExport()

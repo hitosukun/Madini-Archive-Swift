@@ -6,9 +6,11 @@ import Foundation
 /// - `ingest` / `listSnapshots` / `search` return empty results rather than
 ///   throwing, so the UI can compose these calls without special-casing the
 ///   mock path.
-/// - The restore API throws `RawExportVaultError.*NotFound` so that callers
-///   hitting the no-op vault by mistake surface a loud, typed failure rather
-///   than silently receiving empty data.
+/// - `getSnapshot` returns `nil` — single-item lookup APIs naturally express
+///   absence as `nil`, and callers typically branch on that already.
+/// - `listFiles` / `loadBlob` / `loadFile` throw `RawExportVaultError.*NotFound`
+///   so that callers hitting the no-op vault by mistake surface a loud, typed
+///   failure rather than silently receiving empty data.
 struct NoOpRawExportVault: RawExportVault {
     func ingest(_ urls: [URL]) async throws -> RawExportVaultResult? {
         nil
@@ -36,7 +38,10 @@ struct NoOpRawExportVault: RawExportVault {
         offset: Int,
         limit: Int
     ) async throws -> [RawExportFileEntry] {
-        []
+        // A no-op vault never ingests, so every snapshotID is unknown —
+        // match `GRDBRawExportVault.listFiles` and throw rather than return
+        // an empty page that callers could mistake for "snapshot was empty".
+        throw RawExportVaultError.snapshotNotFound(snapshotID: snapshotID)
     }
 
     func loadBlob(hash: String) async throws -> Data {

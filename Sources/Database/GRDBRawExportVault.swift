@@ -439,11 +439,17 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
     ) async throws -> [RawExportFileEntry] {
         let boundedLimit = max(0, min(limit, 5_000))
         let boundedOffset = max(0, offset)
-        guard boundedLimit > 0 else {
-            return []
-        }
 
         return try await GRDBAsync.read(from: dbQueue) { db in
+            // ingest never creates empty snapshots, so an unknown ID is a
+            // contract break rather than "no files" — throw a typed error so
+            // callers (and UI) can tell apart "snapshot gone" from "empty page".
+            guard try Self.snapshotExists(snapshotID: snapshotID, in: db) else {
+                throw RawExportVaultError.snapshotNotFound(snapshotID: snapshotID)
+            }
+            guard boundedLimit > 0 else {
+                return []
+            }
             let rows = try Row.fetchAll(
                 db,
                 sql: """
@@ -471,10 +477,27 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
 
     func loadBlob(hash: String) async throws -> Data {
         let record = try await fetchBlobRecord(hash: hash)
-        let storedURL = URL(fileURLWithPath: record.storedPath)
 
-        guard fileManager.fileExists(atPath: storedURL.path) else {
-            throw RawExportVaultError.blobFileMissing(hash: hash, path: storedURL.path)
+        // Vault must be portable: the data directory can move between machines
+        // or user homes, so resolve the blob through the current `storage`
+        // first and fall back to the DB-recorded absolute path only when the
+        // canonical layout isn't present (older snapshots, debug copies).
+        let canonicalURL = blobURL(hash: hash, compression: record.compression)
+        let legacyURL = URL(fileURLWithPath: record.storedPath)
+        let candidates: [URL]
+        if canonicalURL.standardizedFileURL == legacyURL.standardizedFileURL {
+            candidates = [canonicalURL]
+        } else {
+            candidates = [canonicalURL, legacyURL]
+        }
+
+        var resolvedURL: URL?
+        for candidate in candidates where fileManager.fileExists(atPath: candidate.path) {
+            resolvedURL = candidate
+            break
+        }
+        guard let storedURL = resolvedURL else {
+            throw RawExportVaultError.blobFileMissing(hash: hash, path: canonicalURL.path)
         }
 
         let storedData: Data
@@ -573,13 +596,27 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
                     """,
                 arguments: [snapshotID, relativePath]
             ) else {
-                throw RawExportVaultError.fileNotFound(
-                    snapshotID: snapshotID,
-                    relativePath: relativePath
-                )
+                // Distinguish "snapshot gone" from "snapshot exists but file
+                // missing" so the UI can word errors correctly.
+                if try Self.snapshotExists(snapshotID: snapshotID, in: db) {
+                    throw RawExportVaultError.fileNotFound(
+                        snapshotID: snapshotID,
+                        relativePath: relativePath
+                    )
+                } else {
+                    throw RawExportVaultError.snapshotNotFound(snapshotID: snapshotID)
+                }
             }
             return Self.fileEntry(from: row)
         }
+    }
+
+    private static func snapshotExists(snapshotID: Int64, in db: Database) throws -> Bool {
+        try Bool.fetchOne(
+            db,
+            sql: "SELECT EXISTS(SELECT 1 FROM raw_export_snapshots WHERE id = ?)",
+            arguments: [snapshotID]
+        ) ?? false
     }
 
     private static func fileEntry(from row: Row) -> RawExportFileEntry {

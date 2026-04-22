@@ -699,6 +699,9 @@ protocol RawExportVault: Sendable {
 
     /// Page through the files that belong to a snapshot. Ordered by
     /// `relative_path ASC` so results are stable across calls.
+    /// Throws `RawExportVaultError.snapshotNotFound` when the snapshot is
+    /// unknown — ingest never creates empty snapshots, so an unknown ID is
+    /// treated as a contract break rather than "empty page".
     func listFiles(
         snapshotID: Int64,
         offset: Int,
@@ -713,6 +716,9 @@ protocol RawExportVault: Sendable {
 
     /// Read a specific file from a snapshot: looks up the file row, fetches
     /// the blob, verifies integrity, and returns both metadata and bytes.
+    /// Throws `RawExportVaultError.snapshotNotFound` when the snapshot is
+    /// unknown, or `.fileNotFound` when the snapshot exists but does not
+    /// contain the given relative path.
     func loadFile(
         snapshotID: Int64,
         relativePath: String
