@@ -58,3 +58,21 @@ struct NoOpRawExportVault: RawExportVault {
         )
     }
 }
+
+struct NoOpRawAssetResolver: RawAssetResolver {
+    func resolveAsset(
+        snapshotID: Int64,
+        reference: String
+    ) async throws -> RawAssetHit? {
+        nil
+    }
+
+    func assetsReferencedBy(
+        snapshotID: Int64,
+        sourceRelativePath: String,
+        offset: Int,
+        limit: Int
+    ) async throws -> [RawAssetHit] {
+        throw RawExportVaultError.snapshotNotFound(snapshotID: snapshotID)
+    }
+}

@@ -895,7 +895,11 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
         if ["projects.json", "users.json", "user.json", "user_settings.json", "memories.json"].contains(name) {
             return "metadata"
         }
-        if let mimeType = mimeType(forExtension: URL(fileURLWithPath: relativePath).pathExtension),
+        let pathExtension = URL(fileURLWithPath: relativePath).pathExtension.lowercased()
+        if Self.assetFileExtensions.contains(pathExtension) {
+            return "asset"
+        }
+        if let mimeType = mimeType(forExtension: pathExtension),
            mimeType.hasPrefix("image/") || mimeType == "application/pdf" {
             return "asset"
         }
@@ -907,10 +911,12 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
     }
 
     private func mimeType(forExtension pathExtension: String) -> String? {
-        guard !pathExtension.isEmpty else {
+        let normalizedExtension = pathExtension.lowercased()
+        guard !normalizedExtension.isEmpty else {
             return nil
         }
-        return UTType(filenameExtension: pathExtension)?.preferredMIMEType
+        return UTType(filenameExtension: normalizedExtension)?.preferredMIMEType
+            ?? Self.fallbackMimeTypes[normalizedExtension]
     }
 
     private func relativePath(for file: URL, root: URL?) -> String {
@@ -979,6 +985,32 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
             .map { String(format: "%02x", $0) }
             .joined()
     }
+
+    private static let assetFileExtensions: Set<String> = [
+        "gif",
+        "heic",
+        "jpeg",
+        "jpg",
+        "mov",
+        "mp4",
+        "pdf",
+        "png",
+        "webm",
+        "webp"
+    ]
+
+    private static let fallbackMimeTypes: [String: String] = [
+        "gif": "image/gif",
+        "heic": "image/heic",
+        "jpeg": "image/jpeg",
+        "jpg": "image/jpeg",
+        "mov": "video/quicktime",
+        "mp4": "video/mp4",
+        "pdf": "application/pdf",
+        "png": "image/png",
+        "webm": "video/webm",
+        "webp": "image/webp"
+    ]
 
     // MARK: - Schema
 

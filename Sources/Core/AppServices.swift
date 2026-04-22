@@ -10,6 +10,7 @@ final class AppServices: ObservableObject {
     let projectSuggestions: any ProjectSuggestionRepository
     let projectSuggester: any ProjectSuggester
     let rawExportVault: any RawExportVault
+    let rawAssetResolver: any RawAssetResolver
     let bookmarks: any BookmarkRepository
     let tags: any TagRepository
     let views: any ViewService
@@ -28,6 +29,7 @@ final class AppServices: ObservableObject {
         projectSuggestions: any ProjectSuggestionRepository,
         projectSuggester: any ProjectSuggester,
         rawExportVault: any RawExportVault,
+        rawAssetResolver: any RawAssetResolver,
         bookmarks: any BookmarkRepository,
         tags: any TagRepository,
         views: any ViewService,
@@ -40,6 +42,7 @@ final class AppServices: ObservableObject {
         self.projectSuggestions = projectSuggestions
         self.projectSuggester = projectSuggester
         self.rawExportVault = rawExportVault
+        self.rawAssetResolver = rawAssetResolver
         self.bookmarks = bookmarks
         self.tags = tags
         self.views = views
@@ -71,6 +74,7 @@ final class AppServices: ObservableObject {
                         suggestions: projectSuggestions
                     ),
                     rawExportVault: GRDBRawExportVault(dbQueue: dbQueue),
+                    rawAssetResolver: GRDBRawAssetResolver(dbQueue: dbQueue),
                     bookmarks: GRDBBookmarkRepository(dbQueue: dbQueue),
                     tags: GRDBTagRepository(dbQueue: dbQueue),
                     views: GRDBViewService(dbQueue: dbQueue),
@@ -94,6 +98,7 @@ final class AppServices: ObservableObject {
             projectSuggestions: MockProjectSuggestionRepository(),
             projectSuggester: NoOpProjectSuggester(),
             rawExportVault: NoOpRawExportVault(),
+            rawAssetResolver: NoOpRawAssetResolver(),
             bookmarks: MockBookmarkRepository(),
             tags: MockTagRepository(),
             views: MockViewService(),

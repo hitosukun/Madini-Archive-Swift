@@ -616,6 +616,22 @@ enum RawExportVaultError: Error, Sendable, Equatable {
     case unsupportedCompression(String)
 }
 
+struct RawAssetHit: Identifiable, Hashable, Sendable {
+    let snapshotID: Int64
+    let sourceRelativePath: String
+    let assetRelativePath: String
+    let blobHash: String
+    let kind: String
+    let sizeBytes: Int64
+    let storedSizeBytes: Int64
+    let mimeType: String?
+    let compression: String
+
+    var id: String {
+        "\(snapshotID):\(sourceRelativePath):\(assetRelativePath)"
+    }
+}
+
 protocol ConversationRepository: Sendable {
     func fetchIndex(query: ConversationListQuery) async throws -> [ConversationSummary]
     func fetchDetail(id: String) async throws -> ConversationDetail?
@@ -723,6 +739,26 @@ protocol RawExportVault: Sendable {
         snapshotID: Int64,
         relativePath: String
     ) async throws -> RawExportFilePayload
+}
+
+protocol RawAssetResolver: Sendable {
+    /// Resolve one asset reference inside a snapshot. `reference` can be an
+    /// exact relative path or the basename seen in an export JSON field.
+    /// Returns `nil` when the snapshot exists but no asset matches.
+    func resolveAsset(
+        snapshotID: Int64,
+        reference: String
+    ) async throws -> RawAssetHit?
+
+    /// Page through the assets referenced by one textual export file.
+    /// Throws `RawExportVaultError.snapshotNotFound` when the snapshot is
+    /// unknown.
+    func assetsReferencedBy(
+        snapshotID: Int64,
+        sourceRelativePath: String,
+        offset: Int,
+        limit: Int
+    ) async throws -> [RawAssetHit]
 }
 
 protocol BookmarkRepository: Sendable {

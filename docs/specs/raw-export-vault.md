@@ -169,7 +169,8 @@ Current indexing rules:
 
 ### `raw_export_asset_links`
 
-Early backing table for future asset resolution.
+Backing table for `RawAssetResolver`. Rows map textual export files to asset
+files stored in the same snapshot.
 
 ```sql
 CREATE TABLE IF NOT EXISTS raw_export_asset_links (
@@ -187,8 +188,7 @@ CREATE INDEX IF NOT EXISTS idx_raw_export_asset_links_asset
 ON raw_export_asset_links(snapshot_id, asset_relative_path);
 ```
 
-This table is intentionally not the UI contract yet. Phase C should introduce a
-dedicated Raw Asset Resolver layer before UI depends on it.
+UI should go through `RawAssetResolver`, not query this table directly.
 
 ## Snapshot Manifest
 
@@ -272,6 +272,15 @@ Restore:
 - `listFiles(snapshotID:offset:limit:) async throws -> [RawExportFileEntry]`
 - `loadBlob(hash:) async throws -> Data`
 - `loadFile(snapshotID:relativePath:) async throws -> RawExportFilePayload`
+
+Asset resolution:
+
+- `RawAssetResolver.resolveAsset(snapshotID:reference:) async throws -> RawAssetHit?`
+- `RawAssetResolver.assetsReferencedBy(snapshotID:sourceRelativePath:offset:limit:) async throws -> [RawAssetHit]`
+
+`RawAssetResolver` returns metadata and blob identity only. Callers that need
+bytes should pass `RawAssetHit.assetRelativePath` to
+`RawExportVault.loadFile(snapshotID:relativePath:)`.
 
 All list APIs must remain paginated with `offset` and `limit`.
 
@@ -380,7 +389,8 @@ Phase B: Import Coordinator
 
 Phase C: Raw Asset Resolver
 
-- Extract asset reference resolution out of Vault storage.
+- Extract asset reference resolution out of Vault storage. Implemented as
+  `RawAssetResolver` / `GRDBRawAssetResolver`.
 - Populate and query `raw_export_asset_links`.
 - Return asset payloads through restore APIs without mixing them into canonical
   message bodies.
