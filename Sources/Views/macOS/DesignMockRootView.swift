@@ -8,7 +8,6 @@ struct DesignMockRootView: View {
     @State private var selectedConversationID: DesignMockConversation.ID? = DesignMockData.conversations.first?.id
     @State private var selectedLayoutMode: DesignMockLayoutMode = .default
     @State private var selectedCenterDisplayMode: DesignMockCenterDisplayMode = .cards
-    @State private var sortKey: DesignMockSortKey = .newest
     @State private var searchText = ""
     @State private var selectedPromptIndex = 0
     @State private var expandedPromptConversationID: DesignMockConversation.ID?
@@ -18,29 +17,6 @@ struct DesignMockRootView: View {
         .searchable(text: $searchText, prompt: "検索")
         .navigationTitle("")
         .toolbar {
-            ToolbarItem(placement: .navigation) {
-                HStack(spacing: 10) {
-                    DesignMockSortMenu(sortKey: $sortKey)
-
-                    DesignMockBreadcrumbBar(
-                        conversation: selectedConversation,
-                        promptTitle: currentPromptTitle,
-                        promptIndex: selectedPromptIndex,
-                        promptCount: DesignMockData.promptSnippets.count,
-                        conversations: filteredConversations,
-                        prompts: DesignMockData.promptSnippets,
-                        onSelectConversation: { id in
-                            selectedConversationID = id
-                            selectedPromptIndex = 0
-                        },
-                        onSelectPrompt: { index in
-                            selectedPromptIndex = index
-                        }
-                    )
-                    .frame(minWidth: 90, idealWidth: 584, maxWidth: 584, alignment: .leading)
-                }
-            }
-
             ToolbarItem(placement: .primaryAction) {
                 DesignMockLayoutModePicker(selection: $selectedLayoutMode, isCompact: isSearching || !searchText.isEmpty)
             }
@@ -69,7 +45,7 @@ struct DesignMockRootView: View {
                     .navigationSplitViewColumnWidth(min: 240, ideal: 270, max: 320)
             } detail: {
                 DesignMockThreadTablePane(
-                    conversations: sortedConversations,
+                    conversations: filteredConversations,
                     selection: $selectedConversationID
                 )
             }
@@ -80,7 +56,7 @@ struct DesignMockRootView: View {
             } content: {
                 DesignMockDefaultContentPane(
                     displayMode: $selectedCenterDisplayMode,
-                    conversations: sortedConversations,
+                    conversations: filteredConversations,
                     conversationSelection: $selectedConversationID,
                     selectedPromptIndex: $selectedPromptIndex,
                     expandedPromptConversationID: $expandedPromptConversationID
@@ -89,7 +65,8 @@ struct DesignMockRootView: View {
             } detail: {
                 DesignMockReaderPane(
                     conversation: selectedConversation,
-                    promptTitle: currentPromptTitle
+                    selectedPromptIndex: $selectedPromptIndex,
+                    prompts: DesignMockData.promptSnippets
                 )
             }
         case .viewer:
@@ -99,43 +76,22 @@ struct DesignMockRootView: View {
             } detail: {
                 DesignMockReaderPane(
                     conversation: selectedConversation,
-                    promptTitle: currentPromptTitle
+                    selectedPromptIndex: $selectedPromptIndex,
+                    prompts: DesignMockData.promptSnippets
                 )
             }
         }
     }
 
-    private var currentPromptTitle: String {
-        guard DesignMockData.promptSnippets.indices.contains(selectedPromptIndex) else {
-            return "Prompt"
-        }
-        return DesignMockData.promptSnippets[selectedPromptIndex]
-    }
-
     private var selectedConversation: DesignMockConversation? {
-        guard let selectedConversationID else { return sortedConversations.first }
-        return DesignMockData.conversations.first { $0.id == selectedConversationID } ?? sortedConversations.first
+        guard let selectedConversationID else { return filteredConversations.first }
+        return DesignMockData.conversations.first { $0.id == selectedConversationID } ?? filteredConversations.first
     }
 
     private var filteredConversations: [DesignMockConversation] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         return DesignMockData.conversations.filter { item in
             matchesSidebarFilter(item) && matchesSearch(item, query: query)
-        }
-    }
-
-    private var sortedConversations: [DesignMockConversation] {
-        filteredConversations.sorted { lhs, rhs in
-            switch sortKey {
-            case .newest:
-                lhs.sortRank < rhs.sortRank
-            case .oldest:
-                lhs.sortRank > rhs.sortRank
-            case .mostPrompts:
-                lhs.prompts > rhs.prompts
-            case .fewestPrompts:
-                lhs.prompts < rhs.prompts
-            }
         }
     }
 
@@ -432,18 +388,23 @@ private struct DesignMockExpandedPromptList: View {
 
 private struct DesignMockReaderPane: View {
     let conversation: DesignMockConversation?
-    let promptTitle: String
+    @Binding var selectedPromptIndex: Int
+    let prompts: [String]
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                DesignMockReaderTitle(conversation: conversation, promptTitle: promptTitle)
+                DesignMockReaderTitle(
+                    conversation: conversation,
+                    selectedPromptIndex: $selectedPromptIndex,
+                    prompts: prompts
+                )
 
                 VStack(alignment: .leading, spacing: 14) {
                     Text("Original-preserving reader mock")
                         .font(.title3.weight(.semibold))
 
-                    Text("This area stands in for the eventual conversation renderer. The chrome is intentionally native: the sidebar keeps source-list behavior, the window toolbar owns global actions, and the breadcrumb stays centered as the window resizes.")
+                    Text("This area stands in for the eventual conversation renderer. The chrome is intentionally native: the sidebar keeps source-list behavior, the window toolbar owns global actions, and prompt navigation lives with the reader context.")
                         .lineSpacing(5)
 
                     Text("Project hints, source metadata, and prompt position are shown as reading context rather than written back into canonical message bodies.")
@@ -468,7 +429,8 @@ private struct DesignMockReaderPane: View {
 
 private struct DesignMockReaderTitle: View {
     let conversation: DesignMockConversation?
-    let promptTitle: String
+    @Binding var selectedPromptIndex: Int
+    let prompts: [String]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -482,8 +444,7 @@ private struct DesignMockReaderTitle: View {
                     .foregroundStyle(conversation?.sourceColor ?? .secondary)
                 Text("·")
                     .foregroundStyle(.tertiary)
-                Label(promptTitle, systemImage: "text.bubble")
-                    .lineLimit(1)
+                promptMenu
                 Text("·")
                     .foregroundStyle(.tertiary)
                 Text(conversation?.projectLabel ?? "No project")
@@ -492,6 +453,38 @@ private struct DesignMockReaderTitle: View {
             }
             .font(.callout)
         }
+    }
+
+    private var promptMenu: some View {
+        Menu {
+            ForEach(prompts.indices, id: \.self) { index in
+                Button {
+                    selectedPromptIndex = index
+                } label: {
+                    Label(
+                        "Prompt \(index + 1): \(prompts[index])",
+                        systemImage: index == selectedPromptIndex ? "checkmark" : "text.bubble"
+                    )
+                }
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Label(currentPromptTitle, systemImage: "text.bubble")
+                    .lineLimit(1)
+                Text("\(min(selectedPromptIndex + 1, max(prompts.count, 1))) / \(max(prompts.count, 1))")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+    }
+
+    private var currentPromptTitle: String {
+        guard prompts.indices.contains(selectedPromptIndex) else {
+            return "Prompt"
+        }
+        return prompts[selectedPromptIndex]
     }
 }
 
@@ -525,222 +518,6 @@ private struct DesignMockConversationListRow: View {
             .foregroundStyle(.secondary)
         }
         .padding(.vertical, 6)
-    }
-}
-
-private struct DesignMockBreadcrumbBar: View {
-    private enum Metrics {
-        static let capsuleHeight: CGFloat = 24
-        static let capsulePadH: CGFloat = 4
-        static let capsuleGap: CGFloat = 2
-        static let segmentHeight: CGFloat = 22
-        static let segmentPadH: CGFloat = 6
-        static let segmentGap: CGFloat = 4
-        static let segmentRadius: CGFloat = 9
-        static let labelFont: Font = .system(size: 13)
-        static let counterFont: Font = .system(size: 12)
-        static let disclosureFont: Font = .system(size: 9, weight: .semibold)
-        static let chevronFont: Font = .system(size: 10, weight: .semibold)
-        static let chevronWidth: CGFloat = 16
-        static let counterWidth: CGFloat = 28
-        static let stubWidth: CGFloat = 24
-    }
-
-    private struct TierWidths {
-        var thread: (min: CGFloat, ideal: CGFloat)
-        var prompt: (min: CGFloat, ideal: CGFloat)?
-        var showsStub: Bool
-        var showsCounter: Bool
-
-        static let tier1 = TierWidths(thread: (200, 260), prompt: (200, 280), showsStub: false, showsCounter: true)
-        static let tier2 = TierWidths(thread: (120, 180), prompt: (120, 160), showsStub: false, showsCounter: true)
-        static let tier3 = TierWidths(thread: (80, 120), prompt: (62, 70), showsStub: false, showsCounter: true)
-        static let tier4 = TierWidths(thread: (80, 120), prompt: nil, showsStub: true, showsCounter: true)
-        static let tier5 = TierWidths(thread: (50, 90), prompt: nil, showsStub: false, showsCounter: false)
-    }
-
-    let conversation: DesignMockConversation?
-    let promptTitle: String
-    let promptIndex: Int
-    let promptCount: Int
-    let conversations: [DesignMockConversation]
-    let prompts: [String]
-    let onSelectConversation: (DesignMockConversation.ID) -> Void
-    let onSelectPrompt: (Int) -> Void
-
-    var body: some View {
-        HStack(spacing: 0) {
-            ViewThatFits(in: .horizontal) {
-                tierView(.tier1)
-                tierView(.tier2)
-                tierView(.tier3)
-                tierView(.tier4)
-                tierView(.tier5)
-            }
-        }
-        .frame(height: Metrics.capsuleHeight)
-        .padding(.horizontal, Metrics.capsulePadH)
-        .background(capsuleBackground)
-        .clipShape(Capsule())
-    }
-
-    @ViewBuilder
-    private func tierView(_ tier: TierWidths) -> some View {
-        HStack(spacing: Metrics.capsuleGap) {
-            threadSegment(min: tier.thread.min, ideal: tier.thread.ideal)
-
-            if let prompt = tier.prompt {
-                chevronDivider
-                promptSegment(min: prompt.min, ideal: prompt.ideal)
-                if tier.showsCounter {
-                    counterView
-                }
-            } else if tier.showsStub {
-                chevronDivider
-                promptStub
-                if tier.showsCounter {
-                    counterView
-                }
-            }
-        }
-        .frame(height: Metrics.capsuleHeight)
-    }
-
-    private func threadSegment(min: CGFloat, ideal: CGFloat) -> some View {
-        Menu {
-            ForEach(conversations.prefix(10)) { item in
-                Button {
-                    onSelectConversation(item.id)
-                } label: {
-                    Label(item.title, systemImage: item.id == conversation?.id ? "checkmark" : item.projectSymbol)
-                }
-            }
-        } label: {
-            HStack(spacing: Metrics.segmentGap) {
-                Text(conversation?.title ?? "No conversation")
-                    .font(Metrics.labelFont.weight(.semibold))
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                disclosureChevron
-            }
-            .padding(.horizontal, Metrics.segmentPadH)
-            .frame(height: Metrics.segmentHeight)
-            .frame(minWidth: min, idealWidth: ideal, maxWidth: ideal)
-            .contentShape(RoundedRectangle(cornerRadius: Metrics.segmentRadius, style: .continuous))
-        }
-        .menuStyle(.button)
-        .menuIndicator(.hidden)
-        .buttonStyle(.plain)
-    }
-
-    private func promptSegment(min: CGFloat, ideal: CGFloat) -> some View {
-        Menu {
-            ForEach(prompts.indices, id: \.self) { index in
-                Button {
-                    onSelectPrompt(index)
-                } label: {
-                    Label("Prompt \(index + 1)", systemImage: index == promptIndex ? "checkmark" : "text.bubble")
-                }
-            }
-        } label: {
-            HStack(spacing: Metrics.segmentGap) {
-                Text(promptTitle)
-                    .font(Metrics.labelFont)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                disclosureChevron
-            }
-            .padding(.horizontal, Metrics.segmentPadH)
-            .frame(height: Metrics.segmentHeight)
-            .frame(minWidth: min, idealWidth: ideal, maxWidth: ideal)
-            .contentShape(RoundedRectangle(cornerRadius: Metrics.segmentRadius, style: .continuous))
-        }
-        .menuStyle(.button)
-        .menuIndicator(.hidden)
-        .buttonStyle(.plain)
-    }
-
-    private var promptStub: some View {
-        Menu {
-            ForEach(prompts.indices, id: \.self) { index in
-                Button {
-                    onSelectPrompt(index)
-                } label: {
-                    Label("Prompt \(index + 1)", systemImage: index == promptIndex ? "checkmark" : "text.bubble")
-                }
-            }
-        } label: {
-            Text("…")
-                .font(Metrics.labelFont)
-                .foregroundStyle(.secondary)
-                .frame(width: Metrics.stubWidth, height: Metrics.segmentHeight)
-                .contentShape(RoundedRectangle(cornerRadius: Metrics.segmentRadius, style: .continuous))
-        }
-        .menuStyle(.button)
-        .menuIndicator(.hidden)
-        .buttonStyle(.plain)
-    }
-
-    private var chevronDivider: some View {
-        Image(systemName: "chevron.forward")
-            .font(Metrics.chevronFont)
-            .foregroundStyle(.tertiary)
-            .frame(width: Metrics.chevronWidth)
-    }
-
-    @ViewBuilder
-    private var counterView: some View {
-        if promptCount > 1 {
-            HStack(spacing: 3) {
-                Circle()
-                    .fill(Color.secondary.opacity(0.4))
-                    .frame(width: 2, height: 2)
-                Text("\(min(promptIndex + 1, promptCount)) / \(promptCount)")
-                    .font(Metrics.counterFont)
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
-            }
-            .frame(width: Metrics.counterWidth, height: Metrics.segmentHeight, alignment: .trailing)
-            .padding(.trailing, 2)
-        }
-    }
-
-    private var disclosureChevron: some View {
-        Image(systemName: "chevron.down")
-            .font(Metrics.disclosureFont)
-            .foregroundStyle(.tertiary)
-    }
-
-    private var capsuleBackground: some View {
-        Capsule()
-            .fill(.black.opacity(0.25))
-            .overlay(
-                Capsule()
-                    .strokeBorder(.white.opacity(0.06), lineWidth: 0.5)
-            )
-    }
-}
-
-private struct DesignMockSortMenu: View {
-    @Binding var sortKey: DesignMockSortKey
-
-    var body: some View {
-        Menu {
-            ForEach(DesignMockSortKey.allCases) { key in
-                Button {
-                    sortKey = key
-                } label: {
-                    Label(key.menuTitle, systemImage: sortKey == key ? "checkmark" : key.symbol)
-                }
-            }
-        } label: {
-            Image(systemName: "arrow.up.arrow.down")
-        }
-        .help("Sort: \(sortKey.shortTitle)")
     }
 }
 
@@ -887,42 +664,6 @@ private enum DesignMockCenterDisplayMode: String, CaseIterable, Identifiable {
         switch self {
         case .cards: return "rectangle.stack"
         case .table: return "tablecells"
-        }
-    }
-}
-
-private enum DesignMockSortKey: String, CaseIterable, Identifiable {
-    case newest
-    case oldest
-    case mostPrompts
-    case fewestPrompts
-
-    var id: String { rawValue }
-
-    var shortTitle: String {
-        switch self {
-        case .newest: return "Newest"
-        case .oldest: return "Oldest"
-        case .mostPrompts: return "Most"
-        case .fewestPrompts: return "Fewest"
-        }
-    }
-
-    var menuTitle: String {
-        switch self {
-        case .newest: return "Newest first"
-        case .oldest: return "Oldest first"
-        case .mostPrompts: return "Most prompts"
-        case .fewestPrompts: return "Fewest prompts"
-        }
-    }
-
-    var symbol: String {
-        switch self {
-        case .newest: return "arrow.down"
-        case .oldest: return "arrow.up"
-        case .mostPrompts: return "text.bubble.fill"
-        case .fewestPrompts: return "text.bubble"
         }
     }
 }
