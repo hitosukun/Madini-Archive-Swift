@@ -178,7 +178,18 @@ struct VaultFileContentView: View {
     /// Inline-render size ceiling. Kept separate from the classifier so the
     /// view can show "too large" instead of falling through to the generic
     /// binary placeholder for oversized but textual files.
-    static let textSizeCap: Int64 = 10_000_000
+    ///
+    /// Capped at 1 MB deliberately: SwiftUI's `Text` view doesn't virtualise
+    /// its glyph layout, and feeding it even a few MB of text wedges the
+    /// main thread for seconds-to-forever while it lays out every line —
+    /// especially when the detail pane is narrow and every character wraps.
+    /// Users reported a 4 MB conversations.json spinning "Restoring…"
+    /// indefinitely; the load had finished, but the follow-up `Text` layout
+    /// pass never returned. 1 MB is comfortably within `Text`'s happy
+    /// range; anything larger routes to `tooLargeTextPlaceholder`.
+    /// Streaming / `NSTextView`-backed preview for larger textual files is
+    /// tracked for a later phase.
+    static let textSizeCap: Int64 = 1_000_000
 
     /// True when this entry *looks* like something we could render as text.
     /// Doesn't check size — the caller combines this with `textSizeCap` to

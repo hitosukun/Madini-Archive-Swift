@@ -33,19 +33,16 @@ final class VaultBrowserViewModel {
     private(set) var hasMoreSnapshots = true
 
     /// Snapshot the user has currently selected in the sidebar (nil = none).
-    var selectedSnapshotID: Int64? {
-        didSet {
-            guard oldValue != selectedSnapshotID else { return }
-            files = []
-            filesState = .idle
-            hasMoreFiles = true
-            filesOffset = 0
-            // Switching snapshot also invalidates any file we had open and
-            // therefore any asset chips / preview derived from that file.
-            selectedFileID = nil
-            resetReferencedAssets()
-        }
-    }
+    ///
+    /// The stale state that belongs to the old selection (files list, file
+    /// content, asset chips, preview sheet) is reset through
+    /// `handleSnapshotSelectionChanged()`, not via didSet. Cascading
+    /// `@Observable` mutations from inside a property observer that fires
+    /// during a SwiftUI `Binding.set` caused re-entrant redraws and blank
+    /// columns on macOS — the view now drives the reset from inside the
+    /// files pane's `.task(id:)` block so the reset + load is serialized
+    /// on snapshot transitions.
+    var selectedSnapshotID: Int64?
 
     /// Files loaded for `selectedSnapshotID`. Resets when the selection
     /// changes, so callers don't need to clear it manually.
@@ -54,19 +51,16 @@ final class VaultBrowserViewModel {
     private(set) var hasMoreFiles = true
 
     /// Compound key (`RawExportFileEntry.id` = "snapshotID:relativePath") of
-    /// the file the user is currently inspecting. Changing this clears the
-    /// previously loaded payload and asset chips so the view can't flash
-    /// stale bytes or chips from the old selection.
-    var selectedFileID: String? {
-        didSet {
-            guard oldValue != selectedFileID else { return }
-            selectedFilePayload = nil
-            fileContentState = .idle
-            resetReferencedAssets()
-            // Any open asset preview belongs to the previous source file.
-            previewingAssetID = nil
-        }
-    }
+    /// the file the user is currently inspecting.
+    ///
+    /// Stale payload / chips / preview get cleared via
+    /// `handleFileSelectionChanged()` — see the note on
+    /// `selectedSnapshotID` for why the reset is explicit instead of
+    /// living in didSet. The view invokes the handler from the content
+    /// pane's `.task(id: entry.id)` block so the reset + load is serialized
+    /// on every file transition (an `.onChange(of:)` handler would race
+    /// with `.task(id:)` and could leave the pane permanently blank).
+    var selectedFileID: String?
 
     /// Decompressed bytes + metadata for `selectedFileID`. `nil` until the
     /// view calls `loadSelectedFileContent()`.
@@ -140,6 +134,36 @@ final class VaultBrowserViewModel {
         hasMoreSnapshots = true
         snapshotsState = .idle
         await loadMoreSnapshots()
+    }
+
+    /// Clear all state that belongs to the previously selected snapshot
+    /// (files page, file selection, content payload, chips, open preview).
+    /// Called from the files pane's `.task(id: snapshot.id)` so the reset
+    /// runs serialized with the subsequent `loadMoreFiles()` call — not
+    /// inside SwiftUI's `Binding.set` update cycle, which would trigger
+    /// re-entrant redraws and blank the middle / detail panes.
+    func handleSnapshotSelectionChanged() {
+        files = []
+        filesState = .idle
+        hasMoreFiles = true
+        filesOffset = 0
+        selectedFileID = nil
+        selectedFilePayload = nil
+        fileContentState = .idle
+        resetReferencedAssets()
+        previewingAssetID = nil
+    }
+
+    /// Clear per-file state (payload bytes, referenced-asset chips, any open
+    /// preview sheet). Called from the content pane's `.task(id: entry.id)`
+    /// immediately before `loadSelectedFileContent()` so the previous file's
+    /// payload can't flash under the new file's header while the next load
+    /// is in flight.
+    func handleFileSelectionChanged() {
+        selectedFilePayload = nil
+        fileContentState = .idle
+        resetReferencedAssets()
+        previewingAssetID = nil
     }
 
     /// Fetch the next page of snapshots. Idempotent while a fetch is in

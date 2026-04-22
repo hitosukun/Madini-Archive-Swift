@@ -33,14 +33,36 @@ struct VaultBrowserView: View {
     }
 
     var body: some View {
+        // Selection bindings (snapshots + files) are hand-rolled
+        // `Binding(get:set:)` pairs where the set closure hops to the next
+        // main-actor turn via `Task { @MainActor in ... }`. That split —
+        // read synchronously, write deferred — is what stops the
+        // `@Observable` mutation cascade from re-entering SwiftUI's render
+        // pass and blanking the List + detail pane after a click. Don't
+        // replace these with `@Bindable`/$projection: direct projection
+        // writes synchronously and reproduces the blanking bug.
+        //
+        // Per-selection reset + load lives inside `.task(id:)` on the
+        // relevant panes (see `filesList(for:)` and `fileContentPane`), not
+        // in `.onChange(of:)`. `.onChange` races with `.task(id:)` on the
+        // same transition and can fire in the order "task body → onChange
+        // clears state", leaving the pane permanently blank.
         NavigationSplitView {
+            // Deliberately no `max:` on the sidebar/content columns. An
+            // earlier version capped them at 420 / 520, which on wide
+            // windows left the detail pane squeezed to ~100 px — wide
+            // enough that a monospaced filename would wrap one character
+            // per line. The detail pane is where the actual file
+            // preview lives, so it should absorb extra horizontal
+            // space; users can still drag the dividers to rebalance.
             snapshotsPane
-                .navigationSplitViewColumnWidth(min: 260, ideal: 320, max: 420)
+                .navigationSplitViewColumnWidth(min: 260, ideal: 320)
         } content: {
             filesPane
-                .navigationSplitViewColumnWidth(min: 300, ideal: 360, max: 520)
+                .navigationSplitViewColumnWidth(min: 300, ideal: 360)
         } detail: {
             contentPane
+                .frame(minWidth: 360)
         }
         .navigationTitle("Vault Browser")
         .task {
@@ -75,9 +97,20 @@ struct VaultBrowserView: View {
 
     @ViewBuilder
     private var snapshotsPane: some View {
+        // Deferred write on purpose: writing `selectedSnapshotID`
+        // synchronously from inside the `List.selection` `Binding.set` was
+        // re-entering SwiftUI's update cycle (the `@Observable` mutation
+        // invalidates views already being updated), which blanked the List
+        // + middle pane until the user clicked again. Pushing the write to
+        // the next main-actor turn gives SwiftUI a chance to commit the
+        // current render pass first.
         List(selection: Binding(
             get: { viewModel.selectedSnapshotID },
-            set: { viewModel.selectedSnapshotID = $0 }
+            set: { newValue in
+                Task { @MainActor in
+                    viewModel.selectedSnapshotID = newValue
+                }
+            }
         )) {
             ForEach(viewModel.snapshots) { snapshot in
                 snapshotRow(snapshot)
@@ -176,9 +209,18 @@ struct VaultBrowserView: View {
     }
 
     private func filesList(for snapshot: RawExportSnapshotSummary) -> some View {
-        List(selection: Binding(
+        // See the matching deferred-write comment in `snapshotsPane`. Same
+        // re-entrancy fix: writing `selectedFileID` synchronously from
+        // inside `Binding.set` was triggering `@Observable` cascades that
+        // blanked the detail pane immediately after the click, so the
+        // write is hoisted to the next main-actor turn.
+        return List(selection: Binding(
             get: { viewModel.selectedFileID },
-            set: { viewModel.selectedFileID = $0 }
+            set: { newValue in
+                Task { @MainActor in
+                    viewModel.selectedFileID = newValue
+                }
+            }
         )) {
             Section {
                 ForEach(viewModel.files) { entry in
@@ -190,9 +232,13 @@ struct VaultBrowserView: View {
             }
         }
         .task(id: snapshot.id) {
-            if viewModel.files.isEmpty, viewModel.filesState == .idle {
-                await viewModel.loadMoreFiles()
-            }
+            // Reset-then-load is serialized here (rather than in an
+            // `.onChange(of: selectedSnapshotID)`) so the clearing can't
+            // race against the load. SwiftUI cancels the previous task on
+            // id change, so for every snapshot transition we always start
+            // from a known-empty state and then fetch.
+            viewModel.handleSnapshotSelectionChanged()
+            await viewModel.loadMoreFiles()
         }
     }
 
@@ -246,19 +292,17 @@ struct VaultBrowserView: View {
             }
         }
         .task(id: entry.id) {
-            // Auto-load file bytes + referenced assets on selection change.
-            // Both are idempotent, so the chip strip can appear as soon as the
-            // resolver returns even if the body is still being restored.
-            if viewModel.selectedFilePayload == nil,
-               viewModel.fileContentState == .idle
-            {
-                await viewModel.loadSelectedFileContent()
-            }
-            if viewModel.referencedAssets.isEmpty,
-               viewModel.referencedAssetsState == .idle
-            {
-                await viewModel.loadMoreReferencedAssets()
-            }
+            // Serialize "clear stale bytes/chips from previous file → load
+            // new ones" inside a single task body. Using `.onChange(of:)`
+            // for the reset was racing against this task: if .task fired
+            // first, its loaded-state guards skipped the new load; then
+            // the delayed .onChange cleared state, leaving the pane blank.
+            // `.task(id:)` cancels the old task and starts fresh on every
+            // id change, so this block always runs in order for the new
+            // entry.
+            viewModel.handleFileSelectionChanged()
+            await viewModel.loadSelectedFileContent()
+            await viewModel.loadMoreReferencedAssets()
         }
     }
 

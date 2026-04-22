@@ -76,13 +76,15 @@ final class VaultBrowserViewModelTests: XCTestCase {
         let vm = Self.makeViewModel(vault: fake)
 
         vm.selectedSnapshotID = 1
+        vm.handleSnapshotSelectionChanged()
         await vm.loadMoreFiles()
         XCTAssertEqual(vm.files.map(\.relativePath), ["a.json"])
 
         vm.selectedSnapshotID = 2
-        // Switching snapshot must clear the previous page list immediately —
-        // otherwise the view would briefly show stale rows under the new
-        // header.
+        // In production the view drives this via `.onChange(of:)` so the
+        // `@Observable` mutations land outside SwiftUI's view-update cycle.
+        // Tests call the handler directly to simulate that wiring.
+        vm.handleSnapshotSelectionChanged()
         XCTAssertTrue(vm.files.isEmpty, "files should reset on selection change")
         await vm.loadMoreFiles()
         XCTAssertEqual(vm.files.map(\.relativePath), ["b.json"])
@@ -96,10 +98,12 @@ final class VaultBrowserViewModelTests: XCTestCase {
         let vm = Self.makeViewModel(vault: fake)
 
         vm.selectedSnapshotID = 1
+        vm.handleSnapshotSelectionChanged()
         async let firstFetch: Void = vm.loadMoreFiles()
         // Flip selection while the first fetch is still in flight.
         try await Task.sleep(nanoseconds: 10_000_000)
         vm.selectedSnapshotID = 2
+        vm.handleSnapshotSelectionChanged()
         _ = await firstFetch
 
         XCTAssertFalse(
@@ -131,8 +135,10 @@ final class VaultBrowserViewModelTests: XCTestCase {
         let vm = Self.makeViewModel(vault: fake)
 
         vm.selectedSnapshotID = 1
+        vm.handleSnapshotSelectionChanged()
         await vm.loadMoreFiles()
         vm.selectedFileID = entry.id
+        vm.handleFileSelectionChanged()
         await vm.loadSelectedFileContent()
 
         XCTAssertEqual(vm.fileContentState, .loaded)
@@ -152,14 +158,19 @@ final class VaultBrowserViewModelTests: XCTestCase {
         let vm = Self.makeViewModel(vault: fake)
 
         vm.selectedSnapshotID = 1
+        vm.handleSnapshotSelectionChanged()
         await vm.loadMoreFiles()
         vm.selectedFileID = a.id
+        vm.handleFileSelectionChanged()
         await vm.loadSelectedFileContent()
         XCTAssertEqual(vm.selectedFilePayload?.data, Data("A".utf8))
 
         vm.selectedFileID = b.id
+        vm.handleFileSelectionChanged()
         // Switching files must clear previous bytes synchronously so the view
-        // can't flash file A's content under file B's header.
+        // can't flash file A's content under file B's header. In production
+        // the view drives this via `.onChange(of:)`; tests invoke the handler
+        // directly.
         XCTAssertNil(vm.selectedFilePayload, "payload should clear on selection change")
         XCTAssertEqual(vm.fileContentState, .idle)
 
@@ -178,8 +189,10 @@ final class VaultBrowserViewModelTests: XCTestCase {
         let vm = Self.makeViewModel(vault: fake)
 
         vm.selectedSnapshotID = 7
+        vm.handleSnapshotSelectionChanged()
         await vm.loadMoreFiles()
         vm.selectedFileID = entry.id
+        vm.handleFileSelectionChanged()
         await vm.loadSelectedFileContent()
 
         guard case .failed(let message) = vm.fileContentState else {
@@ -200,12 +213,15 @@ final class VaultBrowserViewModelTests: XCTestCase {
         let vm = Self.makeViewModel(vault: fake)
 
         vm.selectedSnapshotID = 1
+        vm.handleSnapshotSelectionChanged()
         await vm.loadMoreFiles()
         vm.selectedFileID = entry.id
+        vm.handleFileSelectionChanged()
         await vm.loadSelectedFileContent()
         XCTAssertNotNil(vm.selectedFilePayload)
 
         vm.selectedSnapshotID = 2
+        vm.handleSnapshotSelectionChanged()
         XCTAssertNil(vm.selectedFileID, "snapshot change should also clear file selection")
         XCTAssertNil(vm.selectedFilePayload)
     }
@@ -333,8 +349,10 @@ final class VaultBrowserViewModelTests: XCTestCase {
 
         let vm = Self.makeViewModel(vault: fake, resolver: resolver)
         vm.selectedSnapshotID = 1
+        vm.handleSnapshotSelectionChanged()
         await vm.loadMoreFiles()
         vm.selectedFileID = source.id
+        vm.handleFileSelectionChanged()
 
         await vm.loadMoreReferencedAssets()
 
@@ -355,14 +373,18 @@ final class VaultBrowserViewModelTests: XCTestCase {
 
         let vm = Self.makeViewModel(vault: fake, resolver: resolver)
         vm.selectedSnapshotID = 1
+        vm.handleSnapshotSelectionChanged()
         await vm.loadMoreFiles()
         vm.selectedFileID = a.id
+        vm.handleFileSelectionChanged()
         await vm.loadMoreReferencedAssets()
         XCTAssertFalse(vm.referencedAssets.isEmpty)
 
         vm.selectedFileID = b.id
+        vm.handleFileSelectionChanged()
         // Switching files MUST clear the chips synchronously so the view never
-        // flashes file A's chips under file B's header.
+        // flashes file A's chips under file B's header. In production the
+        // view drives this via `.onChange(of:)`.
         XCTAssertTrue(vm.referencedAssets.isEmpty)
         XCTAssertEqual(vm.referencedAssetsState, .idle)
     }
@@ -384,12 +406,15 @@ final class VaultBrowserViewModelTests: XCTestCase {
 
         let vm = Self.makeViewModel(vault: fake, resolver: resolver)
         vm.selectedSnapshotID = 1
+        vm.handleSnapshotSelectionChanged()
         await vm.loadMoreFiles()
 
         vm.selectedFileID = a.id
+        vm.handleFileSelectionChanged()
         async let firstFetch: Void = vm.loadMoreReferencedAssets()
         try await Task.sleep(nanoseconds: 10_000_000)
         vm.selectedFileID = b.id
+        vm.handleFileSelectionChanged()
         _ = await firstFetch
 
         XCTAssertFalse(
@@ -416,8 +441,10 @@ final class VaultBrowserViewModelTests: XCTestCase {
 
         let vm = Self.makeViewModel(vault: fake, resolver: resolver)
         vm.selectedSnapshotID = 1
+        vm.handleSnapshotSelectionChanged()
         await vm.loadMoreFiles()
         vm.selectedFileID = source.id
+        vm.handleFileSelectionChanged()
         await vm.loadMoreReferencedAssets()
 
         vm.previewingAssetID = hit.id
@@ -442,15 +469,19 @@ final class VaultBrowserViewModelTests: XCTestCase {
 
         let vm = Self.makeViewModel(vault: fake, resolver: resolver)
         vm.selectedSnapshotID = 1
+        vm.handleSnapshotSelectionChanged()
         await vm.loadMoreFiles()
         vm.selectedFileID = a.id
+        vm.handleFileSelectionChanged()
         await vm.loadMoreReferencedAssets()
         vm.previewingAssetID = hit.id
         XCTAssertNotNil(vm.previewingAssetID)
 
         vm.selectedFileID = b.id
+        vm.handleFileSelectionChanged()
         // Preview belongs to file A — switching to file B must retire the
-        // open asset sheet so it can't linger with stale chip metadata.
+        // open asset sheet so it can't linger with stale chip metadata. In
+        // production the view's `.onChange(of:)` handler does this.
         XCTAssertNil(vm.previewingAssetID)
         XCTAssertNil(vm.previewedAssetPayload)
     }
