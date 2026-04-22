@@ -291,6 +291,33 @@ final class AppServices: ObservableObject {
             // idioms in this bootstrap.
             try GRDBRawExportVault.installSchema(in: db)
 
+            // conversation_raw_refs links a `conversations.id` (provider-native
+            // conversation ID, populated by the Python importer) back to the
+            // exact Raw Export Vault location where that conversation's source
+            // JSON lives. The reader uses this as an O(1) lookup — on miss,
+            // `RawConversationLoader` scans the newest matching snapshot and
+            // caches the hit here. Composite PK means one row per
+            // (conversation, snapshot) pair: the same conversation can appear
+            // in multiple snapshots (e.g. user re-exports later) and we keep
+            // the pointer per snapshot so deleting a snapshot CASCADEs the
+            // pointer with it.
+            try db.execute(sql: """
+                CREATE TABLE IF NOT EXISTS conversation_raw_refs (
+                    conversation_id TEXT NOT NULL,
+                    snapshot_id INTEGER NOT NULL,
+                    relative_path TEXT NOT NULL,
+                    json_index INTEGER NOT NULL,
+                    provider TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (conversation_id, snapshot_id),
+                    FOREIGN KEY (snapshot_id) REFERENCES raw_export_snapshots(id) ON DELETE CASCADE
+                )
+                """)
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS idx_conversation_raw_refs_conv
+                ON conversation_raw_refs(conversation_id)
+                """)
+
             // Seed the Trash system tag. Trash is a "rescue lane" — when a
             // user-defined tag is deleted, the conversations that had it get
             // Trash attached in its place, so nothing silently disappears.
