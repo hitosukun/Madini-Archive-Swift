@@ -250,74 +250,25 @@ struct MacOSRootView: View {
                 }
             }
 
-            // Resolve dropped files into importer-ready JSON payloads. A full
-            // ChatGPT export folder includes helper JSON files and assets; the
-            // importable payload is the sorted `conversations-*.json` set.
-            let selection = JSONImportFileResolver.resolve(urls)
-            let jsonURLs = selection.jsonURLs
-            let rejectedCount = selection.rejectedInputCount
-
-            guard !jsonURLs.isEmpty else {
-                if rejectedCount > 0 {
-                    showToast(.failure(
-                        message: "Only JSON exports can be imported.",
-                        detail: nil
-                    ))
-                }
+            guard !urls.isEmpty else {
+                showToast(.failure(
+                    message: "Only file drops can be imported.",
+                    detail: nil
+                ))
                 return
             }
 
-            showToast(.progress(message: "Vaulting and importing \(jsonURLs.count) file\(jsonURLs.count == 1 ? "" : "s")…"))
+            showToast(.progress(message: "Vaulting and importing export…"))
 
             do {
-                let vaultResult: RawExportVaultResult?
-                do {
-                    let rawExportVault = services.rawExportVault
-                    vaultResult = try await Task.detached(priority: .utility) {
-                        try await rawExportVault.ingest(urls)
-                    }.value
-                } catch {
-                    vaultResult = nil
-                    print("Raw export vault ingest failed: \(error)")
-                }
-
-                // Actual shell-out runs on a detached background task so
-                // the importer's blocking IO doesn't pin the main actor.
-                let result = try await Task.detached(priority: .userInitiated) {
-                    try await JSONImporter.importFiles(jsonURLs)
-                }.value
-
-                if result.exitCode == 0 {
-                    do {
-                        try await JSONImportProjectReconciler.reconcileImportedFiles(jsonURLs, services: services)
-                    } catch {
-                        print("Project reconciliation failed after import: \(error)")
-                    }
-                    archiveEvents.didImportConversations()
-                    let importSummary = rejectedCount > 0
-                        ? "Imported \(jsonURLs.count) file\(jsonURLs.count == 1 ? "" : "s"), skipped \(rejectedCount) unsupported item\(rejectedCount == 1 ? "" : "s")."
-                        : "Imported \(jsonURLs.count) file\(jsonURLs.count == 1 ? "" : "s")."
-                    let summary: String
-                    if let vaultResult {
-                        summary = "\(importSummary) Vault: \(vaultResult.newBlobs) new, \(vaultResult.reusedBlobs) reused."
-                    } else {
-                        summary = importSummary
-                    }
-                    showToast(.success(message: summary))
-                } else {
-                    // Non-zero exit: importer ran but the Python side
-                    // reported an error. Surface a short tail of stderr
-                    // so the user has a pointer to the cause (full
-                    // output is still in Console.app as stderr lines).
-                    let tail = result.stderr
-                        .split(separator: "\n")
-                        .suffix(2)
-                        .joined(separator: " ")
-                    showToast(.failure(
-                        message: "Import failed (exit \(result.exitCode)).",
-                        detail: tail.isEmpty ? nil : String(tail)
-                    ))
-                }
+                let result = try await ImportCoordinator.importDroppedURLs(urls, services: services)
+                archiveEvents.didImportConversations()
+                showToast(.success(message: importSuccessMessage(for: result)))
+            } catch let error as ImportCoordinatorError {
+                showToast(.failure(
+                    message: error.errorDescription ?? "Import failed.",
+                    detail: error.failureDetail
+                ))
             } catch {
                 showToast(.failure(
                     message: "Import couldn't start.",
@@ -325,6 +276,17 @@ struct MacOSRootView: View {
                 ))
             }
         }
+    }
+
+    private func importSuccessMessage(for result: ImportCoordinatorResult) -> String {
+        let importSummary = result.rejectedInputCount > 0
+            ? "Imported \(result.jsonFileCount) file\(result.jsonFileCount == 1 ? "" : "s"), skipped \(result.rejectedInputCount) unsupported item\(result.rejectedInputCount == 1 ? "" : "s")."
+            : "Imported \(result.jsonFileCount) file\(result.jsonFileCount == 1 ? "" : "s")."
+        let vaultSummary = "Vault: \(result.vaultResult.newBlobs) new, \(result.vaultResult.reusedBlobs) reused."
+        if result.reconciliationErrorDescription != nil {
+            return "\(importSummary) \(vaultSummary) Project hints need review."
+        }
+        return "\(importSummary) \(vaultSummary)"
     }
 
     /// Async wrapper around `NSItemProvider.loadItem(forTypeIdentifier:…)`
