@@ -254,6 +254,31 @@ final class VaultBrowserViewModelTests: XCTestCase {
         )
     }
 
+    // MARK: - Reload snapshots
+
+    func testReloadSnapshotsStartsFromOffsetZero() async throws {
+        let fake = FakeVault()
+        fake.snapshotPages = [
+            [Self.makeSnapshot(id: 1), Self.makeSnapshot(id: 2)],
+            // Simulates the vault state after a user imported a new export:
+            // the reload should surface the just-ingested snapshot at the
+            // top without needing to page past the pre-reload cursor.
+            [Self.makeSnapshot(id: 99), Self.makeSnapshot(id: 1), Self.makeSnapshot(id: 2)]
+        ]
+        let vm = Self.makeViewModel(vault: fake)
+
+        await vm.loadMoreSnapshots()
+        XCTAssertEqual(vm.snapshots.map(\.id), [1, 2])
+
+        await vm.reloadSnapshots()
+        XCTAssertEqual(
+            vm.snapshots.map(\.id),
+            [99, 1, 2],
+            "reload should replace the existing list with the fresh first page"
+        )
+        XCTAssertEqual(vm.snapshotsState, .loaded)
+    }
+
     // MARK: - Referenced assets (D4)
 
     func testLoadMoreReferencedAssetsPopulatesChips() async throws {

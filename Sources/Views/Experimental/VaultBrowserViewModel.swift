@@ -128,6 +128,20 @@ final class VaultBrowserViewModel {
 
     // MARK: - Snapshots
 
+    /// Wipe the snapshot list and re-fetch the first page. Called after a
+    /// successful vault ingest so the new snapshot appears at the top of the
+    /// sidebar without the user having to scroll through a stale page cursor.
+    /// File / asset state deliberately stays untouched so the current
+    /// selection isn't thrown away when the user's intent was just "import
+    /// one more export."
+    func reloadSnapshots() async {
+        snapshots = []
+        snapshotsOffset = 0
+        hasMoreSnapshots = true
+        snapshotsState = .idle
+        await loadMoreSnapshots()
+    }
+
     /// Fetch the next page of snapshots. Idempotent while a fetch is in
     /// flight, so the view can call this from `.task` + "Load more" without
     /// worrying about overlap.

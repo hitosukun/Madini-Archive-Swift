@@ -1,4 +1,8 @@
 import SwiftUI
+#if os(macOS)
+import AppKit
+import UniformTypeIdentifiers
+#endif
 
 /// Phase D1 raw-export Vault browser — read-only 2-pane view.
 ///
@@ -10,6 +14,11 @@ import SwiftUI
 /// don't perturb the main reader UI while the vault surface is being built.
 struct VaultBrowserView: View {
     @State private var viewModel: VaultBrowserViewModel
+    #if os(macOS)
+    @EnvironmentObject private var services: AppServices
+    @State private var isImporting = false
+    @State private var importError: ImportErrorAlert?
+    #endif
 
     init(
         vault: any RawExportVault,
@@ -39,6 +48,27 @@ struct VaultBrowserView: View {
                 await viewModel.loadMoreSnapshots()
             }
         }
+        #if os(macOS)
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                importToolbarButton
+            }
+        }
+        .alert(
+            "Import failed",
+            isPresented: Binding(
+                get: { importError != nil },
+                set: { isPresented in
+                    if !isPresented { importError = nil }
+                }
+            ),
+            presenting: importError
+        ) { _ in
+            Button("OK", role: .cancel) { importError = nil }
+        } message: { alert in
+            Text(alert.message)
+        }
+        #endif
     }
 
     // MARK: - Snapshots pane
@@ -498,3 +528,74 @@ struct VaultBrowserView: View {
         URL(fileURLWithPath: path).lastPathComponent
     }
 }
+
+// MARK: - Import (macOS)
+
+#if os(macOS)
+/// Error payload for the `.alert` driving import failures. Modelled as a
+/// separate `Identifiable` so we can drive the alert with `presenting:` and
+/// keep the message verbatim across re-renders.
+struct ImportErrorAlert: Identifiable, Equatable {
+    let id = UUID()
+    let message: String
+}
+
+extension VaultBrowserView {
+    @ViewBuilder
+    fileprivate var importToolbarButton: some View {
+        if isImporting {
+            ProgressView()
+                .controlSize(.small)
+        } else {
+            Button {
+                Task { await runImport() }
+            } label: {
+                Label("Import…", systemImage: "square.and.arrow.down")
+            }
+            .help("Pick one or more export JSON files or folders to ingest into the vault")
+        }
+    }
+
+    /// Drive a full import cycle from an NSOpenPanel selection through the
+    /// `ImportCoordinator`. The coordinator is authoritative for "vaulted /
+    /// not vaulted" semantics — we only translate its result into UI state.
+    @MainActor
+    fileprivate func runImport() async {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.allowedContentTypes = [.json, .folder]
+        panel.message = "Select ChatGPT / Claude / Gemini export JSON files or folders"
+        panel.prompt = "Import"
+
+        guard panel.runModal() == .OK else { return }
+        let urls = panel.urls
+        guard !urls.isEmpty else { return }
+
+        isImporting = true
+        defer { isImporting = false }
+
+        do {
+            _ = try await ImportCoordinator.importDroppedURLs(urls, services: services)
+            await viewModel.reloadSnapshots()
+        } catch let coordinatorError as ImportCoordinatorError {
+            // .importerFailed preserves the vault snapshot even though the
+            // Python importer bailed — refresh so the new row shows up,
+            // then surface the detail so the user knows normalization has
+            // to be retried.
+            if case .importerFailed(_, _, _) = coordinatorError {
+                await viewModel.reloadSnapshots()
+            }
+            importError = ImportErrorAlert(
+                message: [
+                    coordinatorError.errorDescription,
+                    coordinatorError.failureDetail
+                ].compactMap { $0 }.joined(separator: "\n\n")
+            )
+        } catch {
+            importError = ImportErrorAlert(message: error.localizedDescription)
+        }
+    }
+}
+#endif
