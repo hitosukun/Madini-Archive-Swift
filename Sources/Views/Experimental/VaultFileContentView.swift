@@ -93,6 +93,15 @@ struct VaultFileContentView: View {
         // a JSON as `application/octet-stream` etc.
         if VaultAssetPreviewView.renderable(for: payload) != nil {
             VaultAssetPreviewView(payload: payload)
+        } else if Self.looksTextual(payload.entry),
+                  payload.entry.sizeBytes > Self.textSizeCap
+        {
+            // ChatGPT `conversations.json` routinely lands in the 50–500 MB
+            // range. We don't want to refuse to show it silently as a
+            // "binary file" — that reads like corruption. Surface the real
+            // reason so the user knows the bytes are fine, just too big for
+            // inline rendering at this phase.
+            tooLargeTextPlaceholder(for: payload)
         } else if let text = Self.textRepresentation(for: payload) {
             ScrollView([.vertical, .horizontal]) {
                 Text(text)
@@ -125,32 +134,67 @@ struct VaultFileContentView: View {
         .padding()
     }
 
+    private func tooLargeTextPlaceholder(for payload: RawExportFilePayload) -> some View {
+        VStack(spacing: 12) {
+            Image(systemName: "doc.text.magnifyingglass")
+                .font(.system(size: 36))
+                .foregroundStyle(.secondary)
+            Text("File too large to preview")
+                .font(.headline)
+            Text("\(Self.byteString(payload.entry.sizeBytes)) · \(payload.entry.mimeType ?? "text")")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text("Inline rendering is capped at \(Self.byteString(Self.textSizeCap)) to keep the UI responsive. The bytes are fully vaulted and hash-verified; streaming preview lands in a later phase.")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: 420)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding()
+    }
+
     // MARK: - Text detection + pretty print
 
     /// Returns a printable string for the payload, or `nil` if the bytes look
-    /// binary. Tries JSON pretty-printing first for JSON roles / MIME, then
-    /// falls back to raw UTF-8.
+    /// binary or are past the inline-render size cap. Tries JSON
+    /// pretty-printing first for JSON roles / MIME, then falls back to raw
+    /// UTF-8. Callers that want to distinguish "too large" from "binary"
+    /// should consult `looksTextual` + `textSizeCap` directly.
     static func textRepresentation(for payload: RawExportFilePayload) -> String? {
         let entry = payload.entry
         // Never try to decode huge blobs as text — the SwiftUI `Text` wrap
         // cost dominates well before we hit interesting content.
-        guard entry.sizeBytes <= 10_000_000 else { return nil }
+        guard entry.sizeBytes <= textSizeCap else { return nil }
+        guard looksTextual(entry) else { return nil }
 
-        let looksJSON = entry.mimeType == "application/json"
-            || entry.relativePath.lowercased().hasSuffix(".json")
-            || entry.role == "manifest"
-        if looksJSON, let pretty = prettyPrintedJSON(payload.data) {
+        if looksJSON(entry), let pretty = prettyPrintedJSON(payload.data) {
             return pretty
         }
-
-        let looksTextual = (entry.mimeType?.hasPrefix("text/") == true)
-            || entry.role == "conversation"
-            || entry.role == "metadata"
-            || entry.role == "manifest"
-            || Self.textExtensions.contains(URL(fileURLWithPath: entry.relativePath).pathExtension.lowercased())
-        guard looksTextual else { return nil }
-
         return String(data: payload.data, encoding: .utf8)
+    }
+
+    /// Inline-render size ceiling. Kept separate from the classifier so the
+    /// view can show "too large" instead of falling through to the generic
+    /// binary placeholder for oversized but textual files.
+    static let textSizeCap: Int64 = 10_000_000
+
+    /// True when this entry *looks* like something we could render as text.
+    /// Doesn't check size — the caller combines this with `textSizeCap` to
+    /// decide between inline rendering and the "too large" placeholder.
+    static func looksTextual(_ entry: RawExportFileEntry) -> Bool {
+        if looksJSON(entry) { return true }
+        if entry.mimeType?.hasPrefix("text/") == true { return true }
+        if entry.role == "conversation" || entry.role == "metadata" { return true }
+        let ext = URL(fileURLWithPath: entry.relativePath).pathExtension.lowercased()
+        return textExtensions.contains(ext)
+    }
+
+    private static func looksJSON(_ entry: RawExportFileEntry) -> Bool {
+        entry.mimeType == "application/json"
+            || entry.relativePath.lowercased().hasSuffix(".json")
+            || entry.role == "manifest"
     }
 
     private static let textExtensions: Set<String> = [

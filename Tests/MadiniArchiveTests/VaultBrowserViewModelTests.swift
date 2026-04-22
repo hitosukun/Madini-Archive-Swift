@@ -231,6 +231,47 @@ final class VaultBrowserViewModelTests: XCTestCase {
         }
     }
 
+    func testLooksTextualClassifiesConversationJSONEvenAtHugeSize() throws {
+        // A 500 MB ChatGPT `conversations.json` is the motivating case —
+        // `textRepresentation` still refuses (size cap), but the classifier
+        // must return true so the view can show "too large" rather than
+        // falling through to the generic binary placeholder.
+        let entry = RawExportFileEntry(
+            snapshotID: 1,
+            relativePath: "conversations-000.json",
+            blobHash: String(repeating: "a", count: 64),
+            sizeBytes: 500_000_000,
+            storedSizeBytes: 50_000_000,
+            mimeType: "application/json",
+            role: "conversation",
+            compression: "lzfse",
+            storedPath: "/tmp/blobs/aa/aaaa.blob"
+        )
+
+        XCTAssertTrue(VaultFileContentView.looksTextual(entry))
+
+        let payload = RawExportFilePayload(entry: entry, data: Data())
+        XCTAssertNil(
+            VaultFileContentView.textRepresentation(for: payload),
+            "files past the size cap must still opt out of inline rendering"
+        )
+    }
+
+    func testLooksTextualRejectsImageAsset() throws {
+        let entry = RawExportFileEntry(
+            snapshotID: 1,
+            relativePath: "assets/screenshot.png",
+            blobHash: String(repeating: "b", count: 64),
+            sizeBytes: 4,
+            storedSizeBytes: 4,
+            mimeType: "image/png",
+            role: "asset",
+            compression: "none",
+            storedPath: "/tmp/blobs/bb/bbbb.blob"
+        )
+        XCTAssertFalse(VaultFileContentView.looksTextual(entry))
+    }
+
     func testTextRepresentationReturnsNilForBinaryPayload() throws {
         let entry = RawExportFileEntry(
             snapshotID: 1,
