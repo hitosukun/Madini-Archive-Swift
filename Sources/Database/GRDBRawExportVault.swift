@@ -500,34 +500,45 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
             throw RawExportVaultError.blobFileMissing(hash: hash, path: canonicalURL.path)
         }
 
-        let storedData: Data
-        do {
-            storedData = try Data(contentsOf: storedURL)
-        } catch {
-            throw RawExportVaultError.blobFileMissing(hash: hash, path: storedURL.path)
-        }
-
-        let bytes: Data
-        switch record.compression {
-        case "none":
-            bytes = storedData
-        case "lzfse":
-            guard let decompressed = Self.lzfseDecompressed(
-                storedData,
-                expectedSize: Int(clamping: record.sizeBytes)
-            ) else {
-                throw RawExportVaultError.decompressionFailed(hash: hash)
+        // Everything below — disk read, LZFSE decompress, SHA-256 — is CPU /
+        // I/O heavy. For an 84 MB JSON the hash alone takes ~200 ms, and
+        // SwiftUI freezes if that runs on the main actor. Non-isolated async
+        // funcs are supposed to off-main automatically, but the guarantee
+        // isn't reliable in practice (it hinges on Swift version + optimizer
+        // decisions). Push the work onto a detached task to make off-main
+        // execution explicit.
+        let expectedSize = Int(clamping: record.sizeBytes)
+        let compression = record.compression
+        return try await Task.detached(priority: .userInitiated) {
+            let storedData: Data
+            do {
+                storedData = try Data(contentsOf: storedURL, options: .mappedIfSafe)
+            } catch {
+                throw RawExportVaultError.blobFileMissing(hash: hash, path: storedURL.path)
             }
-            bytes = decompressed
-        default:
-            throw RawExportVaultError.unsupportedCompression(record.compression)
-        }
 
-        let actual = Self.sha256Hex(bytes)
-        guard actual == hash else {
-            throw RawExportVaultError.hashMismatch(expected: hash, actual: actual)
-        }
-        return bytes
+            let bytes: Data
+            switch compression {
+            case "none":
+                bytes = storedData
+            case "lzfse":
+                guard let decompressed = Self.lzfseDecompressed(
+                    storedData,
+                    expectedSize: expectedSize
+                ) else {
+                    throw RawExportVaultError.decompressionFailed(hash: hash)
+                }
+                bytes = decompressed
+            default:
+                throw RawExportVaultError.unsupportedCompression(compression)
+            }
+
+            let actual = Self.sha256Hex(bytes)
+            guard actual == hash else {
+                throw RawExportVaultError.hashMismatch(expected: hash, actual: actual)
+            }
+            return bytes
+        }.value
     }
 
     func loadFile(
