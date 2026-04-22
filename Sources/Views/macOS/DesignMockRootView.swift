@@ -44,41 +44,58 @@ struct DesignMockRootView: View {
                 DesignMockSidebar(selection: $selectedSidebarItemID)
                     .navigationSplitViewColumnWidth(min: 240, ideal: 270, max: 320)
             } detail: {
-                DesignMockThreadTablePane(
-                    conversations: filteredConversations,
-                    selection: $selectedConversationID
-                )
+                if showingAutoIntake {
+                    AutoIntakePane()
+                } else {
+                    DesignMockThreadTablePane(
+                        conversations: filteredConversations,
+                        selection: $selectedConversationID
+                    )
+                }
             }
         case .default:
             NavigationSplitView {
                 DesignMockSidebar(selection: $selectedSidebarItemID)
                     .navigationSplitViewColumnWidth(min: 240, ideal: 270, max: 320)
             } content: {
-                DesignMockDefaultContentPane(
-                    displayMode: $selectedCenterDisplayMode,
-                    conversations: filteredConversations,
-                    conversationSelection: $selectedConversationID,
-                    selectedPromptIndex: $selectedPromptIndex,
-                    expandedPromptConversationID: $expandedPromptConversationID
-                )
-                .navigationSplitViewColumnWidth(min: 360, ideal: 460, max: 760)
+                if showingAutoIntake {
+                    AutoIntakePane()
+                        .navigationSplitViewColumnWidth(min: 360, ideal: 460, max: 760)
+                } else {
+                    DesignMockDefaultContentPane(
+                        displayMode: $selectedCenterDisplayMode,
+                        conversations: filteredConversations,
+                        conversationSelection: $selectedConversationID,
+                        selectedPromptIndex: $selectedPromptIndex,
+                        expandedPromptConversationID: $expandedPromptConversationID
+                    )
+                    .navigationSplitViewColumnWidth(min: 360, ideal: 460, max: 760)
+                }
             } detail: {
-                DesignMockReaderPane(
-                    conversation: selectedConversation,
-                    selectedPromptIndex: $selectedPromptIndex,
-                    prompts: DesignMockData.promptSnippets
-                )
+                if showingAutoIntake {
+                    AutoIntakeDetailPlaceholder()
+                } else {
+                    DesignMockReaderPane(
+                        conversation: selectedConversation,
+                        selectedPromptIndex: $selectedPromptIndex,
+                        prompts: DesignMockData.promptSnippets
+                    )
+                }
             }
         case .viewer:
             NavigationSplitView {
                 DesignMockSidebar(selection: $selectedSidebarItemID)
                     .navigationSplitViewColumnWidth(min: 240, ideal: 270, max: 320)
             } detail: {
-                DesignMockReaderPane(
-                    conversation: selectedConversation,
-                    selectedPromptIndex: $selectedPromptIndex,
-                    prompts: DesignMockData.promptSnippets
-                )
+                if showingAutoIntake {
+                    AutoIntakePane()
+                } else {
+                    DesignMockReaderPane(
+                        conversation: selectedConversation,
+                        selectedPromptIndex: $selectedPromptIndex,
+                        prompts: DesignMockData.promptSnippets
+                    )
+                }
             }
         }
     }
@@ -110,7 +127,18 @@ struct DesignMockRootView: View {
             return false
         case .source(let source):
             return item.source.lowercased() == source.lowercased()
+        case .autoIntake:
+            // Intake has its own pane; conversations never show here.
+            return false
         }
+    }
+
+    private var showingAutoIntake: Bool {
+        guard let selectedSidebarItemID else { return false }
+        if case .autoIntake = DesignMockSidebarItem.kind(for: selectedSidebarItemID) {
+            return true
+        }
+        return false
     }
 
     private func matchesSearch(_ item: DesignMockConversation, query: String) -> Bool {
@@ -129,6 +157,7 @@ private struct DesignMockSidebar: View {
             Section("Library") {
                 sidebarRow(DesignMockSidebarItem.allThreads)
                 sidebarRow(.init(id: "archive-db", title: "archive.db", subtitle: "Local SQLite archive", systemImage: "externaldrive", kind: .all))
+                sidebarRow(DesignMockSidebarItem.autoIntake)
             }
 
             Section("Projects") {
@@ -574,6 +603,7 @@ private struct DesignMockSidebarItem: Identifiable {
         case suggested
         case unassigned
         case source(String)
+        case autoIntake
     }
 
     let id: String
@@ -600,8 +630,17 @@ private struct DesignMockSidebarItem: Identifiable {
         )
     }
 
+    static let autoIntake = DesignMockSidebarItem(
+        id: "auto-intake",
+        title: "Auto Intake",
+        subtitle: "Drop exports to ingest",
+        systemImage: "tray.and.arrow.down.fill",
+        kind: .autoIntake
+    )
+
     static func kind(for id: String) -> Kind {
         if id == allThreads.id || id == "archive-db" { return .all }
+        if id == autoIntake.id { return .autoIntake }
         if id == "suggested" { return .suggested }
         if id == "unassigned" { return .unassigned }
         if let project = DesignMockData.projects.first(where: { "project-\($0.id)" == id }) {

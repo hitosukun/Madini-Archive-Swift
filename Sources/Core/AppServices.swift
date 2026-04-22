@@ -39,6 +39,25 @@ final class AppServices: ObservableObject {
     func stopIntake() {
         intake.stop()
     }
+
+    /// Activity log surfaced by the auto-intake watcher. `nil` when the app
+    /// is running against mock data — the watcher is never started in that
+    /// mode, so there's no log to show.
+    var intakeActivityLog: IntakeActivityLog? {
+        guard case .database = dataSource else { return nil }
+        return intake.activityLog
+    }
+
+    /// Path the watcher polls. Always resolvable, even in mock mode, so the
+    /// UI can still render "this is where it would go" when intake is off.
+    var intakeDirURL: URL {
+        // In mock mode `intake` is never instantiated — resolving through
+        // `IntakePaths` avoids lazy-init side effects for a read-only query.
+        if case .database = dataSource {
+            return intake.intakeDir
+        }
+        return IntakePaths.intakeDir
+    }
     #endif
 
     init(
