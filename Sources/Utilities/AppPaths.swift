@@ -25,6 +25,9 @@ enum AppPaths {
     static var historyFile: URL { userDataDir.appendingPathComponent("history.json") }
     static var customCSS: URL { userDataDir.appendingPathComponent("custom.css") }
     static var themesJSON: URL { userDataDir.appendingPathComponent("themes.json") }
+    static var rawExportsDir: URL { userDataDir.appendingPathComponent("raw_exports", isDirectory: true) }
+    static var rawExportBlobsDir: URL { rawExportsDir.appendingPathComponent("blobs", isDirectory: true) }
+    static var rawExportSnapshotsDir: URL { rawExportsDir.appendingPathComponent("snapshots", isDirectory: true) }
 
     // MARK: - 初期化
 

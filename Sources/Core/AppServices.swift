@@ -5,6 +5,11 @@ import SwiftUI
 final class AppServices: ObservableObject {
     let conversations: any ConversationRepository
     let search: any SearchRepository
+    let projects: any ProjectRepository
+    let projectMemberships: any ProjectMembershipRepository
+    let projectSuggestions: any ProjectSuggestionRepository
+    let projectSuggester: any ProjectSuggester
+    let rawExportVault: any RawExportVault
     let bookmarks: any BookmarkRepository
     let tags: any TagRepository
     let views: any ViewService
@@ -18,6 +23,11 @@ final class AppServices: ObservableObject {
     init(
         conversations: any ConversationRepository,
         search: any SearchRepository,
+        projects: any ProjectRepository,
+        projectMemberships: any ProjectMembershipRepository,
+        projectSuggestions: any ProjectSuggestionRepository,
+        projectSuggester: any ProjectSuggester,
+        rawExportVault: any RawExportVault,
         bookmarks: any BookmarkRepository,
         tags: any TagRepository,
         views: any ViewService,
@@ -25,6 +35,11 @@ final class AppServices: ObservableObject {
     ) {
         self.conversations = conversations
         self.search = search
+        self.projects = projects
+        self.projectMemberships = projectMemberships
+        self.projectSuggestions = projectSuggestions
+        self.projectSuggester = projectSuggester
+        self.rawExportVault = rawExportVault
         self.bookmarks = bookmarks
         self.tags = tags
         self.views = views
@@ -39,9 +54,23 @@ final class AppServices: ObservableObject {
             do {
                 let dbQueue = try DatabaseQueue(path: dbPath)
                 try Self.bootstrapViewLayerSchema(dbQueue: dbQueue)
+                let conversations = GRDBConversationRepository(dbQueue: dbQueue)
+                let projects = GRDBProjectRepository(dbQueue: dbQueue)
+                let projectMemberships = GRDBProjectMembershipRepository(dbQueue: dbQueue)
+                let projectSuggestions = GRDBProjectSuggestionRepository(dbQueue: dbQueue)
                 self.init(
-                    conversations: GRDBConversationRepository(dbQueue: dbQueue),
+                    conversations: conversations,
                     search: GRDBSearchRepository(dbQueue: dbQueue),
+                    projects: projects,
+                    projectMemberships: projectMemberships,
+                    projectSuggestions: projectSuggestions,
+                    projectSuggester: TFIDFProjectSuggester(
+                        conversations: conversations,
+                        projects: projects,
+                        memberships: projectMemberships,
+                        suggestions: projectSuggestions
+                    ),
+                    rawExportVault: GRDBRawExportVault(dbQueue: dbQueue),
                     bookmarks: GRDBBookmarkRepository(dbQueue: dbQueue),
                     tags: GRDBTagRepository(dbQueue: dbQueue),
                     views: GRDBViewService(dbQueue: dbQueue),
@@ -60,6 +89,11 @@ final class AppServices: ObservableObject {
                 items: PreviewData.conversations,
                 details: PreviewData.details
             ),
+            projects: MockProjectRepository(),
+            projectMemberships: MockProjectMembershipRepository(),
+            projectSuggestions: MockProjectSuggestionRepository(),
+            projectSuggester: NoOpProjectSuggester(),
+            rawExportVault: NoOpRawExportVault(),
             bookmarks: MockBookmarkRepository(),
             tags: MockTagRepository(),
             views: MockViewService(),
@@ -160,6 +194,101 @@ final class AppServices: ObservableObject {
             try db.execute(sql: """
                 CREATE INDEX IF NOT EXISTS idx_bookmark_tag_links_bookmark
                 ON bookmark_tag_links(bookmark_id, tag_id)
+                """)
+            try db.execute(sql: """
+                CREATE TABLE IF NOT EXISTS projects (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    origin TEXT NOT NULL CHECK (origin IN ('canonical_import', 'user_created')),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """)
+            try db.execute(sql: """
+                CREATE TABLE IF NOT EXISTS project_memberships (
+                    thread_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    origin TEXT NOT NULL CHECK (origin IN ('canonical_import', 'manual_add', 'accepted_suggestion')),
+                    assigned_at TEXT NOT NULL,
+                    FOREIGN KEY (thread_id) REFERENCES conversations(id) ON DELETE CASCADE,
+                    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+                )
+                """)
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS idx_project_memberships_project
+                ON project_memberships(project_id)
+                """)
+            try db.execute(sql: """
+                CREATE TABLE IF NOT EXISTS project_suggestions (
+                    thread_id TEXT NOT NULL,
+                    target_project_id TEXT NOT NULL,
+                    score REAL NOT NULL,
+                    reason TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK (state IN ('pending', 'accepted', 'dismissed')),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (thread_id, target_project_id),
+                    FOREIGN KEY (thread_id) REFERENCES conversations(id) ON DELETE CASCADE,
+                    FOREIGN KEY (target_project_id) REFERENCES projects(id) ON DELETE CASCADE
+                )
+                """)
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS idx_project_suggestions_thread_state
+                ON project_suggestions(thread_id, state)
+                """)
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS idx_project_suggestions_state_score
+                ON project_suggestions(state, score DESC)
+                """)
+            try db.execute(sql: """
+                CREATE TABLE IF NOT EXISTS raw_export_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    provider TEXT NOT NULL,
+                    source_root TEXT,
+                    imported_at TEXT NOT NULL,
+                    manifest_hash TEXT NOT NULL,
+                    file_count INTEGER NOT NULL,
+                    new_blob_count INTEGER NOT NULL,
+                    reused_blob_count INTEGER NOT NULL,
+                    original_bytes INTEGER NOT NULL,
+                    stored_bytes INTEGER NOT NULL,
+                    manifest_path TEXT NOT NULL
+                )
+                """)
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS idx_raw_export_snapshots_provider_time
+                ON raw_export_snapshots(provider, imported_at DESC, id DESC)
+                """)
+            try db.execute(sql: """
+                CREATE TABLE IF NOT EXISTS raw_export_blobs (
+                    hash TEXT PRIMARY KEY,
+                    size_bytes INTEGER NOT NULL,
+                    stored_size_bytes INTEGER NOT NULL,
+                    mime_type TEXT,
+                    compression TEXT NOT NULL,
+                    stored_path TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """)
+            try db.execute(sql: """
+                CREATE TABLE IF NOT EXISTS raw_export_files (
+                    snapshot_id INTEGER NOT NULL,
+                    relative_path TEXT NOT NULL,
+                    blob_hash TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    mime_type TEXT,
+                    role TEXT NOT NULL,
+                    compression TEXT NOT NULL,
+                    stored_path TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (snapshot_id, relative_path),
+                    FOREIGN KEY(snapshot_id) REFERENCES raw_export_snapshots(id) ON DELETE CASCADE,
+                    FOREIGN KEY(blob_hash) REFERENCES raw_export_blobs(hash)
+                )
+                """)
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS idx_raw_export_files_blob
+                ON raw_export_files(blob_hash)
                 """)
 
             // Seed the Trash system tag. Trash is a "rescue lane" — when a

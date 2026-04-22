@@ -91,8 +91,8 @@ struct MacOSRootView: View {
         // further down the view tree) so an external file drag lands
         // here first. Accepting `UTType.fileURL` — not `UTType.json` —
         // because we want the drop handler to fire on any file; we
-        // filter to JSONs ourselves inside `handleFileURLDrop(_:)` so
-        // the user can see a "only .json files are supported" toast
+        // resolve export folders / JSONs ourselves inside
+        // `handleFileURLDrop(_:)` so the user can see a helpful toast
         // rather than a silent rejection at the drop-zone layer.
         .onDrop(of: [.fileURL], isTargeted: $isJSONDropTargeted) { providers in
             handleFileURLDrop(providers: providers)
@@ -217,7 +217,7 @@ struct MacOSRootView: View {
     /// Keeps the visual contract simple — tell the user we'll import
     /// `.json` files and that anything else is ignored.
     private var dropTargetBanner: some View {
-        Text("Drop .json files to import into archive.db")
+        Text("Drop export folders or JSON files to import into archive.db")
             .font(.callout.weight(.medium))
             .foregroundStyle(.white)
             .padding(.horizontal, 14)
@@ -250,27 +250,37 @@ struct MacOSRootView: View {
                 }
             }
 
-            // Filter to `.json` files by extension. Pathextension check is
-            // enough — we rely on the Python importer to detect whether
-            // the contents are ChatGPT/Claude/Gemini/etc. If the user
-            // drops a `.txt` or `.md` alongside the jsons, reject only
-            // the non-json entries and import the rest.
-            let jsonURLs = urls.filter { $0.pathExtension.lowercased() == "json" }
-            let rejectedCount = urls.count - jsonURLs.count
+            // Resolve dropped files into importer-ready JSON payloads. A full
+            // ChatGPT export folder includes helper JSON files and assets; the
+            // importable payload is the sorted `conversations-*.json` set.
+            let selection = JSONImportFileResolver.resolve(urls)
+            let jsonURLs = selection.jsonURLs
+            let rejectedCount = selection.rejectedInputCount
 
             guard !jsonURLs.isEmpty else {
                 if rejectedCount > 0 {
                     showToast(.failure(
-                        message: "Only .json files can be imported.",
+                        message: "Only JSON exports can be imported.",
                         detail: nil
                     ))
                 }
                 return
             }
 
-            showToast(.progress(message: "Importing \(jsonURLs.count) file\(jsonURLs.count == 1 ? "" : "s")…"))
+            showToast(.progress(message: "Vaulting and importing \(jsonURLs.count) file\(jsonURLs.count == 1 ? "" : "s")…"))
 
             do {
+                let vaultResult: RawExportVaultResult?
+                do {
+                    let rawExportVault = services.rawExportVault
+                    vaultResult = try await Task.detached(priority: .utility) {
+                        try await rawExportVault.ingest(urls)
+                    }.value
+                } catch {
+                    vaultResult = nil
+                    print("Raw export vault ingest failed: \(error)")
+                }
+
                 // Actual shell-out runs on a detached background task so
                 // the importer's blocking IO doesn't pin the main actor.
                 let result = try await Task.detached(priority: .userInitiated) {
@@ -278,10 +288,21 @@ struct MacOSRootView: View {
                 }.value
 
                 if result.exitCode == 0 {
+                    do {
+                        try await JSONImportProjectReconciler.reconcileImportedFiles(jsonURLs, services: services)
+                    } catch {
+                        print("Project reconciliation failed after import: \(error)")
+                    }
                     archiveEvents.didImportConversations()
-                    let summary = rejectedCount > 0
-                        ? "Imported \(jsonURLs.count) file\(jsonURLs.count == 1 ? "" : "s"), skipped \(rejectedCount) non-JSON."
+                    let importSummary = rejectedCount > 0
+                        ? "Imported \(jsonURLs.count) file\(jsonURLs.count == 1 ? "" : "s"), skipped \(rejectedCount) unsupported item\(rejectedCount == 1 ? "" : "s")."
                         : "Imported \(jsonURLs.count) file\(jsonURLs.count == 1 ? "" : "s")."
+                    let summary: String
+                    if let vaultResult {
+                        summary = "\(importSummary) Vault: \(vaultResult.newBlobs) new, \(vaultResult.reusedBlobs) reused."
+                    } else {
+                        summary = importSummary
+                    }
                     showToast(.success(message: summary))
                 } else {
                     // Non-zero exit: importer ran but the Python side

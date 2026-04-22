@@ -472,6 +472,78 @@ struct SourceModelFacet: Sendable, Hashable {
     let count: Int
 }
 
+enum ProjectOrigin: String, Codable, Hashable, Sendable {
+    case canonicalImport = "canonical_import"
+    case userCreated = "user_created"
+}
+
+enum MembershipOrigin: String, Codable, Hashable, Sendable {
+    case canonicalImport = "canonical_import"
+    case manualAdd = "manual_add"
+    case acceptedSuggestion = "accepted_suggestion"
+}
+
+enum SuggestionState: String, Codable, Hashable, Sendable {
+    case pending
+    case accepted
+    case dismissed
+}
+
+struct Project: Identifiable, Hashable, Sendable {
+    let id: String
+    let name: String
+    let origin: ProjectOrigin
+    let createdAt: Date
+    let updatedAt: Date
+}
+
+struct ProjectMembership: Hashable, Sendable {
+    let threadId: String
+    let projectId: String
+    let origin: MembershipOrigin
+    let assignedAt: Date
+}
+
+struct ProjectSuggestion: Hashable, Sendable {
+    let threadId: String
+    let targetProjectId: String
+    let score: Double
+    let reason: [String]
+    let state: SuggestionState
+    let createdAt: Date
+    let updatedAt: Date
+}
+
+struct ProjectCounts: Hashable, Sendable {
+    let all: Int
+    let byProject: [String: Int]
+    let inbox: Int
+    let orphans: Int
+}
+
+enum ProjectRepositoryError: Error, Sendable {
+    case emptyProjectID
+    case emptyProjectName
+}
+
+enum RawExportProvider: String, Codable, Hashable, Sendable {
+    case chatGPT = "chatgpt"
+    case claude
+    case gemini
+    case unknown
+}
+
+struct RawExportVaultResult: Hashable, Sendable {
+    let provider: RawExportProvider
+    let snapshotID: Int64
+    let totalFiles: Int
+    let newBlobs: Int
+    let reusedBlobs: Int
+    let originalBytes: Int64
+    let storedBytes: Int64
+    let manifestURL: URL
+}
+
 protocol ConversationRepository: Sendable {
     func fetchIndex(query: ConversationListQuery) async throws -> [ConversationSummary]
     func fetchDetail(id: String) async throws -> ConversationDetail?
@@ -503,6 +575,37 @@ extension ConversationRepository {
 protocol SearchRepository: Sendable {
     func search(query: SearchQuery) async throws -> [SearchResult]
     func count(query: SearchQuery) async throws -> Int
+}
+
+protocol ProjectRepository: Sendable {
+    func listProjects(offset: Int, limit: Int) async throws -> [Project]
+    func project(id: String) async throws -> Project?
+    func upsertCanonicalProject(id: String, name: String) async throws -> Project
+    func createUserProject(name: String) async throws -> Project
+    func renameProject(id: String, to name: String) async throws
+    func deleteProject(id: String) async throws
+    func threadCounts() async throws -> ProjectCounts
+}
+
+protocol ProjectMembershipRepository: Sendable {
+    func membership(threadId: String) async throws -> ProjectMembership?
+    func setMembership(_ membership: ProjectMembership) async throws
+    func removeMembership(threadId: String) async throws
+    func threadsInProject(projectId: String, offset: Int, limit: Int) async throws -> [ConversationSummary]
+    func unassignedThreads(hasSuggestion: Bool, offset: Int, limit: Int) async throws -> [ConversationSummary]
+}
+
+protocol ProjectSuggestionRepository: Sendable {
+    func topPendingSuggestion(threadId: String) async throws -> ProjectSuggestion?
+    func suggestions(threadId: String) async throws -> [ProjectSuggestion]
+    func upsertSuggestion(_ suggestion: ProjectSuggestion) async throws
+    func markAccepted(threadId: String, targetProjectId: String) async throws
+    func markDismissed(threadId: String, targetProjectId: String) async throws
+    func dismissedTokens(projectId: String) async throws -> [String: Int]
+}
+
+protocol RawExportVault: Sendable {
+    func ingest(_ urls: [URL]) async throws -> RawExportVaultResult?
 }
 
 protocol BookmarkRepository: Sendable {
