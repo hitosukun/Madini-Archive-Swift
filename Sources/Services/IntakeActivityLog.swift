@@ -13,6 +13,9 @@ import Observation
 final class IntakeActivityLog {
     enum Kind: Sendable, Equatable {
         case ingested(snapshotID: Int64, jsonFileCount: Int)
+        /// The Vault recognized the dropped bytes as a prior ingest and
+        /// skipped work. `snapshotID` points at the already-stored snapshot.
+        case alreadyIngested(snapshotID: Int64)
         case importerFailed(snapshotID: Int64, detail: String)
         case unrecognized(reason: String)
         case failed(detail: String)

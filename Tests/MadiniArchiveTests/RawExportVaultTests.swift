@@ -182,23 +182,120 @@ final class RawExportVaultTests: XCTestCase {
 
     // MARK: - Dedupe
 
-    func testReingestSameExportReusesBlobs() async throws {
-        let (vault, _) = try makeVault()
+    func testReingestSameExportIsTreatedAsDuplicate() async throws {
+        let (vault, dbQueue) = try makeVault()
         let root = try makeChatGPTExport()
 
         let first = try await vault.ingest([root])
         let firstResult = try XCTUnwrap(first)
         XCTAssertEqual(firstResult.newBlobs, 2)
         XCTAssertEqual(firstResult.reusedBlobs, 0)
+        XCTAssertFalse(firstResult.wasDuplicate)
 
         let second = try await vault.ingest([root])
         let secondResult = try XCTUnwrap(second)
-        XCTAssertEqual(
-            secondResult.newBlobs,
-            0,
-            "second ingest of identical bytes should add zero new blobs"
+        XCTAssertTrue(
+            secondResult.wasDuplicate,
+            "re-dropping the same export folder should be flagged as duplicate"
         )
-        XCTAssertEqual(secondResult.reusedBlobs, 2)
+        XCTAssertEqual(
+            secondResult.snapshotID,
+            firstResult.snapshotID,
+            "duplicate result should point back at the original snapshot"
+        )
+        XCTAssertEqual(secondResult.newBlobs, 0)
+        XCTAssertEqual(secondResult.reusedBlobs, 0)
+
+        // Confirm only one snapshot row exists in the DB.
+        let snapshotCount = try await dbQueue.read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM raw_export_snapshots") ?? -1
+        }
+        XCTAssertEqual(snapshotCount, 1, "duplicate ingest should not create a new snapshot row")
+    }
+
+    func testReingestCopyWithSamePathDedupesToSameSnapshot() async throws {
+        // Drop the same content twice from two different source paths. The
+        // content hash is path-independent, so the second ingest should still
+        // collapse onto the first snapshot.
+        let (vault, dbQueue) = try makeVault()
+        let firstRoot = try makeChatGPTExport(named: "chatgpt-export-a")
+        let secondRoot = try makeChatGPTExport(named: "chatgpt-export-b")
+
+        let firstRaw = try await vault.ingest([firstRoot])
+        let first = try XCTUnwrap(firstRaw)
+        let secondRaw = try await vault.ingest([secondRoot])
+        let second = try XCTUnwrap(secondRaw)
+
+        XCTAssertTrue(second.wasDuplicate)
+        XCTAssertEqual(second.snapshotID, first.snapshotID)
+
+        let snapshotCount = try await dbQueue.read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM raw_export_snapshots") ?? -1
+        }
+        XCTAssertEqual(snapshotCount, 1)
+    }
+
+    func testDifferentContentProducesDistinctSnapshots() async throws {
+        let (vault, dbQueue) = try makeVault()
+        let firstRoot = try makeChatGPTExport(named: "export-1")
+
+        // Second export has an extra file so the content hash diverges.
+        let secondRoot = try makeChatGPTExport(named: "export-2")
+        try Data("different".utf8).write(
+            to: secondRoot.appendingPathComponent("extra.txt"),
+            options: .atomic
+        )
+
+        let firstRaw = try await vault.ingest([firstRoot])
+        let first = try XCTUnwrap(firstRaw)
+        let secondRaw = try await vault.ingest([secondRoot])
+        let second = try XCTUnwrap(secondRaw)
+
+        XCTAssertFalse(first.wasDuplicate)
+        XCTAssertFalse(second.wasDuplicate)
+        XCTAssertNotEqual(first.snapshotID, second.snapshotID)
+
+        let snapshotCount = try await dbQueue.read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM raw_export_snapshots") ?? -1
+        }
+        XCTAssertEqual(snapshotCount, 2)
+    }
+
+    func testContentHashBackfillFillsLegacySnapshot() async throws {
+        let (vault, dbQueue) = try makeVault()
+        let root = try makeChatGPTExport()
+        let firstRaw = try await vault.ingest([root])
+        let first = try XCTUnwrap(firstRaw)
+
+        // Simulate a pre-backfill database by blanking the content_hash.
+        try await dbQueue.write { db in
+            try db.execute(
+                sql: "UPDATE raw_export_snapshots SET content_hash = '' WHERE id = ?",
+                arguments: [first.snapshotID]
+            )
+        }
+
+        // Re-running the schema installer should backfill the stable hash.
+        try await dbQueue.write { db in
+            try GRDBRawExportVault.installSchema(in: db)
+        }
+
+        let hashAfter: String? = try await dbQueue.read { db in
+            try String.fetchOne(
+                db,
+                sql: "SELECT content_hash FROM raw_export_snapshots WHERE id = ?",
+                arguments: [first.snapshotID]
+            )
+        }
+        XCTAssertNotNil(hashAfter)
+        XCTAssertFalse(hashAfter?.isEmpty ?? true, "backfill should populate a non-empty hash")
+
+        // And a subsequent ingest of the same bytes should now dedupe
+        // correctly onto the backfilled snapshot.
+        let secondRaw = try await vault.ingest([root])
+        let second = try XCTUnwrap(secondRaw)
+        XCTAssertTrue(second.wasDuplicate)
+        XCTAssertEqual(second.snapshotID, first.snapshotID)
     }
 
     // MARK: - Search

@@ -5,8 +5,14 @@ struct ImportCoordinatorResult: Sendable {
     let jsonFileCount: Int
     let rejectedInputCount: Int
     let vaultResult: RawExportVaultResult
-    let importerResult: JSONImportResult
+    /// `nil` when the importer was skipped — currently only happens when the
+    /// Vault detected this content hash already existed and short-circuited.
+    let importerResult: JSONImportResult?
     let reconciliationErrorDescription: String?
+    /// `true` when the Vault returned an existing snapshot instead of creating
+    /// a new one. Callers can use this to render "already ingested" UX
+    /// instead of the normal success path.
+    let wasDuplicateSnapshot: Bool
 }
 
 enum ImportCoordinatorError: LocalizedError, Sendable {
@@ -73,6 +79,22 @@ enum ImportCoordinator {
         }
 
         let vaultResult = try await vaultOriginalExport(urls, services: services)
+
+        // Vault returned an existing snapshot — same bytes were ingested
+        // before, so the Python importer + reconciler would both be no-ops
+        // (same conversation IDs → overwrite with identical data). Skip them
+        // and let the caller render this as an "already ingested" event.
+        if vaultResult.wasDuplicate {
+            return ImportCoordinatorResult(
+                jsonFileCount: jsonURLs.count,
+                rejectedInputCount: selection.rejectedInputCount,
+                vaultResult: vaultResult,
+                importerResult: nil,
+                reconciliationErrorDescription: nil,
+                wasDuplicateSnapshot: true
+            )
+        }
+
         let importerResult: JSONImportResult
         do {
             importerResult = try await Task.detached(priority: .userInitiated) {
@@ -107,7 +129,8 @@ enum ImportCoordinator {
             rejectedInputCount: selection.rejectedInputCount,
             vaultResult: vaultResult,
             importerResult: importerResult,
-            reconciliationErrorDescription: reconciliationErrorDescription
+            reconciliationErrorDescription: reconciliationErrorDescription,
+            wasDuplicateSnapshot: false
         )
     }
 

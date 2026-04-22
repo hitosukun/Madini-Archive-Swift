@@ -279,6 +279,9 @@ struct MacOSRootView: View {
     }
 
     private func importSuccessMessage(for result: ImportCoordinatorResult) -> String {
+        if result.wasDuplicateSnapshot {
+            return "Already ingested — reusing snapshot \(result.vaultResult.snapshotID)."
+        }
         let importSummary = result.rejectedInputCount > 0
             ? "Imported \(result.jsonFileCount) file\(result.jsonFileCount == 1 ? "" : "s"), skipped \(result.rejectedInputCount) unsupported item\(result.rejectedInputCount == 1 ? "" : "s")."
             : "Imported \(result.jsonFileCount) file\(result.jsonFileCount == 1 ? "" : "s")."

@@ -87,13 +87,20 @@ struct IntakeProcessor {
     private func runImport(urls: [URL], source: String) async {
         do {
             let result = try await ImportCoordinator.importDroppedURLs(urls, services: services)
-            activityLog.record(
-                source: source,
-                kind: .ingested(
-                    snapshotID: result.vaultResult.snapshotID,
-                    jsonFileCount: result.jsonFileCount
+            if result.wasDuplicateSnapshot {
+                activityLog.record(
+                    source: source,
+                    kind: .alreadyIngested(snapshotID: result.vaultResult.snapshotID)
                 )
-            )
+            } else {
+                activityLog.record(
+                    source: source,
+                    kind: .ingested(
+                        snapshotID: result.vaultResult.snapshotID,
+                        jsonFileCount: result.jsonFileCount
+                    )
+                )
+            }
         } catch let error as ImportCoordinatorError {
             switch error {
             case .noImportableJSON:

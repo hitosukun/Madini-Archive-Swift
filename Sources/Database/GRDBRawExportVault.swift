@@ -107,10 +107,12 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
         var reusedBlobCount = 0
         var originalBytes: Int64 = 0
         var storedBytes: Int64 = 0
+        var contentPairs: [(String, String)] = []
 
         for candidate in candidates {
             let original = try Data(contentsOf: candidate.url)
             let hash = Self.sha256Hex(original)
+            contentPairs.append((candidate.relativePath, hash))
             let originalSize = Int64(original.count)
             originalBytes += originalSize
             if let searchable = searchableText(from: original, candidate: candidate) {
@@ -166,6 +168,26 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
             )
         }
 
+        let contentHash = Self.computeContentHash(provider: provider.rawValue, files: contentPairs)
+
+        // Dedupe: if a prior snapshot carries the same stable content hash,
+        // skip the manifest + INSERT and return the existing snapshot. This
+        // is what makes re-dropping the same export folder a no-op at the
+        // Vault level instead of the watcher level.
+        if let existing = try await fetchExistingSnapshot(contentHash: contentHash) {
+            return RawExportVaultResult(
+                provider: existing.provider,
+                snapshotID: existing.id,
+                totalFiles: existing.fileCount,
+                newBlobs: 0,
+                reusedBlobs: 0,
+                originalBytes: 0,
+                storedBytes: 0,
+                manifestURL: URL(fileURLWithPath: existing.manifestPath),
+                wasDuplicate: true
+            )
+        }
+
         let manifest = SnapshotManifest(
             provider: provider.rawValue,
             sourceRoot: root?.path,
@@ -191,9 +213,10 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
                 sql: """
                     INSERT INTO raw_export_snapshots (
                         provider, source_root, imported_at, manifest_hash, file_count,
-                        new_blob_count, reused_blob_count, original_bytes, stored_bytes, manifest_path
+                        new_blob_count, reused_blob_count, original_bytes, stored_bytes, manifest_path,
+                        content_hash
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                 arguments: [
                     provider.rawValue,
@@ -205,7 +228,8 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
                     reusedBlobCount,
                     originalBytes,
                     storedBytes,
-                    manifestURL.path
+                    manifestURL.path,
+                    contentHash
                 ]
             )
             let snapshotID = db.lastInsertedRowID
@@ -303,8 +327,40 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
             reusedBlobs: reusedBlobCount,
             originalBytes: originalBytes,
             storedBytes: storedBytes,
-            manifestURL: manifestURL
+            manifestURL: manifestURL,
+            wasDuplicate: false
         )
+    }
+
+    private struct ExistingSnapshot {
+        let id: Int64
+        let provider: RawExportProvider
+        let fileCount: Int
+        let manifestPath: String
+    }
+
+    private func fetchExistingSnapshot(contentHash: String) async throws -> ExistingSnapshot? {
+        try await GRDBAsync.read(from: dbQueue) { db in
+            guard let row = try Row.fetchOne(
+                db,
+                sql: """
+                    SELECT id, provider, file_count, manifest_path
+                    FROM raw_export_snapshots
+                    WHERE content_hash = ?
+                    ORDER BY id ASC
+                    LIMIT 1
+                    """,
+                arguments: [contentHash]
+            ) else {
+                return nil
+            }
+            return ExistingSnapshot(
+                id: row["id"],
+                provider: RawExportProvider(rawValue: row["provider"] ?? "") ?? .unknown,
+                fileCount: row["file_count"],
+                manifestPath: row["manifest_path"] ?? ""
+            )
+        }
     }
 
     func listSnapshots(offset: Int, limit: Int) async throws -> [RawExportSnapshotSummary] {
@@ -1042,12 +1098,30 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
                 reused_blob_count INTEGER NOT NULL,
                 original_bytes INTEGER NOT NULL,
                 stored_bytes INTEGER NOT NULL,
-                manifest_path TEXT NOT NULL
+                manifest_path TEXT NOT NULL,
+                content_hash TEXT NOT NULL DEFAULT ''
             )
             """)
         try db.execute(sql: """
             CREATE INDEX IF NOT EXISTS idx_raw_export_snapshots_provider_time
             ON raw_export_snapshots(provider, imported_at DESC, id DESC)
+            """)
+        // `content_hash` was added after the initial schema shipped. For
+        // databases created before this column existed, add it with a safe
+        // default ('') so the backfill pass below can populate it.
+        if try !Self.tableColumns(db: db, table: "raw_export_snapshots").contains("content_hash") {
+            try db.execute(sql: """
+                ALTER TABLE raw_export_snapshots
+                ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''
+                """)
+        }
+        // Partial unique index guards against duplicate ingests. Rows with an
+        // empty `content_hash` (pre-backfill or legacy) are excluded so the
+        // column can be added without breaking migration.
+        try db.execute(sql: """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_raw_export_snapshots_content_hash
+            ON raw_export_snapshots(content_hash)
+            WHERE content_hash <> ''
             """)
         try db.execute(sql: """
             CREATE TABLE IF NOT EXISTS raw_export_blobs (
@@ -1107,5 +1181,92 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
             CREATE INDEX IF NOT EXISTS idx_raw_export_asset_links_asset
             ON raw_export_asset_links(snapshot_id, asset_relative_path)
             """)
+
+        try Self.backfillContentHashes(in: db)
+    }
+
+    /// Populate `content_hash` for any legacy snapshots that predate the
+    /// column. Reads each snapshot's file list (provider + sorted
+    /// relative_path/blob_hash tuples), computes the stable digest, and
+    /// writes it back. Runs only on rows where `content_hash` is still empty
+    /// — once filled, the row is skipped on subsequent boots. If two legacy
+    /// snapshots collapse to the same hash, keep only the oldest and leave
+    /// the rest with an empty hash (unique index tolerates that); a future
+    /// GC pass can prune them.
+    private static func backfillContentHashes(in db: Database) throws {
+        let pendingRows = try Row.fetchAll(
+            db,
+            sql: """
+                SELECT id, provider
+                FROM raw_export_snapshots
+                WHERE content_hash = ''
+                ORDER BY id ASC
+                """
+        )
+        guard !pendingRows.isEmpty else {
+            return
+        }
+
+        var seenHashes = Set<String>()
+        // Prime with already-backfilled rows so the first legacy snapshot
+        // collides with them, not the other way around.
+        if let existing = try? String.fetchAll(
+            db,
+            sql: "SELECT content_hash FROM raw_export_snapshots WHERE content_hash <> ''"
+        ) {
+            seenHashes.formUnion(existing)
+        }
+
+        for row in pendingRows {
+            let snapshotID: Int64 = row["id"]
+            let provider: String = row["provider"] ?? "unknown"
+            let fileRows = try Row.fetchAll(
+                db,
+                sql: """
+                    SELECT relative_path, blob_hash
+                    FROM raw_export_files
+                    WHERE snapshot_id = ?
+                    ORDER BY relative_path ASC
+                    """,
+                arguments: [snapshotID]
+            )
+            let pairs: [(String, String)] = fileRows.map { ($0["relative_path"], $0["blob_hash"]) }
+            let contentHash = Self.computeContentHash(provider: provider, files: pairs)
+            if seenHashes.contains(contentHash) {
+                // Duplicate among legacy rows — leave empty so the unique
+                // index (partial, excludes '') accepts it.
+                continue
+            }
+            seenHashes.insert(contentHash)
+            try db.execute(
+                sql: "UPDATE raw_export_snapshots SET content_hash = ? WHERE id = ?",
+                arguments: [contentHash, snapshotID]
+            )
+        }
+    }
+
+    private static func tableColumns(db: Database, table: String) throws -> Set<String> {
+        let rows = try Row.fetchAll(db, sql: "PRAGMA table_info(\(table))")
+        return Set(rows.compactMap { $0["name"] as String? })
+    }
+
+    /// Stable digest of a snapshot's content: provider + sorted list of
+    /// (relativePath, blobHash). Intentionally excludes timestamps and the
+    /// import path so re-dropping the same export folder collapses to the
+    /// same hash.
+    static func computeContentHash(provider: String, files: [(String, String)]) -> String {
+        let sorted = files.sorted { $0.0 < $1.0 }
+        var hasher = SHA256()
+        hasher.update(data: Data("v1\n".utf8))
+        hasher.update(data: Data("\(provider)\n".utf8))
+        for (path, hash) in sorted {
+            hasher.update(data: Data(path.utf8))
+            hasher.update(data: Data("\t".utf8))
+            hasher.update(data: Data(hash.utf8))
+            hasher.update(data: Data("\n".utf8))
+        }
+        return hasher.finalize()
+            .map { String(format: "%02x", $0) }
+            .joined()
     }
 }

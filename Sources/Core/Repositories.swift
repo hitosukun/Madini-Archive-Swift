@@ -542,6 +542,10 @@ struct RawExportVaultResult: Hashable, Sendable {
     let originalBytes: Int64
     let storedBytes: Int64
     let manifestURL: URL
+    /// `true` when the ingest was a no-op because an existing snapshot with
+    /// the same stable content hash was found. The returned `snapshotID`
+    /// points to that prior snapshot, and byte / blob counts are zero.
+    let wasDuplicate: Bool
 }
 
 struct RawExportSnapshotSummary: Identifiable, Hashable, Sendable {
