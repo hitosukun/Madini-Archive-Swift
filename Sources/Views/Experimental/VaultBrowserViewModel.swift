@@ -40,8 +40,10 @@ final class VaultBrowserViewModel {
             filesState = .idle
             hasMoreFiles = true
             filesOffset = 0
-            // Switching snapshot also invalidates any file we had open.
+            // Switching snapshot also invalidates any file we had open and
+            // therefore any asset chips / preview derived from that file.
             selectedFileID = nil
+            resetReferencedAssets()
         }
     }
 
@@ -53,12 +55,16 @@ final class VaultBrowserViewModel {
 
     /// Compound key (`RawExportFileEntry.id` = "snapshotID:relativePath") of
     /// the file the user is currently inspecting. Changing this clears the
-    /// previously loaded payload so the view can't flash stale bytes.
+    /// previously loaded payload and asset chips so the view can't flash
+    /// stale bytes or chips from the old selection.
     var selectedFileID: String? {
         didSet {
             guard oldValue != selectedFileID else { return }
             selectedFilePayload = nil
             fileContentState = .idle
+            resetReferencedAssets()
+            // Any open asset preview belongs to the previous source file.
+            previewingAssetID = nil
         }
     }
 
@@ -67,12 +73,48 @@ final class VaultBrowserViewModel {
     private(set) var selectedFilePayload: RawExportFilePayload?
     private(set) var fileContentState: LoadState = .idle
 
+    // MARK: - Asset chips (D4)
+
+    /// Assets referenced by the currently selected (textual) file, resolved
+    /// via `RawAssetResolver.assetsReferencedBy`. Empty when the selected
+    /// file isn't a document that references anything.
+    private(set) var referencedAssets: [RawAssetHit] = []
+    private(set) var referencedAssetsState: LoadState = .idle
+
+    /// Asset the user is previewing via the chip overlay (D4). When non-nil
+    /// the view shows the asset preview sheet; setting it back to nil or to
+    /// a different hit re-triggers payload loading.
+    var previewingAssetID: String? {
+        didSet {
+            guard oldValue != previewingAssetID else { return }
+            previewedAssetPayload = nil
+            previewedAssetState = .idle
+        }
+    }
+
+    /// Decompressed bytes for `previewingAssetID` once loaded.
+    private(set) var previewedAssetPayload: RawExportFilePayload?
+    private(set) var previewedAssetState: LoadState = .idle
+
+    /// Backing hit record for `previewingAssetID` so the view can title the
+    /// preview sheet without reaching back through the resolver.
+    var previewingAsset: RawAssetHit? {
+        guard let previewingAssetID else { return nil }
+        return referencedAssets.first { $0.id == previewingAssetID }
+    }
+
     private let vault: any RawExportVault
+    private let assetResolver: any RawAssetResolver
     private var snapshotsOffset = 0
     private var filesOffset = 0
+    private var referencedAssetsOffset = 0
 
-    init(vault: any RawExportVault) {
+    init(
+        vault: any RawExportVault,
+        assetResolver: any RawAssetResolver
+    ) {
         self.vault = vault
+        self.assetResolver = assetResolver
     }
 
     /// Entry metadata for `selectedFileID`, looked up in the already-loaded
@@ -158,6 +200,62 @@ final class VaultBrowserViewModel {
             selectedFilePayload = nil
             fileContentState = .failed(message: Self.message(for: error))
         }
+    }
+
+    // MARK: - Referenced assets (D4)
+
+    /// Load (or page) the assets referenced by the currently selected file.
+    /// The D4 UI calls this after a file is selected; it's cheap to no-op
+    /// when the selection isn't a document that references anything because
+    /// the resolver simply returns an empty page.
+    func loadMoreReferencedAssets() async {
+        guard let entry = selectedFileEntry else { return }
+        guard referencedAssetsState != .loading else { return }
+        let pinnedFileID = entry.id
+        referencedAssetsState = .loading
+        do {
+            let page = try await assetResolver.assetsReferencedBy(
+                snapshotID: entry.snapshotID,
+                sourceRelativePath: entry.relativePath,
+                offset: referencedAssetsOffset,
+                limit: Self.pageSize
+            )
+            guard selectedFileID == pinnedFileID else { return }
+            referencedAssets.append(contentsOf: page)
+            referencedAssetsOffset += page.count
+            referencedAssetsState = .loaded
+        } catch {
+            guard selectedFileID == pinnedFileID else { return }
+            referencedAssetsState = .failed(message: Self.message(for: error))
+        }
+    }
+
+    /// Load the asset bytes for the current `previewingAssetID` via
+    /// `RawExportVault.loadFile`. Called by the chip-preview sheet.
+    func loadPreviewedAssetPayload() async {
+        guard let hit = previewingAsset else { return }
+        guard previewedAssetState != .loading else { return }
+        let pinnedAssetID = hit.id
+        previewedAssetState = .loading
+        do {
+            let payload = try await vault.loadFile(
+                snapshotID: hit.snapshotID,
+                relativePath: hit.assetRelativePath
+            )
+            guard previewingAssetID == pinnedAssetID else { return }
+            previewedAssetPayload = payload
+            previewedAssetState = .loaded
+        } catch {
+            guard previewingAssetID == pinnedAssetID else { return }
+            previewedAssetPayload = nil
+            previewedAssetState = .failed(message: Self.message(for: error))
+        }
+    }
+
+    private func resetReferencedAssets() {
+        referencedAssets = []
+        referencedAssetsState = .idle
+        referencedAssetsOffset = 0
     }
 
     // MARK: - Helpers

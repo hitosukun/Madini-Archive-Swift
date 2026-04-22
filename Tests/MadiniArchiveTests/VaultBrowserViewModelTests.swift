@@ -25,7 +25,7 @@ final class VaultBrowserViewModelTests: XCTestCase {
             },
             [Self.makeSnapshot(id: 9_999)] // short page → hasMore flips false
         ]
-        let vm = VaultBrowserViewModel(vault: fake)
+        let vm = Self.makeViewModel(vault: fake)
 
         await vm.loadMoreSnapshots()
         XCTAssertEqual(vm.snapshots.count, VaultBrowserViewModel.pageSize)
@@ -41,7 +41,7 @@ final class VaultBrowserViewModelTests: XCTestCase {
         let fake = FakeVault()
         fake.snapshotFetchDelay = .milliseconds(30)
         fake.snapshotPages = [[Self.makeSnapshot(id: 1), Self.makeSnapshot(id: 2)]]
-        let vm = VaultBrowserViewModel(vault: fake)
+        let vm = Self.makeViewModel(vault: fake)
 
         async let a: Void = vm.loadMoreSnapshots()
         async let b: Void = vm.loadMoreSnapshots()
@@ -54,7 +54,7 @@ final class VaultBrowserViewModelTests: XCTestCase {
     func testSnapshotsFailureProducesTypedMessage() async throws {
         let fake = FakeVault()
         fake.snapshotError = RawExportVaultError.snapshotNotFound(snapshotID: 42)
-        let vm = VaultBrowserViewModel(vault: fake)
+        let vm = Self.makeViewModel(vault: fake)
 
         await vm.loadMoreSnapshots()
 
@@ -73,7 +73,7 @@ final class VaultBrowserViewModelTests: XCTestCase {
         let fake = FakeVault()
         fake.filePages[1] = [[Self.makeFile(snapshotID: 1, relativePath: "a.json")]]
         fake.filePages[2] = [[Self.makeFile(snapshotID: 2, relativePath: "b.json")]]
-        let vm = VaultBrowserViewModel(vault: fake)
+        let vm = Self.makeViewModel(vault: fake)
 
         vm.selectedSnapshotID = 1
         await vm.loadMoreFiles()
@@ -93,7 +93,7 @@ final class VaultBrowserViewModelTests: XCTestCase {
         fake.fileFetchDelay = .milliseconds(60)
         fake.filePages[1] = [[Self.makeFile(snapshotID: 1, relativePath: "slow-from-1.json")]]
         fake.filePages[2] = [[Self.makeFile(snapshotID: 2, relativePath: "fast-from-2.json")]]
-        let vm = VaultBrowserViewModel(vault: fake)
+        let vm = Self.makeViewModel(vault: fake)
 
         vm.selectedSnapshotID = 1
         async let firstFetch: Void = vm.loadMoreFiles()
@@ -110,7 +110,7 @@ final class VaultBrowserViewModelTests: XCTestCase {
 
     func testLoadMoreFilesIsNoOpWithoutSelection() async throws {
         let fake = FakeVault()
-        let vm = VaultBrowserViewModel(vault: fake)
+        let vm = Self.makeViewModel(vault: fake)
 
         await vm.loadMoreFiles()
 
@@ -128,7 +128,7 @@ final class VaultBrowserViewModelTests: XCTestCase {
             entry: entry,
             data: Data("{\"ok\":true}".utf8)
         )
-        let vm = VaultBrowserViewModel(vault: fake)
+        let vm = Self.makeViewModel(vault: fake)
 
         vm.selectedSnapshotID = 1
         await vm.loadMoreFiles()
@@ -149,7 +149,7 @@ final class VaultBrowserViewModelTests: XCTestCase {
         fake.filePages[1] = [[a, b]]
         fake.payloadsByRelativePath["a.json"] = RawExportFilePayload(entry: a, data: Data("A".utf8))
         fake.payloadsByRelativePath["b.json"] = RawExportFilePayload(entry: b, data: Data("B".utf8))
-        let vm = VaultBrowserViewModel(vault: fake)
+        let vm = Self.makeViewModel(vault: fake)
 
         vm.selectedSnapshotID = 1
         await vm.loadMoreFiles()
@@ -175,7 +175,7 @@ final class VaultBrowserViewModelTests: XCTestCase {
             snapshotID: 7,
             relativePath: "missing.json"
         )
-        let vm = VaultBrowserViewModel(vault: fake)
+        let vm = Self.makeViewModel(vault: fake)
 
         vm.selectedSnapshotID = 7
         await vm.loadMoreFiles()
@@ -197,7 +197,7 @@ final class VaultBrowserViewModelTests: XCTestCase {
         let entry = Self.makeFile(snapshotID: 1, relativePath: "a.json")
         fake.filePages[1] = [[entry]]
         fake.payloadsByRelativePath["a.json"] = RawExportFilePayload(entry: entry, data: Data("A".utf8))
-        let vm = VaultBrowserViewModel(vault: fake)
+        let vm = Self.makeViewModel(vault: fake)
 
         vm.selectedSnapshotID = 1
         await vm.loadMoreFiles()
@@ -254,7 +254,171 @@ final class VaultBrowserViewModelTests: XCTestCase {
         )
     }
 
+    // MARK: - Referenced assets (D4)
+
+    func testLoadMoreReferencedAssetsPopulatesChips() async throws {
+        let fake = FakeVault()
+        let source = Self.makeFile(snapshotID: 1, relativePath: "conversations-0001.json")
+        fake.filePages[1] = [[source]]
+
+        let resolver = FakeAssetResolver()
+        let hit = Self.makeAssetHit(snapshotID: 1, sourceRelativePath: source.relativePath, asset: "assets/a.png")
+        resolver.assetsByFile[Self.key(1, source.relativePath)] = [[hit]]
+
+        let vm = Self.makeViewModel(vault: fake, resolver: resolver)
+        vm.selectedSnapshotID = 1
+        await vm.loadMoreFiles()
+        vm.selectedFileID = source.id
+
+        await vm.loadMoreReferencedAssets()
+
+        XCTAssertEqual(vm.referencedAssets.map(\.assetRelativePath), ["assets/a.png"])
+        XCTAssertEqual(vm.referencedAssetsState, .loaded)
+    }
+
+    func testReferencedAssetsResetOnFileChange() async throws {
+        let fake = FakeVault()
+        let a = Self.makeFile(snapshotID: 1, relativePath: "a.json")
+        let b = Self.makeFile(snapshotID: 1, relativePath: "b.json")
+        fake.filePages[1] = [[a, b]]
+
+        let resolver = FakeAssetResolver()
+        resolver.assetsByFile[Self.key(1, "a.json")] = [[
+            Self.makeAssetHit(snapshotID: 1, sourceRelativePath: "a.json", asset: "assets/one.png")
+        ]]
+
+        let vm = Self.makeViewModel(vault: fake, resolver: resolver)
+        vm.selectedSnapshotID = 1
+        await vm.loadMoreFiles()
+        vm.selectedFileID = a.id
+        await vm.loadMoreReferencedAssets()
+        XCTAssertFalse(vm.referencedAssets.isEmpty)
+
+        vm.selectedFileID = b.id
+        // Switching files MUST clear the chips synchronously so the view never
+        // flashes file A's chips under file B's header.
+        XCTAssertTrue(vm.referencedAssets.isEmpty)
+        XCTAssertEqual(vm.referencedAssetsState, .idle)
+    }
+
+    func testReferencedAssetsDiscardsStaleResultAfterFileChange() async throws {
+        let fake = FakeVault()
+        let a = Self.makeFile(snapshotID: 1, relativePath: "a.json")
+        let b = Self.makeFile(snapshotID: 1, relativePath: "b.json")
+        fake.filePages[1] = [[a, b]]
+
+        let resolver = FakeAssetResolver()
+        resolver.fetchDelay = .milliseconds(60)
+        resolver.assetsByFile[Self.key(1, "a.json")] = [[
+            Self.makeAssetHit(snapshotID: 1, sourceRelativePath: "a.json", asset: "assets/slow.png")
+        ]]
+        resolver.assetsByFile[Self.key(1, "b.json")] = [[
+            Self.makeAssetHit(snapshotID: 1, sourceRelativePath: "b.json", asset: "assets/fast.png")
+        ]]
+
+        let vm = Self.makeViewModel(vault: fake, resolver: resolver)
+        vm.selectedSnapshotID = 1
+        await vm.loadMoreFiles()
+
+        vm.selectedFileID = a.id
+        async let firstFetch: Void = vm.loadMoreReferencedAssets()
+        try await Task.sleep(nanoseconds: 10_000_000)
+        vm.selectedFileID = b.id
+        _ = await firstFetch
+
+        XCTAssertFalse(
+            vm.referencedAssets.contains(where: { $0.assetRelativePath == "assets/slow.png" }),
+            "stale chip list from the old file must not land in the VM"
+        )
+    }
+
+    func testLoadPreviewedAssetPayloadPopulatesBytes() async throws {
+        let fake = FakeVault()
+        let source = Self.makeFile(snapshotID: 1, relativePath: "conversations-0001.json")
+        fake.filePages[1] = [[source]]
+
+        let resolver = FakeAssetResolver()
+        let hit = Self.makeAssetHit(snapshotID: 1, sourceRelativePath: source.relativePath, asset: "assets/img.png")
+        resolver.assetsByFile[Self.key(1, source.relativePath)] = [[hit]]
+
+        // The preview sheet pulls bytes via vault.loadFile — the fake keys on
+        // relative path, so seed the asset's path rather than the source file's.
+        fake.payloadsByRelativePath[hit.assetRelativePath] = RawExportFilePayload(
+            entry: Self.makeFile(snapshotID: 1, relativePath: hit.assetRelativePath),
+            data: Data([0x89, 0x50, 0x4E, 0x47])
+        )
+
+        let vm = Self.makeViewModel(vault: fake, resolver: resolver)
+        vm.selectedSnapshotID = 1
+        await vm.loadMoreFiles()
+        vm.selectedFileID = source.id
+        await vm.loadMoreReferencedAssets()
+
+        vm.previewingAssetID = hit.id
+        await vm.loadPreviewedAssetPayload()
+
+        XCTAssertEqual(vm.previewedAssetState, .loaded)
+        XCTAssertEqual(
+            vm.previewedAssetPayload?.data,
+            Data([0x89, 0x50, 0x4E, 0x47])
+        )
+    }
+
+    func testChangingFilePreservesNoPreviewIDFromOldFile() async throws {
+        let fake = FakeVault()
+        let a = Self.makeFile(snapshotID: 1, relativePath: "a.json")
+        let b = Self.makeFile(snapshotID: 1, relativePath: "b.json")
+        fake.filePages[1] = [[a, b]]
+
+        let resolver = FakeAssetResolver()
+        let hit = Self.makeAssetHit(snapshotID: 1, sourceRelativePath: "a.json", asset: "assets/a.png")
+        resolver.assetsByFile[Self.key(1, "a.json")] = [[hit]]
+
+        let vm = Self.makeViewModel(vault: fake, resolver: resolver)
+        vm.selectedSnapshotID = 1
+        await vm.loadMoreFiles()
+        vm.selectedFileID = a.id
+        await vm.loadMoreReferencedAssets()
+        vm.previewingAssetID = hit.id
+        XCTAssertNotNil(vm.previewingAssetID)
+
+        vm.selectedFileID = b.id
+        // Preview belongs to file A — switching to file B must retire the
+        // open asset sheet so it can't linger with stale chip metadata.
+        XCTAssertNil(vm.previewingAssetID)
+        XCTAssertNil(vm.previewedAssetPayload)
+    }
+
     // MARK: - Fixtures
+
+    private static func makeViewModel(
+        vault: any RawExportVault,
+        resolver: any RawAssetResolver = FakeAssetResolver()
+    ) -> VaultBrowserViewModel {
+        VaultBrowserViewModel(vault: vault, assetResolver: resolver)
+    }
+
+    private static func key(_ snapshotID: Int64, _ relativePath: String) -> String {
+        "\(snapshotID):\(relativePath)"
+    }
+
+    private static func makeAssetHit(
+        snapshotID: Int64,
+        sourceRelativePath: String,
+        asset: String
+    ) -> RawAssetHit {
+        RawAssetHit(
+            snapshotID: snapshotID,
+            sourceRelativePath: sourceRelativePath,
+            assetRelativePath: asset,
+            blobHash: String(repeating: "d", count: 64),
+            kind: "image",
+            sizeBytes: 256,
+            storedSizeBytes: 256,
+            mimeType: "image/png",
+            compression: "none"
+        )
+    }
 
     private static func makeSnapshot(id: Int64) -> RawExportSnapshotSummary {
         RawExportSnapshotSummary(
@@ -362,5 +526,48 @@ private final class FakeVault: RawExportVault, @unchecked Sendable {
             return payload
         }
         throw RawExportVaultError.fileNotFound(snapshotID: snapshotID, relativePath: relativePath)
+    }
+}
+
+// MARK: - FakeAssetResolver
+
+/// Hand-rolled `RawAssetResolver` stub for D4 tests. Keyed by the compound
+/// `"snapshotID:sourceRelativePath"` so multiple files inside the same
+/// snapshot can each expose a distinct chip list.
+private final class FakeAssetResolver: RawAssetResolver, @unchecked Sendable {
+    /// Pages of hits, keyed by `"snapshotID:sourceRelativePath"`. Each call
+    /// to `assetsReferencedBy` pops the head page, matching the way the VM
+    /// calls this method as the user pages through chips.
+    var assetsByFile: [String: [[RawAssetHit]]] = [:]
+    var resolverError: Error?
+    var fetchDelay: Duration = .zero
+    var assetsReferencedByCallCount = 0
+    var resolveAssetCallCount = 0
+
+    func resolveAsset(
+        snapshotID: Int64,
+        reference: String
+    ) async throws -> RawAssetHit? {
+        resolveAssetCallCount += 1
+        if let resolverError { throw resolverError }
+        return nil
+    }
+
+    func assetsReferencedBy(
+        snapshotID: Int64,
+        sourceRelativePath: String,
+        offset: Int,
+        limit: Int
+    ) async throws -> [RawAssetHit] {
+        assetsReferencedByCallCount += 1
+        if fetchDelay != .zero {
+            try await Task.sleep(for: fetchDelay)
+        }
+        if let resolverError { throw resolverError }
+        let key = "\(snapshotID):\(sourceRelativePath)"
+        guard var pages = assetsByFile[key], !pages.isEmpty else { return [] }
+        let page = pages.removeFirst()
+        assetsByFile[key] = pages
+        return page
     }
 }

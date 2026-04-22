@@ -51,7 +51,10 @@ struct MadiniArchiveApp: App {
         // reader UI. Accessible from Window → Vault Browser (⌘⌥V, wired in
         // `VaultBrowserCommands`).
         Window("Vault Browser", id: VaultBrowserCommands.windowID) {
-            VaultBrowserView(vault: services.rawExportVault)
+            VaultBrowserView(
+                vault: services.rawExportVault,
+                assetResolver: services.rawAssetResolver
+            )
                 .environmentObject(services)
                 .frame(minWidth: 720, minHeight: 480)
         }

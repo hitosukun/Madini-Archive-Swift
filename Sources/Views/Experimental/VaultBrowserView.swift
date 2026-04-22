@@ -11,8 +11,16 @@ import SwiftUI
 struct VaultBrowserView: View {
     @State private var viewModel: VaultBrowserViewModel
 
-    init(vault: any RawExportVault) {
-        _viewModel = State(wrappedValue: VaultBrowserViewModel(vault: vault))
+    init(
+        vault: any RawExportVault,
+        assetResolver: any RawAssetResolver
+    ) {
+        _viewModel = State(
+            wrappedValue: VaultBrowserViewModel(
+                vault: vault,
+                assetResolver: assetResolver
+            )
+        )
     }
 
     var body: some View {
@@ -158,11 +166,40 @@ struct VaultBrowserView: View {
         }
     }
 
-    // MARK: - Content pane (D2)
+    // MARK: - Content pane (D2 + D4 chip strip)
 
     @ViewBuilder
     private var contentPane: some View {
-        if let entry = viewModel.selectedFileEntry {
+        Group {
+            if let entry = viewModel.selectedFileEntry {
+                fileContentPane(entry: entry)
+            } else if viewModel.selectedSnapshotID != nil {
+                ContentUnavailableView(
+                    "Select a file",
+                    systemImage: "doc.text",
+                    description: Text("Pick a file in the middle pane to restore and preview its contents.")
+                )
+            } else {
+                ContentUnavailableView(
+                    "Nothing selected",
+                    systemImage: "tray",
+                    description: Text("Pick a snapshot, then a file, to preview raw bytes.")
+                )
+            }
+        }
+        .sheet(isPresented: Binding(
+            get: { viewModel.previewingAssetID != nil },
+            set: { isPresented in
+                if !isPresented { viewModel.previewingAssetID = nil }
+            }
+        )) {
+            assetPreviewSheet
+        }
+    }
+
+    @ViewBuilder
+    private func fileContentPane(entry: RawExportFileEntry) -> some View {
+        VStack(spacing: 0) {
             VaultFileContentView(
                 entry: entry,
                 payload: viewModel.selectedFilePayload,
@@ -171,27 +208,174 @@ struct VaultBrowserView: View {
                     Task { await viewModel.loadSelectedFileContent() }
                 }
             )
-            .task(id: entry.id) {
-                // Auto-load when the selection changes and we haven't already
-                // fetched this file. Retries go through the explicit button.
-                if viewModel.selectedFilePayload == nil,
-                   viewModel.fileContentState == .idle
-                {
-                    await viewModel.loadSelectedFileContent()
+            if !viewModel.referencedAssets.isEmpty
+                || viewModel.referencedAssetsState == .loading
+            {
+                Divider()
+                assetChipStrip
+            }
+        }
+        .task(id: entry.id) {
+            // Auto-load file bytes + referenced assets on selection change.
+            // Both are idempotent, so the chip strip can appear as soon as the
+            // resolver returns even if the body is still being restored.
+            if viewModel.selectedFilePayload == nil,
+               viewModel.fileContentState == .idle
+            {
+                await viewModel.loadSelectedFileContent()
+            }
+            if viewModel.referencedAssets.isEmpty,
+               viewModel.referencedAssetsState == .idle
+            {
+                await viewModel.loadMoreReferencedAssets()
+            }
+        }
+    }
+
+    // MARK: - Asset chips (D4)
+
+    @ViewBuilder
+    private var assetChipStrip: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Text("Referenced assets")
+                    .font(.caption.bold())
+                    .foregroundStyle(.secondary)
+                if viewModel.referencedAssetsState == .loading {
+                    ProgressView().controlSize(.mini)
+                }
+                Spacer(minLength: 0)
+                Text("\(viewModel.referencedAssets.count)")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .monospacedDigit()
+            }
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(viewModel.referencedAssets) { hit in
+                        assetChip(hit)
+                    }
                 }
             }
-        } else if viewModel.selectedSnapshotID != nil {
-            ContentUnavailableView(
-                "Select a file",
-                systemImage: "doc.text",
-                description: Text("Pick a file in the middle pane to restore and preview its contents.")
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 8)
+        .background(.thinMaterial)
+    }
+
+    private func assetChip(_ hit: RawAssetHit) -> some View {
+        Button {
+            viewModel.previewingAssetID = hit.id
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: Self.icon(forAssetMime: hit.mimeType, path: hit.assetRelativePath))
+                Text(Self.basename(hit.assetRelativePath))
+                    .font(.caption.monospaced())
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(Self.byteString(hit.sizeBytes))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(.quaternary)
             )
+        }
+        .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
+    private var assetPreviewSheet: some View {
+        if let hit = viewModel.previewingAsset {
+            VStack(spacing: 0) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(Self.basename(hit.assetRelativePath))
+                            .font(.headline)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Text(hit.assetRelativePath)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    Spacer()
+                    Button("Done") {
+                        viewModel.previewingAssetID = nil
+                    }
+                    .keyboardShortcut(.cancelAction)
+                }
+                .padding()
+                Divider()
+                assetPreviewBody(for: hit)
+            }
+            .frame(minWidth: 480, minHeight: 360)
+            .task(id: viewModel.previewingAssetID) {
+                if viewModel.previewedAssetPayload == nil,
+                   viewModel.previewedAssetState == .idle
+                {
+                    await viewModel.loadPreviewedAssetPayload()
+                }
+            }
         } else {
+            // Defensive: should not happen because the sheet only presents
+            // when `previewingAssetID != nil`, but keep a visible fallback so
+            // a stale binding can't silently deadlock the UI.
             ContentUnavailableView(
-                "Nothing selected",
-                systemImage: "tray",
-                description: Text("Pick a snapshot, then a file, to preview raw bytes.")
+                "No asset",
+                systemImage: "questionmark.square.dashed"
             )
+            .frame(minWidth: 320, minHeight: 200)
+        }
+    }
+
+    @ViewBuilder
+    private func assetPreviewBody(for hit: RawAssetHit) -> some View {
+        switch viewModel.previewedAssetState {
+        case .idle, .loading:
+            VStack {
+                Spacer()
+                ProgressView("Loading asset…")
+                Spacer()
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        case .failed(let message):
+            VStack(spacing: 12) {
+                ContentUnavailableView(
+                    "Couldn't load asset",
+                    systemImage: "exclamationmark.triangle",
+                    description: Text(message)
+                )
+                Button("Retry") {
+                    Task { await viewModel.loadPreviewedAssetPayload() }
+                }
+                .buttonStyle(.bordered)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        case .loaded:
+            if let payload = viewModel.previewedAssetPayload {
+                if VaultAssetPreviewView.renderable(for: payload) != nil {
+                    VaultAssetPreviewView(payload: payload)
+                } else {
+                    ContentUnavailableView(
+                        "Preview unavailable",
+                        systemImage: "shippingbox",
+                        description: Text("\(Self.byteString(hit.sizeBytes)) · \(hit.mimeType ?? "application/octet-stream")")
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            } else {
+                ContentUnavailableView(
+                    "No payload",
+                    systemImage: "doc",
+                    description: Text("The vault returned an empty payload for this asset.")
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
         }
     }
 
@@ -278,5 +462,39 @@ struct VaultBrowserView: View {
 
     private static func byteString(_ bytes: Int64) -> String {
         byteFormatter.string(fromByteCount: bytes)
+    }
+
+    /// SF Symbol for an asset chip. Prefers MIME category so that assets with
+    /// weird extensions still pick up a reasonable icon, falling back to the
+    /// path's extension when MIME is nil (Vault sometimes records that for
+    /// provider exports that don't stamp a Content-Type).
+    private static func icon(forAssetMime mime: String?, path: String) -> String {
+        if let mime {
+            if mime.hasPrefix("image/") { return "photo" }
+            if mime == "application/pdf" { return "doc.richtext" }
+            if mime.hasPrefix("audio/") { return "waveform" }
+            if mime.hasPrefix("video/") { return "film" }
+            if mime.hasPrefix("text/") { return "doc.text" }
+        }
+        let ext = URL(fileURLWithPath: path).pathExtension.lowercased()
+        switch ext {
+        case "png", "jpg", "jpeg", "gif", "webp", "heic", "bmp", "tiff":
+            return "photo"
+        case "pdf": return "doc.richtext"
+        case "mp3", "wav", "m4a", "aac", "flac", "ogg": return "waveform"
+        case "mp4", "mov", "avi", "mkv", "webm": return "film"
+        case "txt", "md", "csv", "xml", "html", "htm", "log", "yaml", "yml",
+             "json":
+            return "doc.text"
+        default:
+            return "doc"
+        }
+    }
+
+    /// Just the trailing filename component — chips are narrow so the full
+    /// relative path is kept in the chip's accessibility label / the sheet
+    /// header, and this is what users actually recognise at a glance.
+    private static func basename(_ path: String) -> String {
+        URL(fileURLWithPath: path).lastPathComponent
     }
 }
