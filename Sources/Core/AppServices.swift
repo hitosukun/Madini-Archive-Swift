@@ -240,83 +240,12 @@ final class AppServices: ObservableObject {
                 CREATE INDEX IF NOT EXISTS idx_project_suggestions_state_score
                 ON project_suggestions(state, score DESC)
                 """)
-            try db.execute(sql: """
-                CREATE TABLE IF NOT EXISTS raw_export_snapshots (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    provider TEXT NOT NULL,
-                    source_root TEXT,
-                    imported_at TEXT NOT NULL,
-                    manifest_hash TEXT NOT NULL,
-                    file_count INTEGER NOT NULL,
-                    new_blob_count INTEGER NOT NULL,
-                    reused_blob_count INTEGER NOT NULL,
-                    original_bytes INTEGER NOT NULL,
-                    stored_bytes INTEGER NOT NULL,
-                    manifest_path TEXT NOT NULL
-                )
-                """)
-            try db.execute(sql: """
-                CREATE INDEX IF NOT EXISTS idx_raw_export_snapshots_provider_time
-                ON raw_export_snapshots(provider, imported_at DESC, id DESC)
-                """)
-            try db.execute(sql: """
-                CREATE TABLE IF NOT EXISTS raw_export_blobs (
-                    hash TEXT PRIMARY KEY,
-                    size_bytes INTEGER NOT NULL,
-                    stored_size_bytes INTEGER NOT NULL,
-                    mime_type TEXT,
-                    compression TEXT NOT NULL,
-                    stored_path TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                )
-                """)
-            try db.execute(sql: """
-                CREATE TABLE IF NOT EXISTS raw_export_files (
-                    snapshot_id INTEGER NOT NULL,
-                    relative_path TEXT NOT NULL,
-                    blob_hash TEXT NOT NULL,
-                    size_bytes INTEGER NOT NULL,
-                    mime_type TEXT,
-                    role TEXT NOT NULL,
-                    compression TEXT NOT NULL,
-                    stored_path TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    PRIMARY KEY (snapshot_id, relative_path),
-                    FOREIGN KEY(snapshot_id) REFERENCES raw_export_snapshots(id) ON DELETE CASCADE,
-                    FOREIGN KEY(blob_hash) REFERENCES raw_export_blobs(hash)
-                )
-                """)
-            try db.execute(sql: """
-                CREATE INDEX IF NOT EXISTS idx_raw_export_files_blob
-                ON raw_export_files(blob_hash)
-                """)
-            try db.execute(sql: """
-                CREATE VIRTUAL TABLE IF NOT EXISTS raw_export_search_idx
-                USING fts5(
-                    snapshot_id UNINDEXED,
-                    blob_hash UNINDEXED,
-                    provider UNINDEXED,
-                    relative_path,
-                    content,
-                    tokenize="unicode61"
-                )
-                """)
-            try db.execute(sql: """
-                CREATE TABLE IF NOT EXISTS raw_export_asset_links (
-                    snapshot_id INTEGER NOT NULL,
-                    source_relative_path TEXT NOT NULL,
-                    asset_relative_path TEXT NOT NULL,
-                    blob_hash TEXT,
-                    kind TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    PRIMARY KEY (snapshot_id, source_relative_path, asset_relative_path),
-                    FOREIGN KEY(snapshot_id) REFERENCES raw_export_snapshots(id) ON DELETE CASCADE
-                )
-                """)
-            try db.execute(sql: """
-                CREATE INDEX IF NOT EXISTS idx_raw_export_asset_links_asset
-                ON raw_export_asset_links(snapshot_id, asset_relative_path)
-                """)
+            // Raw Export Vault schema (5 tables + 2 indexes) lives next to the
+            // Vault implementation so the on-disk shape stays co-located with
+            // the code that reads it. `installSchema` is idempotent, so this
+            // plays nicely with the surrounding `CREATE ... IF NOT EXISTS`
+            // idioms in this bootstrap.
+            try GRDBRawExportVault.installSchema(in: db)
 
             // Seed the Trash system tag. Trash is a "rescue lane" — when a
             // user-defined tag is deleted, the conversations that had it get

@@ -5,6 +5,21 @@ import GRDB
 import UniformTypeIdentifiers
 
 final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
+    /// Filesystem layout for blob & manifest storage. Split out so tests can
+    /// redirect the vault to a temporary directory without touching
+    /// `~/Library/Application Support/Madini Archive`.
+    struct Storage: Sendable {
+        let blobsDir: URL
+        let snapshotsDir: URL
+
+        static var `default`: Storage {
+            Storage(
+                blobsDir: AppPaths.rawExportBlobsDir,
+                snapshotsDir: AppPaths.rawExportSnapshotsDir
+            )
+        }
+    }
+
     private struct CandidateFile {
         let url: URL
         let relativePath: String
@@ -58,10 +73,16 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
     }
 
     private let dbQueue: DatabaseQueue
+    private let storage: Storage
     private let fileManager: FileManager
 
-    init(dbQueue: DatabaseQueue, fileManager: FileManager = .default) {
+    init(
+        dbQueue: DatabaseQueue,
+        storage: Storage = .default,
+        fileManager: FileManager = .default
+    ) {
         self.dbQueue = dbQueue
+        self.storage = storage
         self.fileManager = fileManager
     }
 
@@ -74,8 +95,8 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
             return nil
         }
 
-        try fileManager.createDirectory(at: AppPaths.rawExportBlobsDir, withIntermediateDirectories: true)
-        try fileManager.createDirectory(at: AppPaths.rawExportSnapshotsDir, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: storage.blobsDir, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: storage.snapshotsDir, withIntermediateDirectories: true)
 
         let importedAt = GRDBProjectDateCodec.string(from: Date())
         var storedFiles: [StoredFile] = []
@@ -158,7 +179,7 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let manifestData = try encoder.encode(manifest)
         let manifestHash = Self.sha256Hex(manifestData)
-        let manifestURL = AppPaths.rawExportSnapshotsDir
+        let manifestURL = storage.snapshotsDir
             .appendingPathComponent(provider.rawValue, isDirectory: true)
             .appendingPathComponent("\(safeTimestamp(importedAt))-\(String(manifestHash.prefix(12)))", isDirectory: true)
             .appendingPathComponent("manifest.json")
@@ -428,45 +449,7 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
     }
 
     private func detectProvider(urls: [URL], root: URL?) -> RawExportProvider {
-        if let root {
-            if !chatGPTConversationChunks(in: root).isEmpty
-                || fileManager.fileExists(atPath: root.appendingPathComponent("export_manifest.json").path) {
-                return .chatGPT
-            }
-            if fileManager.fileExists(atPath: root.appendingPathComponent("conversations.json").path)
-                && fileManager.fileExists(atPath: root.appendingPathComponent("projects.json").path) {
-                return .claude
-            }
-            if !geminiActivityFiles(in: root).isEmpty {
-                return .gemini
-            }
-        }
-
-        for url in urls where url.pathExtension.lowercased() == "json" {
-            if let provider = providerFromJSONHeader(url) {
-                return provider
-            }
-        }
-        return .unknown
-    }
-
-    private func providerFromJSONHeader(_ url: URL) -> RawExportProvider? {
-        guard let data = try? Data(contentsOf: url),
-              let object = try? JSONSerialization.jsonObject(with: data),
-              let list = object as? [[String: Any]],
-              let first = list.first else {
-            return nil
-        }
-        if first["mapping"] != nil {
-            return .chatGPT
-        }
-        if first["chat_messages"] != nil {
-            return .claude
-        }
-        if first["time"] != nil, first["title"] != nil {
-            return .gemini
-        }
-        return nil
+        RawExportProviderDetector.detect(urls: urls, root: root, fileManager: fileManager)
     }
 
     private func prepareBlobData(
@@ -615,7 +598,7 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
     }
 
     private func blobURL(hash: String, compression: String) -> URL {
-        AppPaths.rawExportBlobsDir
+        storage.blobsDir
             .appendingPathComponent(String(hash.prefix(2)), isDirectory: true)
             .appendingPathComponent("\(hash).\(compression == "lzfse" ? "lzfse" : "blob")")
     }
@@ -690,35 +673,6 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
         url.lastPathComponent.hasPrefix(".")
     }
 
-    private func chatGPTConversationChunks(in directory: URL) -> [URL] {
-        directoryChildren(in: directory).filter { url in
-            let name = url.lastPathComponent
-            return name.hasPrefix("conversations-") && name.hasSuffix(".json")
-        }
-    }
-
-    private func geminiActivityFiles(in directory: URL) -> [URL] {
-        recursiveFiles(in: directory).filter { url in
-            guard url.pathExtension.lowercased() == "json",
-                  let data = try? Data(contentsOf: url, options: .mappedIfSafe),
-                  let text = String(data: data.prefix(65_536), encoding: .utf8) else {
-                return false
-            }
-            return text.contains("\"header\"")
-                && text.contains("Gemini")
-                && text.contains("\"time\"")
-                && text.contains("\"title\"")
-        }
-    }
-
-    private func directoryChildren(in directory: URL) -> [URL] {
-        (try? fileManager.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-        )) ?? []
-    }
-
     private func safeTimestamp(_ value: String) -> String {
         value.replacingOccurrences(of: ":", with: "-")
             .replacingOccurrences(of: " ", with: "T")
@@ -745,5 +699,91 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
         SHA256.hash(data: data)
             .map { String(format: "%02x", $0) }
             .joined()
+    }
+
+    // MARK: - Schema
+
+    /// Install the 5 Vault tables (+ indexes) onto the given database.
+    /// Idempotent — all statements use `IF NOT EXISTS` so it can be replayed
+    /// after partial setup. `AppServices.bootstrapViewLayerSchema` calls this
+    /// during app startup; tests call it directly against a scratch queue.
+    static func installSchema(in db: Database) throws {
+        try db.execute(sql: """
+            CREATE TABLE IF NOT EXISTS raw_export_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider TEXT NOT NULL,
+                source_root TEXT,
+                imported_at TEXT NOT NULL,
+                manifest_hash TEXT NOT NULL,
+                file_count INTEGER NOT NULL,
+                new_blob_count INTEGER NOT NULL,
+                reused_blob_count INTEGER NOT NULL,
+                original_bytes INTEGER NOT NULL,
+                stored_bytes INTEGER NOT NULL,
+                manifest_path TEXT NOT NULL
+            )
+            """)
+        try db.execute(sql: """
+            CREATE INDEX IF NOT EXISTS idx_raw_export_snapshots_provider_time
+            ON raw_export_snapshots(provider, imported_at DESC, id DESC)
+            """)
+        try db.execute(sql: """
+            CREATE TABLE IF NOT EXISTS raw_export_blobs (
+                hash TEXT PRIMARY KEY,
+                size_bytes INTEGER NOT NULL,
+                stored_size_bytes INTEGER NOT NULL,
+                mime_type TEXT,
+                compression TEXT NOT NULL,
+                stored_path TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """)
+        try db.execute(sql: """
+            CREATE TABLE IF NOT EXISTS raw_export_files (
+                snapshot_id INTEGER NOT NULL,
+                relative_path TEXT NOT NULL,
+                blob_hash TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                mime_type TEXT,
+                role TEXT NOT NULL,
+                compression TEXT NOT NULL,
+                stored_path TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (snapshot_id, relative_path),
+                FOREIGN KEY(snapshot_id) REFERENCES raw_export_snapshots(id) ON DELETE CASCADE,
+                FOREIGN KEY(blob_hash) REFERENCES raw_export_blobs(hash)
+            )
+            """)
+        try db.execute(sql: """
+            CREATE INDEX IF NOT EXISTS idx_raw_export_files_blob
+            ON raw_export_files(blob_hash)
+            """)
+        try db.execute(sql: """
+            CREATE VIRTUAL TABLE IF NOT EXISTS raw_export_search_idx
+            USING fts5(
+                snapshot_id UNINDEXED,
+                blob_hash UNINDEXED,
+                provider UNINDEXED,
+                relative_path,
+                content,
+                tokenize="unicode61"
+            )
+            """)
+        try db.execute(sql: """
+            CREATE TABLE IF NOT EXISTS raw_export_asset_links (
+                snapshot_id INTEGER NOT NULL,
+                source_relative_path TEXT NOT NULL,
+                asset_relative_path TEXT NOT NULL,
+                blob_hash TEXT,
+                kind TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (snapshot_id, source_relative_path, asset_relative_path),
+                FOREIGN KEY(snapshot_id) REFERENCES raw_export_snapshots(id) ON DELETE CASCADE
+            )
+            """)
+        try db.execute(sql: """
+            CREATE INDEX IF NOT EXISTS idx_raw_export_asset_links_asset
+            ON raw_export_asset_links(snapshot_id, asset_relative_path)
+            """)
     }
 }
