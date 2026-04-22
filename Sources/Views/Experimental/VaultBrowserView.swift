@@ -19,8 +19,11 @@ struct VaultBrowserView: View {
         NavigationSplitView {
             snapshotsPane
                 .navigationSplitViewColumnWidth(min: 260, ideal: 320, max: 420)
-        } detail: {
+        } content: {
             filesPane
+                .navigationSplitViewColumnWidth(min: 300, ideal: 360, max: 520)
+        } detail: {
+            contentPane
         }
         .navigationTitle("Vault Browser")
         .task {
@@ -135,10 +138,13 @@ struct VaultBrowserView: View {
     }
 
     private func filesList(for snapshot: RawExportSnapshotSummary) -> some View {
-        List {
+        List(selection: Binding(
+            get: { viewModel.selectedFileID },
+            set: { viewModel.selectedFileID = $0 }
+        )) {
             Section {
                 ForEach(viewModel.files) { entry in
-                    fileRow(entry)
+                    fileRow(entry).tag(entry.id)
                 }
                 filesFooter
             } header: {
@@ -149,6 +155,43 @@ struct VaultBrowserView: View {
             if viewModel.files.isEmpty, viewModel.filesState == .idle {
                 await viewModel.loadMoreFiles()
             }
+        }
+    }
+
+    // MARK: - Content pane (D2)
+
+    @ViewBuilder
+    private var contentPane: some View {
+        if let entry = viewModel.selectedFileEntry {
+            VaultFileContentView(
+                entry: entry,
+                payload: viewModel.selectedFilePayload,
+                state: viewModel.fileContentState,
+                onRetry: {
+                    Task { await viewModel.loadSelectedFileContent() }
+                }
+            )
+            .task(id: entry.id) {
+                // Auto-load when the selection changes and we haven't already
+                // fetched this file. Retries go through the explicit button.
+                if viewModel.selectedFilePayload == nil,
+                   viewModel.fileContentState == .idle
+                {
+                    await viewModel.loadSelectedFileContent()
+                }
+            }
+        } else if viewModel.selectedSnapshotID != nil {
+            ContentUnavailableView(
+                "Select a file",
+                systemImage: "doc.text",
+                description: Text("Pick a file in the middle pane to restore and preview its contents.")
+            )
+        } else {
+            ContentUnavailableView(
+                "Nothing selected",
+                systemImage: "tray",
+                description: Text("Pick a snapshot, then a file, to preview raw bytes.")
+            )
         }
     }
 

@@ -40,6 +40,8 @@ final class VaultBrowserViewModel {
             filesState = .idle
             hasMoreFiles = true
             filesOffset = 0
+            // Switching snapshot also invalidates any file we had open.
+            selectedFileID = nil
         }
     }
 
@@ -49,12 +51,37 @@ final class VaultBrowserViewModel {
     private(set) var filesState: LoadState = .idle
     private(set) var hasMoreFiles = true
 
+    /// Compound key (`RawExportFileEntry.id` = "snapshotID:relativePath") of
+    /// the file the user is currently inspecting. Changing this clears the
+    /// previously loaded payload so the view can't flash stale bytes.
+    var selectedFileID: String? {
+        didSet {
+            guard oldValue != selectedFileID else { return }
+            selectedFilePayload = nil
+            fileContentState = .idle
+        }
+    }
+
+    /// Decompressed bytes + metadata for `selectedFileID`. `nil` until the
+    /// view calls `loadSelectedFileContent()`.
+    private(set) var selectedFilePayload: RawExportFilePayload?
+    private(set) var fileContentState: LoadState = .idle
+
     private let vault: any RawExportVault
     private var snapshotsOffset = 0
     private var filesOffset = 0
 
     init(vault: any RawExportVault) {
         self.vault = vault
+    }
+
+    /// Entry metadata for `selectedFileID`, looked up in the already-loaded
+    /// `files` page. Returns `nil` when no file is selected or when the
+    /// selected file no longer exists in the list (e.g. after a selection
+    /// change that hasn't yet been reflected in the UI).
+    var selectedFileEntry: RawExportFileEntry? {
+        guard let selectedFileID else { return nil }
+        return files.first { $0.id == selectedFileID }
     }
 
     // MARK: - Snapshots
@@ -104,6 +131,32 @@ final class VaultBrowserViewModel {
         } catch {
             guard selectedSnapshotID == pinnedSelection else { return }
             filesState = .failed(message: Self.message(for: error))
+        }
+    }
+
+    // MARK: - File content
+
+    /// Pull the decompressed bytes for `selectedFileID` via
+    /// `RawExportVault.loadFile`. Idempotent while a fetch is in flight, and
+    /// the result is discarded if the user switched files mid-flight so the
+    /// view never renders bytes belonging to a previously selected file.
+    func loadSelectedFileContent() async {
+        guard let entry = selectedFileEntry else { return }
+        guard fileContentState != .loading else { return }
+        let pinnedFileID = entry.id
+        fileContentState = .loading
+        do {
+            let payload = try await vault.loadFile(
+                snapshotID: entry.snapshotID,
+                relativePath: entry.relativePath
+            )
+            guard selectedFileID == pinnedFileID else { return }
+            selectedFilePayload = payload
+            fileContentState = .loaded
+        } catch {
+            guard selectedFileID == pinnedFileID else { return }
+            selectedFilePayload = nil
+            fileContentState = .failed(message: Self.message(for: error))
         }
     }
 

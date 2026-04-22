@@ -118,6 +118,142 @@ final class VaultBrowserViewModelTests: XCTestCase {
         XCTAssertEqual(vm.filesState, .idle)
     }
 
+    // MARK: - File content (D2)
+
+    func testLoadSelectedFileContentStoresPayloadFromVault() async throws {
+        let fake = FakeVault()
+        let entry = Self.makeFile(snapshotID: 1, relativePath: "conversations-0001.json")
+        fake.filePages[1] = [[entry]]
+        fake.payloadsByRelativePath["conversations-0001.json"] = RawExportFilePayload(
+            entry: entry,
+            data: Data("{\"ok\":true}".utf8)
+        )
+        let vm = VaultBrowserViewModel(vault: fake)
+
+        vm.selectedSnapshotID = 1
+        await vm.loadMoreFiles()
+        vm.selectedFileID = entry.id
+        await vm.loadSelectedFileContent()
+
+        XCTAssertEqual(vm.fileContentState, .loaded)
+        XCTAssertEqual(
+            vm.selectedFilePayload?.data,
+            Data("{\"ok\":true}".utf8)
+        )
+    }
+
+    func testSelectingDifferentFileClearsPreviousPayloadBeforeLoad() async throws {
+        let fake = FakeVault()
+        let a = Self.makeFile(snapshotID: 1, relativePath: "a.json")
+        let b = Self.makeFile(snapshotID: 1, relativePath: "b.json")
+        fake.filePages[1] = [[a, b]]
+        fake.payloadsByRelativePath["a.json"] = RawExportFilePayload(entry: a, data: Data("A".utf8))
+        fake.payloadsByRelativePath["b.json"] = RawExportFilePayload(entry: b, data: Data("B".utf8))
+        let vm = VaultBrowserViewModel(vault: fake)
+
+        vm.selectedSnapshotID = 1
+        await vm.loadMoreFiles()
+        vm.selectedFileID = a.id
+        await vm.loadSelectedFileContent()
+        XCTAssertEqual(vm.selectedFilePayload?.data, Data("A".utf8))
+
+        vm.selectedFileID = b.id
+        // Switching files must clear previous bytes synchronously so the view
+        // can't flash file A's content under file B's header.
+        XCTAssertNil(vm.selectedFilePayload, "payload should clear on selection change")
+        XCTAssertEqual(vm.fileContentState, .idle)
+
+        await vm.loadSelectedFileContent()
+        XCTAssertEqual(vm.selectedFilePayload?.data, Data("B".utf8))
+    }
+
+    func testLoadSelectedFileContentSurfacesTypedError() async throws {
+        let fake = FakeVault()
+        let entry = Self.makeFile(snapshotID: 7, relativePath: "missing.json")
+        fake.filePages[7] = [[entry]]
+        fake.loadFileError = RawExportVaultError.fileNotFound(
+            snapshotID: 7,
+            relativePath: "missing.json"
+        )
+        let vm = VaultBrowserViewModel(vault: fake)
+
+        vm.selectedSnapshotID = 7
+        await vm.loadMoreFiles()
+        vm.selectedFileID = entry.id
+        await vm.loadSelectedFileContent()
+
+        guard case .failed(let message) = vm.fileContentState else {
+            return XCTFail("expected .failed, got \(vm.fileContentState)")
+        }
+        XCTAssertTrue(
+            message.contains("missing.json"),
+            "error message should surface the relative path, got \(message)"
+        )
+        XCTAssertNil(vm.selectedFilePayload)
+    }
+
+    func testChangingSnapshotInvalidatesSelectedFile() async throws {
+        let fake = FakeVault()
+        let entry = Self.makeFile(snapshotID: 1, relativePath: "a.json")
+        fake.filePages[1] = [[entry]]
+        fake.payloadsByRelativePath["a.json"] = RawExportFilePayload(entry: entry, data: Data("A".utf8))
+        let vm = VaultBrowserViewModel(vault: fake)
+
+        vm.selectedSnapshotID = 1
+        await vm.loadMoreFiles()
+        vm.selectedFileID = entry.id
+        await vm.loadSelectedFileContent()
+        XCTAssertNotNil(vm.selectedFilePayload)
+
+        vm.selectedSnapshotID = 2
+        XCTAssertNil(vm.selectedFileID, "snapshot change should also clear file selection")
+        XCTAssertNil(vm.selectedFilePayload)
+    }
+
+    // MARK: - Text rendering (D2)
+
+    func testTextRepresentationPrettyPrintsJSONFiles() throws {
+        let entry = Self.makeFile(snapshotID: 1, relativePath: "conversations-0001.json")
+        let minified = Data(#"{"b":2,"a":1}"#.utf8)
+        let payload = RawExportFilePayload(entry: entry, data: minified)
+
+        let text = try XCTUnwrap(
+            VaultFileContentView.textRepresentation(for: payload),
+            "JSON payloads should render as text"
+        )
+        XCTAssertTrue(text.contains("\n"), "pretty-print should insert newlines")
+        // sortedKeys ⇒ deterministic ordering across runs.
+        if let aIndex = text.range(of: "\"a\""),
+           let bIndex = text.range(of: "\"b\"") {
+            XCTAssertLessThan(aIndex.lowerBound, bIndex.lowerBound, "keys should be sorted")
+        } else {
+            XCTFail("expected both keys in pretty-printed output")
+        }
+    }
+
+    func testTextRepresentationReturnsNilForBinaryPayload() throws {
+        let entry = RawExportFileEntry(
+            snapshotID: 1,
+            relativePath: "screenshot.png",
+            blobHash: String(repeating: "b", count: 64),
+            sizeBytes: 4,
+            storedSizeBytes: 4,
+            mimeType: "image/png",
+            role: "asset",
+            compression: "none",
+            storedPath: "/tmp/blobs/bb/bbbb.blob"
+        )
+        let payload = RawExportFilePayload(
+            entry: entry,
+            data: Data([0x89, 0x50, 0x4E, 0x47]) // PNG magic
+        )
+
+        XCTAssertNil(
+            VaultFileContentView.textRepresentation(for: payload),
+            "binary asset should not be rendered as text"
+        )
+    }
+
     // MARK: - Fixtures
 
     private static func makeSnapshot(id: Int64) -> RawExportSnapshotSummary {
@@ -166,6 +302,10 @@ private final class FakeVault: RawExportVault, @unchecked Sendable {
     var fileError: Error?
     var fileFetchDelay: Duration = .zero
     var listFilesCallCount = 0
+
+    var payloadsByRelativePath: [String: RawExportFilePayload] = [:]
+    var loadFileError: Error?
+    var loadFileCallCount = 0
 
     func ingest(_ urls: [URL]) async throws -> RawExportVaultResult? { nil }
 
@@ -216,6 +356,11 @@ private final class FakeVault: RawExportVault, @unchecked Sendable {
         snapshotID: Int64,
         relativePath: String
     ) async throws -> RawExportFilePayload {
+        loadFileCallCount += 1
+        if let loadFileError { throw loadFileError }
+        if let payload = payloadsByRelativePath[relativePath] {
+            return payload
+        }
         throw RawExportVaultError.fileNotFound(snapshotID: snapshotID, relativePath: relativePath)
     }
 }
