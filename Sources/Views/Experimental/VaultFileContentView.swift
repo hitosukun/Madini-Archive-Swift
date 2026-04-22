@@ -88,7 +88,12 @@ struct VaultFileContentView: View {
 
     @ViewBuilder
     private func rendered(_ payload: RawExportFilePayload) -> some View {
-        if let text = Self.textRepresentation(for: payload) {
+        // Asset-looking files get the D3 image/PDF viewer first. Text is
+        // still checked as a fallback because exports occasionally mis-MIME
+        // a JSON as `application/octet-stream` etc.
+        if VaultAssetPreviewView.renderable(for: payload) != nil {
+            VaultAssetPreviewView(payload: payload)
+        } else if let text = Self.textRepresentation(for: payload) {
             ScrollView([.vertical, .horizontal]) {
                 Text(text)
                     .font(.system(.body, design: .monospaced))
