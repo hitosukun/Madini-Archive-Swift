@@ -570,6 +570,52 @@ struct RawExportSearchResult: Identifiable, Hashable, Sendable {
     }
 }
 
+/// One file-level record inside a snapshot. This is the metadata view — the
+/// actual bytes live behind `loadBlob(hash:)` / `loadFile(...)`.
+struct RawExportFileEntry: Identifiable, Hashable, Sendable {
+    let snapshotID: Int64
+    let relativePath: String
+    let blobHash: String
+    /// Byte length of the original (uncompressed) file.
+    let sizeBytes: Int64
+    /// Byte length on disk. Differs from `sizeBytes` when `compression` is
+    /// anything other than `"none"`.
+    let storedSizeBytes: Int64
+    let mimeType: String?
+    /// `"conversation" | "metadata" | "manifest" | "asset" | "other"`.
+    let role: String
+    /// `"none" | "lzfse"`. Additional codecs can be added later without
+    /// breaking callers — `RawExportVaultError.unsupportedCompression` will
+    /// fire if an unknown value is encountered during restore.
+    let compression: String
+    /// Absolute path to the blob on disk. Present so tests and tooling can
+    /// assert filesystem layout; normal callers should prefer `loadBlob`.
+    let storedPath: String
+
+    var id: String { "\(snapshotID):\(relativePath)" }
+}
+
+/// A file's metadata plus its decompressed bytes. The bytes are hash-verified
+/// against `entry.blobHash` before being returned, so a successful return
+/// implies integrity.
+struct RawExportFilePayload: Sendable {
+    let entry: RawExportFileEntry
+    let data: Data
+}
+
+/// Errors surfaced by the restore / read side of the Vault. `ingest` still
+/// throws generic errors (I/O, GRDB) — this enum is specifically for the
+/// read path where we can describe the failure precisely.
+enum RawExportVaultError: Error, Sendable, Equatable {
+    case snapshotNotFound(snapshotID: Int64)
+    case fileNotFound(snapshotID: Int64, relativePath: String)
+    case blobNotFound(hash: String)
+    case blobFileMissing(hash: String, path: String)
+    case decompressionFailed(hash: String)
+    case hashMismatch(expected: String, actual: String)
+    case unsupportedCompression(String)
+}
+
 protocol ConversationRepository: Sendable {
     func fetchIndex(query: ConversationListQuery) async throws -> [ConversationSummary]
     func fetchDetail(id: String) async throws -> ConversationDetail?
@@ -631,7 +677,12 @@ protocol ProjectSuggestionRepository: Sendable {
 }
 
 protocol RawExportVault: Sendable {
+    // MARK: Ingest
+
     func ingest(_ urls: [URL]) async throws -> RawExportVaultResult?
+
+    // MARK: Browse
+
     func listSnapshots(offset: Int, limit: Int) async throws -> [RawExportSnapshotSummary]
     func search(
         query: String,
@@ -639,6 +690,33 @@ protocol RawExportVault: Sendable {
         offset: Int,
         limit: Int
     ) async throws -> [RawExportSearchResult]
+
+    // MARK: Restore
+
+    /// Fetch a single snapshot summary by its database ID.
+    /// Returns `nil` when the snapshot does not exist.
+    func getSnapshot(id: Int64) async throws -> RawExportSnapshotSummary?
+
+    /// Page through the files that belong to a snapshot. Ordered by
+    /// `relative_path ASC` so results are stable across calls.
+    func listFiles(
+        snapshotID: Int64,
+        offset: Int,
+        limit: Int
+    ) async throws -> [RawExportFileEntry]
+
+    /// Read a blob by its SHA-256 hash. Transparently decompresses LZFSE.
+    /// The returned bytes are verified against `hash` before return.
+    /// Throws `RawExportVaultError.blobNotFound` / `.blobFileMissing` /
+    /// `.decompressionFailed` / `.hashMismatch` on integrity failures.
+    func loadBlob(hash: String) async throws -> Data
+
+    /// Read a specific file from a snapshot: looks up the file row, fetches
+    /// the blob, verifies integrity, and returns both metadata and bytes.
+    func loadFile(
+        snapshotID: Int64,
+        relativePath: String
+    ) async throws -> RawExportFilePayload
 }
 
 protocol BookmarkRepository: Sendable {

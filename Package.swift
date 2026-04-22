@@ -28,5 +28,13 @@ let package = Package(
                 .process("Resources"),
             ]
         ),
+        .testTarget(
+            name: "MadiniArchiveTests",
+            dependencies: [
+                "MadiniArchive",
+                .product(name: "GRDB", package: "GRDB.swift"),
+            ],
+            path: "Tests/MadiniArchiveTests"
+        ),
     ]
 )

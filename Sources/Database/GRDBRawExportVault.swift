@@ -399,6 +399,205 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
         }
     }
 
+    // MARK: - Restore API
+
+    func getSnapshot(id: Int64) async throws -> RawExportSnapshotSummary? {
+        try await GRDBAsync.read(from: dbQueue) { db in
+            guard let row = try Row.fetchOne(
+                db,
+                sql: """
+                    SELECT
+                        id, provider, source_root, imported_at, manifest_hash, file_count,
+                        new_blob_count, reused_blob_count, original_bytes, stored_bytes, manifest_path
+                    FROM raw_export_snapshots
+                    WHERE id = ?
+                    """,
+                arguments: [id]
+            ) else {
+                return nil
+            }
+            return RawExportSnapshotSummary(
+                id: row["id"],
+                provider: RawExportProvider(rawValue: row["provider"] ?? "") ?? .unknown,
+                sourceRoot: row["source_root"],
+                importedAt: row["imported_at"],
+                manifestHash: row["manifest_hash"],
+                fileCount: row["file_count"],
+                newBlobCount: row["new_blob_count"],
+                reusedBlobCount: row["reused_blob_count"],
+                originalBytes: row["original_bytes"],
+                storedBytes: row["stored_bytes"],
+                manifestPath: row["manifest_path"]
+            )
+        }
+    }
+
+    func listFiles(
+        snapshotID: Int64,
+        offset: Int,
+        limit: Int
+    ) async throws -> [RawExportFileEntry] {
+        let boundedLimit = max(0, min(limit, 5_000))
+        let boundedOffset = max(0, offset)
+        guard boundedLimit > 0 else {
+            return []
+        }
+
+        return try await GRDBAsync.read(from: dbQueue) { db in
+            let rows = try Row.fetchAll(
+                db,
+                sql: """
+                    SELECT
+                        f.snapshot_id    AS snapshot_id,
+                        f.relative_path  AS relative_path,
+                        f.blob_hash      AS blob_hash,
+                        f.size_bytes     AS size_bytes,
+                        b.stored_size_bytes AS stored_size_bytes,
+                        f.mime_type      AS mime_type,
+                        f.role           AS role,
+                        f.compression    AS compression,
+                        f.stored_path    AS stored_path
+                    FROM raw_export_files AS f
+                    LEFT JOIN raw_export_blobs AS b ON b.hash = f.blob_hash
+                    WHERE f.snapshot_id = ?
+                    ORDER BY f.relative_path ASC
+                    LIMIT ? OFFSET ?
+                    """,
+                arguments: [snapshotID, boundedLimit, boundedOffset]
+            )
+            return rows.map(Self.fileEntry(from:))
+        }
+    }
+
+    func loadBlob(hash: String) async throws -> Data {
+        let record = try await fetchBlobRecord(hash: hash)
+        let storedURL = URL(fileURLWithPath: record.storedPath)
+
+        guard fileManager.fileExists(atPath: storedURL.path) else {
+            throw RawExportVaultError.blobFileMissing(hash: hash, path: storedURL.path)
+        }
+
+        let storedData: Data
+        do {
+            storedData = try Data(contentsOf: storedURL)
+        } catch {
+            throw RawExportVaultError.blobFileMissing(hash: hash, path: storedURL.path)
+        }
+
+        let bytes: Data
+        switch record.compression {
+        case "none":
+            bytes = storedData
+        case "lzfse":
+            guard let decompressed = Self.lzfseDecompressed(
+                storedData,
+                expectedSize: Int(clamping: record.sizeBytes)
+            ) else {
+                throw RawExportVaultError.decompressionFailed(hash: hash)
+            }
+            bytes = decompressed
+        default:
+            throw RawExportVaultError.unsupportedCompression(record.compression)
+        }
+
+        let actual = Self.sha256Hex(bytes)
+        guard actual == hash else {
+            throw RawExportVaultError.hashMismatch(expected: hash, actual: actual)
+        }
+        return bytes
+    }
+
+    func loadFile(
+        snapshotID: Int64,
+        relativePath: String
+    ) async throws -> RawExportFilePayload {
+        let entry = try await fetchFileEntry(snapshotID: snapshotID, relativePath: relativePath)
+        let data = try await loadBlob(hash: entry.blobHash)
+        return RawExportFilePayload(entry: entry, data: data)
+    }
+
+    // MARK: - Restore helpers
+
+    private struct BlobRecord {
+        let hash: String
+        let sizeBytes: Int64
+        let storedSizeBytes: Int64
+        let compression: String
+        let storedPath: String
+    }
+
+    private func fetchBlobRecord(hash: String) async throws -> BlobRecord {
+        try await GRDBAsync.read(from: dbQueue) { db in
+            guard let row = try Row.fetchOne(
+                db,
+                sql: """
+                    SELECT hash, size_bytes, stored_size_bytes, compression, stored_path
+                    FROM raw_export_blobs
+                    WHERE hash = ?
+                    """,
+                arguments: [hash]
+            ) else {
+                throw RawExportVaultError.blobNotFound(hash: hash)
+            }
+            return BlobRecord(
+                hash: row["hash"],
+                sizeBytes: row["size_bytes"],
+                storedSizeBytes: row["stored_size_bytes"],
+                compression: row["compression"],
+                storedPath: row["stored_path"]
+            )
+        }
+    }
+
+    private func fetchFileEntry(
+        snapshotID: Int64,
+        relativePath: String
+    ) async throws -> RawExportFileEntry {
+        try await GRDBAsync.read(from: dbQueue) { db in
+            guard let row = try Row.fetchOne(
+                db,
+                sql: """
+                    SELECT
+                        f.snapshot_id    AS snapshot_id,
+                        f.relative_path  AS relative_path,
+                        f.blob_hash      AS blob_hash,
+                        f.size_bytes     AS size_bytes,
+                        b.stored_size_bytes AS stored_size_bytes,
+                        f.mime_type      AS mime_type,
+                        f.role           AS role,
+                        f.compression    AS compression,
+                        f.stored_path    AS stored_path
+                    FROM raw_export_files AS f
+                    LEFT JOIN raw_export_blobs AS b ON b.hash = f.blob_hash
+                    WHERE f.snapshot_id = ? AND f.relative_path = ?
+                    """,
+                arguments: [snapshotID, relativePath]
+            ) else {
+                throw RawExportVaultError.fileNotFound(
+                    snapshotID: snapshotID,
+                    relativePath: relativePath
+                )
+            }
+            return Self.fileEntry(from: row)
+        }
+    }
+
+    private static func fileEntry(from row: Row) -> RawExportFileEntry {
+        let sizeBytes: Int64 = row["size_bytes"]
+        let storedSizeBytes: Int64 = row["stored_size_bytes"] ?? sizeBytes
+        return RawExportFileEntry(
+            snapshotID: row["snapshot_id"],
+            relativePath: row["relative_path"],
+            blobHash: row["blob_hash"],
+            sizeBytes: sizeBytes,
+            storedSizeBytes: storedSizeBytes,
+            mimeType: row["mime_type"],
+            role: row["role"],
+            compression: row["compression"],
+            storedPath: row["stored_path"]
+        )
+    }
+
     private func collectFiles(from urls: [URL], root: URL?) -> [CandidateFile] {
         var result: [CandidateFile] = []
         var seen = Set<String>()
@@ -565,6 +764,49 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
             || lower.hasSuffix(".txt")
             || lower.hasSuffix(".csv")
             || lower.hasSuffix(".xml")
+    }
+
+    private static func lzfseDecompressed(_ data: Data, expectedSize: Int) -> Data? {
+        // Start with a buffer sized for the expected payload; retry with a
+        // doubled buffer if the runtime can't fit the output (some pathological
+        // LZFSE streams expand temporarily during decode). Cap retries so a
+        // corrupt blob can't trigger unbounded allocation.
+        let minimumCapacity = max(4_096, expectedSize + 1_024)
+        var capacity = minimumCapacity
+        for _ in 0..<4 {
+            if let result = decodeLZFSE(data, capacity: capacity), result.count == expectedSize {
+                return result
+            }
+            capacity *= 2
+        }
+        return nil
+    }
+
+    private static func decodeLZFSE(_ data: Data, capacity: Int) -> Data? {
+        data.withUnsafeBytes { sourceBuffer -> Data? in
+            guard let sourcePointer = sourceBuffer.bindMemory(to: UInt8.self).baseAddress else {
+                return nil
+            }
+            var output = Data(count: capacity)
+            let written = output.withUnsafeMutableBytes { destinationBuffer -> Int in
+                guard let destinationPointer = destinationBuffer.bindMemory(to: UInt8.self).baseAddress else {
+                    return 0
+                }
+                return compression_decode_buffer(
+                    destinationPointer,
+                    capacity,
+                    sourcePointer,
+                    data.count,
+                    nil,
+                    COMPRESSION_LZFSE
+                )
+            }
+            guard written > 0 else {
+                return nil
+            }
+            output.removeSubrange(written..<output.count)
+            return output
+        }
     }
 
     private func lzfseCompressed(_ data: Data) -> Data? {

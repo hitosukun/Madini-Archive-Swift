@@ -1,5 +1,14 @@
 import Foundation
 
+/// Inert `RawExportVault` used when the on-disk database is absent or when a
+/// caller wants a feature-flag "off" switch without branching every call site.
+///
+/// - `ingest` / `listSnapshots` / `search` return empty results rather than
+///   throwing, so the UI can compose these calls without special-casing the
+///   mock path.
+/// - The restore API throws `RawExportVaultError.*NotFound` so that callers
+///   hitting the no-op vault by mistake surface a loud, typed failure rather
+///   than silently receiving empty data.
 struct NoOpRawExportVault: RawExportVault {
     func ingest(_ urls: [URL]) async throws -> RawExportVaultResult? {
         nil
@@ -16,5 +25,31 @@ struct NoOpRawExportVault: RawExportVault {
         limit: Int
     ) async throws -> [RawExportSearchResult] {
         []
+    }
+
+    func getSnapshot(id: Int64) async throws -> RawExportSnapshotSummary? {
+        nil
+    }
+
+    func listFiles(
+        snapshotID: Int64,
+        offset: Int,
+        limit: Int
+    ) async throws -> [RawExportFileEntry] {
+        []
+    }
+
+    func loadBlob(hash: String) async throws -> Data {
+        throw RawExportVaultError.blobNotFound(hash: hash)
+    }
+
+    func loadFile(
+        snapshotID: Int64,
+        relativePath: String
+    ) async throws -> RawExportFilePayload {
+        throw RawExportVaultError.fileNotFound(
+            snapshotID: snapshotID,
+            relativePath: relativePath
+        )
     }
 }
