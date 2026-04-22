@@ -30,6 +30,15 @@ struct MadiniArchiveApp: App {
                 .environmentObject(services)
                 .environment(identityPreferences)
                 .environment(archiveEvents)
+                #if os(macOS)
+                // Start auto-intake once the main scene appears. `.task`
+                // anchors the lifecycle to the root view so the poll loop
+                // goes away when the window closes. `startIntake` is
+                // idempotent, so scene restores don't spawn a second poller.
+                .task {
+                    services.startIntake()
+                }
+                #endif
         }
         #if os(macOS)
         .defaultSize(width: 1200, height: 800)

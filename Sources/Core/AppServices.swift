@@ -21,6 +21,26 @@ final class AppServices: ObservableObject {
         case mock
     }
 
+    #if os(macOS)
+    /// Lazy because `IntakeService` needs `self` to drive `ImportCoordinator`.
+    /// Constructed on first access, started explicitly via `startIntake()` —
+    /// we don't auto-start in `init` because the mock `DataSource` would wire
+    /// the intake folder to a `NoOpRawExportVault` that rejects every ingest.
+    private(set) lazy var intake: IntakeService = IntakeService(services: self)
+
+    /// Kick off auto-intake. No-op when the app is running off mock data
+    /// (there's no Vault to ingest into, so polling would just spam the
+    /// activity log with "Vault ingest failed" for anything the user drops).
+    func startIntake() {
+        guard case .database = dataSource else { return }
+        intake.start()
+    }
+
+    func stopIntake() {
+        intake.stop()
+    }
+    #endif
+
     init(
         conversations: any ConversationRepository,
         search: any SearchRepository,
