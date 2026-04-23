@@ -82,11 +82,12 @@ struct SavedFilterRow: View {
         }
         .font(.body)
         .padding(.horizontal, 6)
-        // Taller hover zone — previously 4pt vertical made hovering
-        // finicky because the row's hit-target shrank to only the
-        // visual content, and the gap between rows left dead bands.
-        // 7pt roughly doubles the vertical catch-area per row.
-        .padding(.vertical, 7)
+        // 4pt vertical — previously 7pt, which read as too airy once
+        // the History section started interleaving filter rows with
+        // thread rows (the user asked to "行間を詰めて"). Keep in sync
+        // with `RecentThreadRow`'s vertical padding so the two row
+        // kinds share identical row heights.
+        .padding(.vertical, 4)
         // Apply contentShape BEFORE `.onHover` so the whole padded
         // rectangle counts as hoverable, not just the visible glyph /
         // text. Without this the user has to land directly on a child

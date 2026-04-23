@@ -1285,30 +1285,41 @@ private struct DesignMockSidebar: View {
             if !historyItems.isEmpty {
                 Section("History") {
                     ForEach(historyItems) { item in
-                        switch item {
-                        case .filter(let entry):
-                            SavedFilterRow(
-                                entry: entry,
-                                onSelect: { onSelectHistoryEntry(entry) },
-                                onTogglePin: {
-                                    libraryViewModel?.togglePinned(entry)
-                                },
-                                onDelete: {
-                                    libraryViewModel?.deleteFilterEntry(entry)
-                                }
-                            )
-                        case .thread(let entry):
-                            RecentThreadRow(entry: entry)
-                                .contentShape(Rectangle())
-                                .onTapGesture {
-                                    onSelectRecentThread(entry)
-                                }
-                                .contextMenu {
-                                    Button("Remove from History", role: .destructive) {
-                                        onRemoveRecentThread(entry)
+                        // Each row manages its own internal padding +
+                        // hover highlight — collapse the List's
+                        // default row insets to zero so rows sit flush
+                        // against each other. Without this override
+                        // macOS sidebar List adds ~4pt of top/bottom
+                        // inset per row, which combined with the
+                        // row's own padding produced the too-airy
+                        // gaps the user flagged ("行間を詰めて").
+                        Group {
+                            switch item {
+                            case .filter(let entry):
+                                SavedFilterRow(
+                                    entry: entry,
+                                    onSelect: { onSelectHistoryEntry(entry) },
+                                    onTogglePin: {
+                                        libraryViewModel?.togglePinned(entry)
+                                    },
+                                    onDelete: {
+                                        libraryViewModel?.deleteFilterEntry(entry)
                                     }
-                                }
+                                )
+                            case .thread(let entry):
+                                RecentThreadRow(entry: entry)
+                                    .contentShape(Rectangle())
+                                    .onTapGesture {
+                                        onSelectRecentThread(entry)
+                                    }
+                                    .contextMenu {
+                                        Button("Remove from History", role: .destructive) {
+                                            onRemoveRecentThread(entry)
+                                        }
+                                    }
+                            }
                         }
+                        .listRowInsets(EdgeInsets(top: 0, leading: 6, bottom: 0, trailing: 6))
                     }
                 }
             }
@@ -2528,11 +2539,21 @@ private enum HistoryItem: Identifiable {
 private struct RecentThreadRow: View {
     let entry: RecentThreadsStore.Entry
 
+    /// Mirrors `SavedFilterRow.isHovering`. Both row kinds live side-by-
+    /// side in the unified History section, so they share the exact
+    /// same hover feedback — otherwise filter rows light up and thread
+    /// rows stay dead under the same cursor gesture, which reads as a
+    /// bug ("混在してる" per the user's report).
+    @State private var isHovering = false
+
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 8) {
             Image(systemName: "clock.arrow.circlepath")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+                // Matches `SavedFilterRow`'s leading-icon column so the
+                // text gutter lines up vertically between the two row
+                // kinds in the interleaved History list.
                 .frame(width: 14, alignment: .center)
 
             VStack(alignment: .leading, spacing: 1) {
@@ -2552,8 +2573,30 @@ private struct RecentThreadRow: View {
             }
             Spacer(minLength: 0)
         }
-        .padding(.vertical, 3)
+        .font(.body)
         .padding(.horizontal, 6)
+        // Vertical padding matches `SavedFilterRow` (tightened from the
+        // prior 7pt to 4pt) so the two row kinds share identical row
+        // heights and the History list reads as one tidy column.
+        .padding(.vertical, 4)
+        .contentShape(Rectangle())
+        .background(
+            RoundedRectangle(cornerRadius: 5, style: .continuous)
+                .fill(isHovering ? Color.secondary.opacity(0.08) : Color.clear)
+        )
+        // Same no-animation hover toggle as `SavedFilterRow` — see the
+        // extended rationale there. Summary: during a sidebar scroll
+        // with the cursor parked over History, rows slide under the
+        // pointer rapidly and any fade animation per row cascades into
+        // visible scroll jitter.
+        .animation(nil, value: isHovering)
+        .onHover { hovering in
+            var tx = Transaction()
+            tx.disablesAnimations = true
+            withTransaction(tx) {
+                isHovering = hovering
+            }
+        }
     }
 }
 
