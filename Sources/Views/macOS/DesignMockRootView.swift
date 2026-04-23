@@ -832,14 +832,19 @@ struct DesignMockRootView: View {
                         conversationSelection: $selectedConversationIDs,
                         pendingPromptID: $pendingPromptID,
                         expandedPromptConversationID: $expandedPromptConversationID,
-                        tableSortOrder: tableSortOrderBinding,
                         totalCount: store.totalCount,
                         isLoading: store.isLoading,
                         isLoadingMore: store.isLoadingMore,
                         lastError: store.lastError,
                         onReachEnd: {
                             store.loadMoreIfNeeded(services: services)
-                        }
+                        },
+                        // Share the same table declaration used by
+                        // `.table` layout. Inside default mode the
+                        // reader is already visible, so `onOpen` is a
+                        // no-op — the double-click highlights the row
+                        // and the reader updates via selection binding.
+                        tableContent: { makeCenterTable() }
                     )
                     .background(centerWidthProbe)
                     .navigationSplitViewColumnWidth(min: 320, ideal: currentCenterIdeal, max: 760)
@@ -991,7 +996,19 @@ struct DesignMockRootView: View {
         .navigationSplitViewColumnWidth(min: 240, ideal: 270, max: 320)
     }
 
-    private var centerTable: some View {
+    /// Single source of truth for the center-pane thread table. Both the
+    /// `.table` outer layout (table-only, no reader) and the `.default`
+    /// outer layout with display mode `.table` (picker + table + reader)
+    /// call this helper, so column declarations / sort binding /
+    /// selection binding don't drift between two call sites. The
+    /// `.id("center-table")` keeps the identity stable — any state
+    /// SwiftUI *can* preserve across layout flips (scroll position on
+    /// the underlying NSTableView, sort order, selection highlight)
+    /// lands on the same view slot in both trees.
+    @ViewBuilder
+    private func makeCenterTable(
+        onOpen: ((DesignMockConversation.ID) -> Void)? = nil
+    ) -> some View {
         DesignMockThreadTablePane(
             conversations: store.conversations,
             selection: $selectedConversationIDs,
@@ -1000,15 +1017,21 @@ struct DesignMockRootView: View {
             onReachEnd: {
                 store.loadMoreIfNeeded(services: services)
             },
-            // Double-click / Return: promote into default mode so the
-            // reader pane appears alongside the now-smaller table. The
-            // selection is already set by the table's primaryAction
-            // callback, so the reader has the right conversation queued
-            // up when default mode mounts.
-            onOpen: { _ in
-                selectedLayoutMode = .default
-            }
+            onOpen: onOpen
         )
+        .id("center-table")
+    }
+
+    private var centerTable: some View {
+        // `.table` layout: table fills the detail column, no reader.
+        // Double-click / Return: promote into default mode so the
+        // reader pane appears alongside the now-smaller table. The
+        // selection is already set by the table's primaryAction
+        // callback, so the reader has the right conversation queued
+        // up when default mode mounts.
+        makeCenterTable(onOpen: { _ in
+            selectedLayoutMode = .default
+        })
     }
 
     /// Two-way bridge between the toolbar search field and the `Table`'s
@@ -1421,6 +1444,12 @@ private struct DesignMockThreadListPane: View {
         // Interaction model is the pre-tag-era `selectOrToggle` pattern
         // (commit 315caf2): first tap selects, second tap on the same
         // card expands the prompt outline.
+        //
+        // Wrap in `ScrollViewReader` so the same selection-driven
+        // scroll-to-top pattern used in the table pane also applies
+        // here — opening a thread from ANY surface (sidebar HISTORY,
+        // bookmark, etc.) lands the row at the top of the card list.
+        ScrollViewReader { proxy in
         ScrollView {
             LazyVStack(spacing: 0) {
                 ForEach(conversations) { conversation in
@@ -1435,6 +1464,11 @@ private struct DesignMockThreadListPane: View {
                                 ? Color.accentColor.opacity(0.14)
                                 : Color.clear
                         )
+                        // `.id(conversation.id)` attaches a
+                        // `ScrollViewReader`-visible anchor to each row,
+                        // so `proxy.scrollTo(id, anchor: .top)` lands
+                        // exactly on the matching card.
+                        .id(conversation.id)
                         .onTapGesture {
                             withAnimation(.easeOut(duration: 0.16)) {
                                 selectOrToggle(conversation)
@@ -1458,6 +1492,31 @@ private struct DesignMockThreadListPane: View {
         }
         // White tray (was gray `.regularMaterial` / `.windowBackgroundColor`).
         .background(Color(nsColor: .textBackgroundColor))
+        // Selection-driven scroll-to-top. Fires on every transition of
+        // the selection set so external triggers (sidebar recent-thread
+        // click, bookmark click, filter-repair) consistently pull the
+        // opened row into the top of the visible viewport.
+        .onChange(of: selection) { _, newSelection in
+            guard let id = newSelection.first else { return }
+            withAnimation(.easeInOut(duration: 0.2)) {
+                proxy.scrollTo(id, anchor: .top)
+            }
+        }
+        // First-mount scroll: if the selection was already seeded
+        // before this view materialized (e.g. the user just flipped
+        // layout mode with a thread already selected), bring that row
+        // into view as well. Short poll lets the in-memory list
+        // populate from the DB paged query before we try to scroll.
+        .task {
+            guard let id = selection.first else { return }
+            for _ in 0..<20 {
+                if conversations.contains(where: { $0.id == id }) { break }
+                try? await Task.sleep(nanoseconds: 40_000_000)
+            }
+            try? await Task.sleep(nanoseconds: 80_000_000)
+            proxy.scrollTo(id, anchor: .top)
+        }
+        } // ScrollViewReader
     }
 
     /// First tap on a card ⇒ select it (replacing any prior selection).
@@ -1514,21 +1573,27 @@ private struct DesignMockThreadListPane: View {
     }
 }
 
-private struct DesignMockDefaultContentPane: View {
+private struct DesignMockDefaultContentPane<TableContent: View>: View {
     @Binding var displayMode: DesignMockCenterDisplayMode
     let conversations: [DesignMockConversation]
     @Binding var conversationSelection: Set<DesignMockConversation.ID>
     @Binding var pendingPromptID: String?
     @Binding var expandedPromptConversationID: DesignMockConversation.ID?
-    /// Forwarded from the shell — shared with the search-field DSL so
-    /// the table inside this pane round-trips column-header taps into
-    /// the toolbar query text just like the standalone table layout.
-    @Binding var tableSortOrder: [KeyPathComparator<DesignMockConversation>]
     let totalCount: Int
     let isLoading: Bool
     let isLoadingMore: Bool
     let lastError: String?
     let onReachEnd: () -> Void
+    /// Shared table view. Injected from the shell so the SAME
+    /// `DesignMockThreadTablePane` declaration / config is rendered
+    /// both when the outer layout is `.table` (table-only, no reader)
+    /// and when the outer layout is `.default` with display mode
+    /// `.table` (picker + table + reader). Sharing the construction
+    /// site eliminates drift between two call-sites that used to
+    /// redeclare the same columns with slightly different parameters,
+    /// and gives SwiftUI a single `.id("center-table")` to hang
+    /// identity off when it evaluates the view tree.
+    @ViewBuilder let tableContent: () -> TableContent
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1537,7 +1602,10 @@ private struct DesignMockDefaultContentPane: View {
             // the RIGHT. Vertical padding matches the reader pane's
             // pinned `ConversationHeaderView` (`.padding(.vertical, 10)`)
             // so the two bar heights line up pixel-for-pixel across the
-            // split-view seam.
+            // split-view seam. `.bar` material makes the strip visually
+            // continuous with the window toolbar above — user explicitly
+            // wanted "継ぎ目がないように" (no seam between this strip and
+            // the toolbar chrome).
             HStack(spacing: 12) {
                 Picker("Center View", selection: $displayMode) {
                     ForEach(DesignMockCenterDisplayMode.allCases) { mode in
@@ -1570,6 +1638,12 @@ private struct DesignMockDefaultContentPane: View {
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
+            // `.bar` material matches the window toolbar's chrome, so the
+            // strip reads as a single continuous bar from the toolbar
+            // down through this row. No bottom divider — the content
+            // material below is distinct enough on its own that the
+            // hairline was just adding a seam.
+            .background(.bar)
 
             if let lastError {
                 Text(lastError)
@@ -1577,9 +1651,8 @@ private struct DesignMockDefaultContentPane: View {
                     .foregroundStyle(.red)
                     .padding(.horizontal, 12)
                     .padding(.bottom, 4)
+                    .background(.bar)
             }
-
-            Divider()
 
             contentView
         }
@@ -1601,13 +1674,11 @@ private struct DesignMockDefaultContentPane: View {
     private var contentView: some View {
         switch displayMode {
         case .table:
-            DesignMockThreadTablePane(
-                conversations: conversations,
-                selection: $conversationSelection,
-                sortOrder: $tableSortOrder,
-                isLoadingMore: isLoadingMore,
-                onReachEnd: onReachEnd
-            )
+            // Hand the shell-owned table view straight through. This is
+            // the SAME construction site used by the `.table` outer
+            // layout, so there's no second declaration of columns /
+            // sort / selection to keep in sync.
+            tableContent()
         case .cards:
             DesignMockThreadListPane(
                 conversations: conversations,
@@ -1646,7 +1717,14 @@ private struct DesignMockThreadTablePane: View {
         // already on screen. Global sort (which drives the DB query and
         // pagination order) is unaffected.
         let rows = conversations.sorted(using: sortOrder)
-        return Table(rows, selection: $selection, sortOrder: $sortOrder) {
+        // `ScrollViewReader` so selection changes driven from OUTSIDE the
+        // table (sidebar HISTORY click, bookmark click, filter swap that
+        // repairs the selection) can scroll the target row to the top.
+        // SwiftUI `Table` on macOS forwards `proxy.scrollTo(id)` through
+        // its underlying `NSScrollView`, so the same row-id we bind the
+        // selection on doubles as the scroll anchor.
+        return ScrollViewReader { proxy in
+        Table(rows, selection: $selection, sortOrder: $sortOrder) {
             TableColumn("Title", value: \DesignMockConversation.title) { conversation in
                 VStack(alignment: .leading, spacing: 2) {
                     Text(conversation.title)
@@ -1702,12 +1780,12 @@ private struct DesignMockThreadTablePane: View {
                     .lineLimit(1)
                     .fixedSize(horizontal: true, vertical: false)
             }
-            // Date string is fixed-shape ("MMM dd" or similar). Keep a
-            // soft ceiling so wide windows don't stretch 6 characters
-            // across a banner of whitespace, but raise it above the
-            // previous 72pt so locales that format longer (e.g.
-            // "Jan 1, 2026") don't end up clipped.
-            .width(min: 56, ideal: 72, max: 104)
+            // Date strings can vary in length depending on locale
+            // ("Jan 1, 2026" vs "2026-01-01 12:34"). No `max` cap —
+            // paired with `.fixedSize` on the cell, the column claims
+            // the natural width of its widest visible row, and the
+            // user can drag it narrower down to the `min` floor.
+            .width(min: 56, ideal: 72)
 
             TableColumn("Prompts", value: \DesignMockConversation.prompts) { conversation in
                 Text("\(conversation.prompts)")
@@ -1718,9 +1796,11 @@ private struct DesignMockThreadTablePane: View {
             }
             // Header text "Prompts" itself is ~52pt at the default
             // font — we need the column at least that wide or the
-            // header truncates to "Prom…". Cap accommodates 4-digit
-            // counts + header width without leaving huge dead space.
-            .width(min: 56, ideal: 64, max: 84)
+            // header truncates to "Prom…". No `max` so the natural
+            // width of the widest prompt count (5-digit archives
+            // exist) lands without clipping; the `.fixedSize` on the
+            // cell content pulls the column to exactly-fit width.
+            .width(min: 56, ideal: 64)
 
             TableColumn("Source", value: \DesignMockConversation.source) { conversation in
                 Text(conversation.source)
@@ -1764,6 +1844,37 @@ private struct DesignMockThreadTablePane: View {
                     .padding(.bottom, 6)
             }
         }
+        // Whenever the selected thread changes (whether by user click in
+        // the table, sidebar HISTORY re-open, bookmark click, or filter-
+        // repair in the shell), snap the table so the selected row sits
+        // at the top. User requested consistency: opening a thread from
+        // ANY surface lands it at the top of the center pane, rather
+        // than requiring the user to hunt for the highlighted row in
+        // the scroll position. `anchor: .top` + easeInOut is less
+        // disorienting than a hard jump on internal clicks.
+        .onChange(of: selection) { _, newSelection in
+            guard let id = newSelection.first else { return }
+            withAnimation(.easeInOut(duration: 0.2)) {
+                proxy.scrollTo(id, anchor: .top)
+            }
+        }
+        // On first mount, if the selection was already set by the
+        // sidebar path (recent-thread click flips layout to `.default`
+        // *and* writes the id into `selectedConversationIDs` in the
+        // same tick), we need to scroll to it too — the `.onChange`
+        // above only fires for transitions *after* mount. A brief
+        // poll waits for the target row to page into the in-memory
+        // list before asking `proxy.scrollTo` to land it.
+        .task {
+            guard let id = selection.first else { return }
+            for _ in 0..<20 {
+                if conversations.contains(where: { $0.id == id }) { break }
+                try? await Task.sleep(nanoseconds: 40_000_000)
+            }
+            try? await Task.sleep(nanoseconds: 80_000_000)
+            proxy.scrollTo(id, anchor: .top)
+        }
+        } // ScrollViewReader
     }
 
 }

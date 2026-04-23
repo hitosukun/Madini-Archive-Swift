@@ -299,14 +299,14 @@ private struct LoadedConversationDetailView: View {
                         )
                         .padding(.horizontal, 24)
                         .padding(.vertical, 10)
-                        .background(.regularMaterial)
-                        .overlay(alignment: .bottom) {
-                            // Hairline separator between the pinned
-                            // header and the scroll content. `.bar`
-                            // material + divider is the AppKit idiom
-                            // for a source-list / inspector header.
-                            Divider()
-                        }
+                        // `.bar` material (instead of `.regularMaterial`)
+                        // so the pinned header visually reads as the
+                        // continuation of the window toolbar chrome
+                        // above — the user explicitly asked for "継ぎ目
+                        // がないように", i.e. no visible seam between the
+                        // toolbar and this strip. No bottom divider
+                        // either; the material shift to the message
+                        // body below is enough structural definition.
                         ScrollView {
                         LazyVStack(alignment: .leading, spacing: 0) {
                             // Invisible top-anchor. `ConversationHeaderView`
