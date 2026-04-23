@@ -299,14 +299,18 @@ private struct LoadedConversationDetailView: View {
                         )
                         .padding(.horizontal, 24)
                         .padding(.vertical, 10)
-                        // `.bar` material (instead of `.regularMaterial`)
-                        // so the pinned header visually reads as the
-                        // continuation of the window toolbar chrome
-                        // above — the user explicitly asked for "継ぎ目
-                        // がないように", i.e. no visible seam between the
-                        // toolbar and this strip. No bottom divider
-                        // either; the material shift to the message
-                        // body below is enough structural definition.
+                        // Fully transparent — NO explicit `.background(...)`.
+                        // The previous `.bar` material rendered a hair
+                        // darker than the window toolbar chrome and a
+                        // subtle seam was visible between the toolbar
+                        // and this pinned strip. Letting the pane /
+                        // window background show through untouched lets
+                        // the toolbar's titlebar blur extend straight
+                        // down into the strip so the seam disappears.
+                        // No bottom divider either; the material /
+                        // content shift below is enough structural
+                        // definition ("透過 / 境界線を消して 継ぎ目が
+                        // ない" per the user's request).
                         ScrollView {
                         LazyVStack(alignment: .leading, spacing: 0) {
                             // Invisible top-anchor. `ConversationHeaderView`

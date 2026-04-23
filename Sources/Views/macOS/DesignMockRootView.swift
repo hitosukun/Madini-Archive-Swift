@@ -1629,10 +1629,11 @@ private struct DesignMockDefaultContentPane<TableContent: View>: View {
             // the RIGHT. Vertical padding matches the reader pane's
             // pinned `ConversationHeaderView` (`.padding(.vertical, 10)`)
             // so the two bar heights line up pixel-for-pixel across the
-            // split-view seam. `.bar` material makes the strip visually
-            // continuous with the window toolbar above — user explicitly
-            // wanted "継ぎ目がないように" (no seam between this strip and
-            // the toolbar chrome).
+            // split-view seam. The strip carries NO explicit background —
+            // it's fully transparent so the window-toolbar blur above
+            // continues straight down into this row without any colour
+            // / material mismatch (user explicitly wanted "透過 / 境界線
+            // を消して 継ぎ目がない").
             HStack(spacing: 12) {
                 Picker("Center View", selection: $displayMode) {
                     ForEach(DesignMockCenterDisplayMode.allCases) { mode in
@@ -1665,12 +1666,15 @@ private struct DesignMockDefaultContentPane<TableContent: View>: View {
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
-            // `.bar` material matches the window toolbar's chrome, so the
-            // strip reads as a single continuous bar from the toolbar
-            // down through this row. No bottom divider — the content
-            // material below is distinct enough on its own that the
-            // hairline was just adding a seam.
-            .background(.bar)
+            // Fully transparent — NO `.background(...)` at all. The
+            // previous `.bar` material rendered a hair darker than the
+            // window toolbar chrome, so a subtle seam was visible where
+            // this strip met the toolbar above. By letting the window /
+            // pane background show through untouched, the toolbar's
+            // titlebar blur extends straight down into this strip and
+            // the seam disappears. No bottom divider either — the
+            // material shift to the table / cards area below is enough
+            // structural definition.
 
             if let lastError {
                 Text(lastError)
@@ -1678,7 +1682,9 @@ private struct DesignMockDefaultContentPane<TableContent: View>: View {
                     .foregroundStyle(.red)
                     .padding(.horizontal, 12)
                     .padding(.bottom, 4)
-                    .background(.bar)
+                // No background here either — keeping the error banner
+                // transparent so it inherits the same seamless chrome
+                // as the strip above.
             }
 
             contentView
