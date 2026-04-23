@@ -584,7 +584,6 @@ struct DesignMockRootView: View {
     /// into a single drop delivery on tag rows.
     @State private var selectedConversationIDs: Set<DesignMockConversation.ID> = []
     @State private var selectedLayoutMode: DesignMockLayoutMode = .default
-    @State private var selectedCenterDisplayMode: DesignMockCenterDisplayMode = .cards
     @State private var searchText = ""
     @State private var expandedPromptConversationID: DesignMockConversation.ID?
     /// One-shot signal that bounces through `selectedPromptID` on the
@@ -611,14 +610,13 @@ struct DesignMockRootView: View {
     /// store's own "last write wins" fetch: whatever the user actually
     /// landed on is what enters History.
     @State private var recordRecentSearchTask: Task<Void, Never>?
-    /// Persisted center-pane width for the `.default` layout, one slot
-    /// per center display mode. The user's desired trade-off differs by
-    /// mode: table view wants the center wide (thread list + metadata
-    /// columns), card view wants it narrow (cards are self-contained
-    /// and the reader gets the slack). Two `@AppStorage` slots keep the
-    /// preferences independent across launches.
+    /// Persisted center-pane width for the `.default` layout. Single
+    /// slot because the default pane now renders only the card list —
+    /// the historical split between card and table widths was dropped
+    /// when the in-pane Table/Cards picker was removed. Table view
+    /// lives only in the separate `.table` outer layout, which sets
+    /// its own pane width via a different mechanism.
     @AppStorage("designmock.centerPaneIdealWidth.cards") private var centerWidthCards: Double = 460
-    @AppStorage("designmock.centerPaneIdealWidth.table") private var centerWidthTable: Double = 560
     /// Debounces the GeometryReader-driven save so a drag-resize doesn't
     /// write to UserDefaults once per frame. Fires ~200ms after the user
     /// stops dragging.
@@ -827,7 +825,6 @@ struct DesignMockRootView: View {
                         .navigationSplitViewColumnWidth(min: 320, ideal: currentCenterIdeal, max: 760)
                 } else {
                     DesignMockDefaultContentPane(
-                        displayMode: $selectedCenterDisplayMode,
                         conversations: store.conversations,
                         conversationSelection: $selectedConversationIDs,
                         pendingPromptID: $pendingPromptID,
@@ -838,13 +835,7 @@ struct DesignMockRootView: View {
                         lastError: store.lastError,
                         onReachEnd: {
                             store.loadMoreIfNeeded(services: services)
-                        },
-                        // Share the same table declaration used by
-                        // `.table` layout. Inside default mode the
-                        // reader is already visible, so `onOpen` is a
-                        // no-op — the double-click highlights the row
-                        // and the reader updates via selection binding.
-                        tableContent: { makeCenterTable() }
+                        }
                     )
                     .background(centerWidthProbe)
                     .navigationSplitViewColumnWidth(min: 320, ideal: currentCenterIdeal, max: 760)
@@ -856,7 +847,7 @@ struct DesignMockRootView: View {
                     readerPane(inThreadSearch: nil)
                 }
             }
-            .id("default-\(selectedCenterDisplayMode.rawValue)")
+            .id("default")
         case .viewer:
             NavigationSplitView {
                 sidebar
@@ -870,19 +861,16 @@ struct DesignMockRootView: View {
         }
     }
 
-    /// Ideal center-pane width for the currently-active display mode in
-    /// `.default` layout. Reads the matching `@AppStorage` slot so the
-    /// width the user settled on last session is the one the split view
-    /// opens with next launch. Table mode gets its own slot from cards
-    /// because the columns-vs-cards trade-off genuinely asks for a
-    /// different ratio: the table wants room for `Model / Updated /
-    /// Prompts / Source` to breathe, cards hand slack to the reader.
+    /// Ideal center-pane width for `.default` layout. Reads the
+    /// card-mode `@AppStorage` slot so the width the user settled on
+    /// last session is the one the split view opens with next launch.
+    /// Only one slot now that the default pane has no in-pane Table
+    /// alternative.
     private var currentCenterIdeal: CGFloat {
-        let raw = selectedCenterDisplayMode == .table ? centerWidthTable : centerWidthCards
         // Clamp defensively so a stale / hand-edited preferences value
         // can't lock the user out of the split (below-min disappears
         // the pane, above-max is equally unusable).
-        return CGFloat(min(max(raw, 320), 760))
+        return CGFloat(min(max(centerWidthCards, 320), 760))
     }
 
     /// Transparent width probe mounted as the content pane's background.
@@ -913,23 +901,15 @@ struct DesignMockRootView: View {
     private func persistCenterWidth(_ width: CGFloat) {
         let clamped = min(max(Double(width), 320), 760)
         // GeometryReader transiently reports 0 during teardown / mode
-        // switch. Treating that as a real preference would wipe the saved
-        // width the moment the user flips mode.
+        // switch. Treating that as a real preference would wipe the
+        // saved width the moment the user flips mode.
         guard width > 1 else { return }
-        let mode = selectedCenterDisplayMode
         persistCenterWidthTask?.cancel()
         persistCenterWidthTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 200_000_000)
             guard !Task.isCancelled else { return }
-            switch mode {
-            case .table:
-                if abs(centerWidthTable - clamped) > 0.5 {
-                    centerWidthTable = clamped
-                }
-            case .cards:
-                if abs(centerWidthCards - clamped) > 0.5 {
-                    centerWidthCards = clamped
-                }
+            if abs(centerWidthCards - clamped) > 0.5 {
+                centerWidthCards = clamped
             }
         }
     }
@@ -1611,8 +1591,7 @@ private struct DesignMockThreadListPane: View {
     }
 }
 
-private struct DesignMockDefaultContentPane<TableContent: View>: View {
-    @Binding var displayMode: DesignMockCenterDisplayMode
+private struct DesignMockDefaultContentPane: View {
     let conversations: [DesignMockConversation]
     @Binding var conversationSelection: Set<DesignMockConversation.ID>
     @Binding var pendingPromptID: String?
@@ -1622,16 +1601,6 @@ private struct DesignMockDefaultContentPane<TableContent: View>: View {
     let isLoadingMore: Bool
     let lastError: String?
     let onReachEnd: () -> Void
-    /// Shared table view. Injected from the shell so the SAME
-    /// `DesignMockThreadTablePane` declaration / config is rendered
-    /// both when the outer layout is `.table` (table-only, no reader)
-    /// and when the outer layout is `.default` with display mode
-    /// `.table` (picker + table + reader). Sharing the construction
-    /// site eliminates drift between two call-sites that used to
-    /// redeclare the same columns with slightly different parameters,
-    /// and gives SwiftUI a single `.id("center-table")` to hang
-    /// identity off when it evaluates the view tree.
-    @ViewBuilder let tableContent: () -> TableContent
 
     var body: some View {
         // `.safeAreaInset(edge: .top)` instead of a plain VStack so the
@@ -1649,26 +1618,24 @@ private struct DesignMockDefaultContentPane<TableContent: View>: View {
         contentView
             .safeAreaInset(edge: .top, spacing: 0) {
                 VStack(spacing: 0) {
-                    // Top strip: view-mode picker hugs the LEFT edge;
-                    // thread-count (plus an optional spinner while the
-                    // first page loads) hugs the RIGHT. Vertical padding
-                    // matches the reader pane's pinned
+                    // Top strip: thread-count (plus an optional spinner
+                    // while the first page loads) hugs the RIGHT.
+                    // Vertical padding matches the reader pane's pinned
                     // `ConversationHeaderView` (`.padding(.vertical, 10)`)
                     // so the two bar heights line up pixel-for-pixel
                     // across the split-view seam.
+                    //
+                    // The view-mode picker that used to live on the left
+                    // (Table vs Cards) was removed — default mode now
+                    // renders only the card list. Table view survives
+                    // as the separate `.table` outer layout mode
+                    // reached from the window toolbar, which is the
+                    // mode where the table actually has room to
+                    // breathe. Having a duplicate table option inside
+                    // default mode fought the narrow center pane and
+                    // ran into repeated horizontal-scroll issues that
+                    // were never worth the feature.
                     HStack(spacing: 12) {
-                        Picker("Center View", selection: $displayMode) {
-                            ForEach(DesignMockCenterDisplayMode.allCases) { mode in
-                                Image(systemName: mode.symbol)
-                                    .accessibilityLabel(Text(mode.title))
-                                    .tag(mode)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-                        .labelsHidden()
-                        .controlSize(.small)
-                        .frame(width: 92)
-
                         Spacer()
 
                         // Count / load status. Keeps the "N threads"
@@ -1731,35 +1698,15 @@ private struct DesignMockDefaultContentPane<TableContent: View>: View {
 
     @ViewBuilder
     private var contentView: some View {
-        switch displayMode {
-        case .table:
-            // Hand the shell-owned table view straight through. This is
-            // the SAME construction site used by the `.table` outer
-            // layout, so there's no second declaration of columns /
-            // sort / selection to keep in sync.
-            tableContent()
-        case .cards:
-            DesignMockThreadListPane(
-                conversations: conversations,
-                selection: $conversationSelection,
-                pendingPromptID: $pendingPromptID,
-                expandedPromptConversationID: $expandedPromptConversationID,
-                isLoadingMore: isLoadingMore,
-                onReachEnd: onReachEnd
-            )
-        }
+        DesignMockThreadListPane(
+            conversations: conversations,
+            selection: $conversationSelection,
+            pendingPromptID: $pendingPromptID,
+            expandedPromptConversationID: $expandedPromptConversationID,
+            isLoadingMore: isLoadingMore,
+            onReachEnd: onReachEnd
+        )
     }
-}
-
-/// Composite trigger for `TableHorizontalScrollReset`. Wrapping the
-/// inputs in a dedicated `Hashable` value (rather than an array of
-/// `AnyHashable`) keeps equality stable — a raw `[AnyHashable]` would
-/// allocate a fresh wrapper object on every SwiftUI update, making
-/// the reset overlay think the trigger changed even when neither
-/// input moved. A named struct with typed fields equates by value.
-private struct ScrollResetKey: Hashable {
-    let selection: AnyHashable
-    let widthBucket: Int
 }
 
 private struct DesignMockThreadTablePane: View {
@@ -1777,37 +1724,11 @@ private struct DesignMockThreadTablePane: View {
     let onReachEnd: () -> Void
     /// Invoked when the user double-clicks a row or hits Return on a
     /// selection — the shell wires this to flip the layout mode so the
-    /// reader pane opens the conversation. Optional because the same
-    /// table is also embedded inside `.default` mode, where the reader
-    /// is already visible and opening is a no-op.
+    /// reader pane opens the conversation. Only the `.table` outer
+    /// layout uses this table now that the default mode has no in-
+    /// pane Table option, so this is always wired up to "flip to
+    /// `.default` so the reader appears."
     var onOpen: ((DesignMockConversation.ID) -> Void)? = nil
-
-    /// Quantized pane-width index used to kick the horizontal-scroll
-    /// reset when the outer layout flips the pane between its "wide"
-    /// (`.table` mode, ~700–900pt) and "narrow" (`.default` mode,
-    /// ~320–480pt) regimes. Raw width would re-trigger on every drag
-    /// pixel; a small set of buckets means the token only rotates
-    /// when the pane actually crosses a regime boundary.
-    @State private var paneWidthBucket: Int = 0
-
-    /// Update `paneWidthBucket` using coarse width thresholds. The
-    /// boundaries match the actual layout-mode floors: `.default` mode
-    /// pins the center pane to `min: 320, max: 760`, while `.table`
-    /// mode lets it grow with the window. Three buckets (below the
-    /// overflow point, between the two ideals, above the high-water
-    /// mark) are enough to distinguish "mode just shrank me" from
-    /// "user is dragging within a single regime."
-    private func updatePaneWidthBucket(for width: CGFloat) {
-        let newBucket: Int
-        switch width {
-        case ..<400:  newBucket = 0
-        case ..<640:  newBucket = 1
-        default:      newBucket = 2
-        }
-        if newBucket != paneWidthBucket {
-            paneWidthBucket = newBucket
-        }
-    }
 
     var body: some View {
         // Re-sort locally so header clicks reflect immediately on the page
@@ -1941,52 +1862,15 @@ private struct DesignMockThreadTablePane: View {
                     .padding(.bottom, 6)
             }
         }
-        // Horizontal-scroll reset. The `.default` outer layout brings
-        // the reader back on-screen and shrinks the middle column
-        // from ~800pt down toward its 320pt floor — `NSTableView`
-        // keeps its prior column widths, so the leftmost `Title`
-        // column ends up scrolled off-screen and the user opens a
-        // thread onto a row where the title itself is hidden. The
-        // helper reaches down to the enclosing `NSScrollView` and
-        // snaps `contentView.bounds.origin.x` back to 0 whenever
-        // the trigger rotates.
+        // (Horizontal-scroll reset used to live here. It was needed
+        // only for `.default` mode's in-pane table, which ran too
+        // narrow for the column declarations to fit — the Title
+        // column ended up scrolled off-screen on every mode flip.
+        // The in-pane table was removed from `.default` mode
+        // entirely; the `.table` outer layout always gives the
+        // table plenty of room, so horizontal overflow isn't a
+        // problem here anymore.)
         //
-        // Trigger inputs:
-        // - selection.first: fires on every "a thread was opened"
-        //   moment (table click, sidebar HISTORY click, bookmark).
-        // - paneWidthBucket: fires whenever the pane crosses a
-        //   meaningful width threshold. This is the ACTUAL trip-
-        //   wire for the mode flip: `.table` → `.default` shrinks
-        //   the pane from ~800pt down to ~320–480pt, which is when
-        //   the column widths exceed the viewport and Title scrolls
-        //   off. Bucketing (not raw width) avoids retrigger-storms
-        //   during drag-resize — once the bucket index changes, the
-        //   reset fires exactly once.
-        // - `resetToken` from the enclosing shell rotates on
-        //   `.default`-mode entry even when nothing else changed
-        //   (e.g. mode flip with the same thread still selected).
-        //
-        // Size is zero so the overlay is invisible and doesn't
-        // intercept hits.
-        .background(
-            GeometryReader { geo in
-                Color.clear
-                    .onAppear { updatePaneWidthBucket(for: geo.size.width) }
-                    .onChange(of: geo.size.width) { _, newValue in
-                        updatePaneWidthBucket(for: newValue)
-                    }
-            }
-        )
-        .overlay(alignment: .topLeading) {
-            TableHorizontalScrollReset(
-                trigger: AnyHashable(ScrollResetKey(
-                    selection: selection.first.map { AnyHashable($0) } ?? AnyHashable("__none__"),
-                    widthBucket: paneWidthBucket
-                ))
-            )
-            .frame(width: 0, height: 0)
-            .allowsHitTesting(false)
-        }
         // Whenever the selected thread changes (whether by user click in
         // the table, sidebar HISTORY re-open, bookmark click, or filter-
         // repair in the shell), snap the table so the selected row sits
@@ -3031,27 +2915,6 @@ private enum DesignMockLayoutMode: String, CaseIterable, Identifiable {
         case .table: return "tablecells"
         case .default: return "rectangle.split.3x1"
         case .viewer: return "doc.plaintext"
-        }
-    }
-}
-
-private enum DesignMockCenterDisplayMode: String, CaseIterable, Identifiable {
-    case table
-    case cards
-
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .cards: return "Cards"
-        case .table: return "Table"
-        }
-    }
-
-    var symbol: String {
-        switch self {
-        case .cards: return "rectangle.stack"
-        case .table: return "tablecells"
         }
     }
 }
