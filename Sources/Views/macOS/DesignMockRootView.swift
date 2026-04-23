@@ -1751,6 +1751,17 @@ private struct DesignMockDefaultContentPane<TableContent: View>: View {
     }
 }
 
+/// Composite trigger for `TableHorizontalScrollReset`. Wrapping the
+/// inputs in a dedicated `Hashable` value (rather than an array of
+/// `AnyHashable`) keeps equality stable — a raw `[AnyHashable]` would
+/// allocate a fresh wrapper object on every SwiftUI update, making
+/// the reset overlay think the trigger changed even when neither
+/// input moved. A named struct with typed fields equates by value.
+private struct ScrollResetKey: Hashable {
+    let selection: AnyHashable
+    let widthBucket: Int
+}
+
 private struct DesignMockThreadTablePane: View {
     let conversations: [DesignMockConversation]
     /// Multi-selection binding (mirrors the card list). `Table` accepts
@@ -1770,6 +1781,33 @@ private struct DesignMockThreadTablePane: View {
     /// table is also embedded inside `.default` mode, where the reader
     /// is already visible and opening is a no-op.
     var onOpen: ((DesignMockConversation.ID) -> Void)? = nil
+
+    /// Quantized pane-width index used to kick the horizontal-scroll
+    /// reset when the outer layout flips the pane between its "wide"
+    /// (`.table` mode, ~700–900pt) and "narrow" (`.default` mode,
+    /// ~320–480pt) regimes. Raw width would re-trigger on every drag
+    /// pixel; a small set of buckets means the token only rotates
+    /// when the pane actually crosses a regime boundary.
+    @State private var paneWidthBucket: Int = 0
+
+    /// Update `paneWidthBucket` using coarse width thresholds. The
+    /// boundaries match the actual layout-mode floors: `.default` mode
+    /// pins the center pane to `min: 320, max: 760`, while `.table`
+    /// mode lets it grow with the window. Three buckets (below the
+    /// overflow point, between the two ideals, above the high-water
+    /// mark) are enough to distinguish "mode just shrank me" from
+    /// "user is dragging within a single regime."
+    private func updatePaneWidthBucket(for width: CGFloat) {
+        let newBucket: Int
+        switch width {
+        case ..<400:  newBucket = 0
+        case ..<640:  newBucket = 1
+        default:      newBucket = 2
+        }
+        if newBucket != paneWidthBucket {
+            paneWidthBucket = newBucket
+        }
+    }
 
     var body: some View {
         // Re-sort locally so header clicks reflect immediately on the page
@@ -1910,13 +1948,41 @@ private struct DesignMockThreadTablePane: View {
         // column ends up scrolled off-screen and the user opens a
         // thread onto a row where the title itself is hidden. The
         // helper reaches down to the enclosing `NSScrollView` and
-        // snaps `contentView.bounds.origin.x` back to 0 on every
-        // selection change (= every "a thread was opened" moment).
+        // snaps `contentView.bounds.origin.x` back to 0 whenever
+        // the trigger rotates.
+        //
+        // Trigger inputs:
+        // - selection.first: fires on every "a thread was opened"
+        //   moment (table click, sidebar HISTORY click, bookmark).
+        // - paneWidthBucket: fires whenever the pane crosses a
+        //   meaningful width threshold. This is the ACTUAL trip-
+        //   wire for the mode flip: `.table` → `.default` shrinks
+        //   the pane from ~800pt down to ~320–480pt, which is when
+        //   the column widths exceed the viewport and Title scrolls
+        //   off. Bucketing (not raw width) avoids retrigger-storms
+        //   during drag-resize — once the bucket index changes, the
+        //   reset fires exactly once.
+        // - `resetToken` from the enclosing shell rotates on
+        //   `.default`-mode entry even when nothing else changed
+        //   (e.g. mode flip with the same thread still selected).
+        //
         // Size is zero so the overlay is invisible and doesn't
         // intercept hits.
+        .background(
+            GeometryReader { geo in
+                Color.clear
+                    .onAppear { updatePaneWidthBucket(for: geo.size.width) }
+                    .onChange(of: geo.size.width) { _, newValue in
+                        updatePaneWidthBucket(for: newValue)
+                    }
+            }
+        )
         .overlay(alignment: .topLeading) {
             TableHorizontalScrollReset(
-                trigger: AnyHashable(selection.first ?? "__none__")
+                trigger: AnyHashable(ScrollResetKey(
+                    selection: selection.first.map { AnyHashable($0) } ?? AnyHashable("__none__"),
+                    widthBucket: paneWidthBucket
+                ))
             )
             .frame(width: 0, height: 0)
             .allowsHitTesting(false)
