@@ -530,17 +530,31 @@ private struct LoadedConversationDetailView: View {
                         )
                         .padding(.horizontal, 24)
                         .padding(.vertical, 10)
-                        // `VisualEffectBar` = `NSVisualEffectView` with
-                        // `.headerView` material. SwiftUI's `.bar`
-                        // material was unreliable here — it read as a
-                        // near-opaque tint whenever the message body
-                        // didn't happen to be scrolled under the
-                        // header, which is most of the time for short
-                        // conversations. The AppKit view gives real
-                        // translucent Finder-style chrome regardless
-                        // of the scroll position.
+                        // Layer stack (back → front):
+                        //   1. opaque paper-white (`textBackgroundColor`)
+                        //   2. `VisualEffectBar` (`.headerView` material)
+                        //   3. the `ConversationHeaderView` labels
+                        //
+                        // The paper-white layer is what kept the center
+                        // pane looking consistent — its thread table
+                        // already paints that color as its NSTableView
+                        // background, so the inset's material always
+                        // has an opaque surface to blur. The right
+                        // pane used to rely on the outer-`Group`
+                        // `.background(...)` for that surface, but
+                        // during a mode transition (user flips outer
+                        // layout → `.default` while a thread is already
+                        // selected) the outer background hadn't re-
+                        // committed before the inset re-attached, and
+                        // the material rendered against bare window
+                        // chrome for a few frames — way too see-
+                        // through, user's "別のモードから切り替えた
+                        // 時にそうなる" report. Pinning the backing
+                        // color directly to the inset closes that
+                        // timing window.
                         #if os(macOS)
                         .background { VisualEffectBar() }
+                        .background(Color(nsColor: .textBackgroundColor))
                         #else
                         .background(.bar)
                         #endif
