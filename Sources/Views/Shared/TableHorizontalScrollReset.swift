@@ -148,53 +148,74 @@ struct TableHorizontalScrollReset: NSViewRepresentable {
 
     // MARK: - View-tree lookup
 
+    /// Minimum column count that qualifies an `NSTableView` as our
+    /// multi-column SwiftUI `Table`. SwiftUI `List` on macOS is ALSO
+    /// backed by `NSTableView`, but always with a single column. If
+    /// we accepted any `NSTableView`, a depth-first search from an
+    /// ancestor would land on the sidebar List's NSTableView (since
+    /// `NavigationSplitView` lays out sidebar → content → detail in
+    /// that subview order) and we'd scroll the wrong view. Requiring
+    /// at least two columns rules out every `List`-backed table and
+    /// zeroes in on our actual data table.
+    private static let minMultiColumnCount = 2
+
     private static func locateTableView(from probe: NSView) -> NSTableView? {
         // 1. Up the superview chain — the probe is typically a
         //    sibling of the NSTableView under a shared clip view.
+        //    At each ancestor, run a multi-column subtree search so
+        //    we skip the sidebar List's single-column NSTableView
+        //    and land on our actual Table.
         var current: NSView? = probe
         while let v = current {
-            if let t = firstTableView(in: v) { return t }
+            if let t = firstMultiColumnTableView(in: v) { return t }
             current = v.superview
         }
-        // 2. Window-scoped fallback.
+        // 2. Window-scoped fallback. Same multi-column filter —
+        //    otherwise a depth-first walk from the window's content
+        //    view would hit the sidebar's single-column table first.
         if let root = probe.window?.contentView {
-            return firstTableView(in: root)
+            return firstMultiColumnTableView(in: root)
         }
         return nil
     }
 
     private static func locateScrollView(from probe: NSView) -> NSScrollView? {
         if let sv = probe.enclosingScrollView,
-           firstTableView(in: sv) != nil {
+           firstMultiColumnTableView(in: sv) != nil {
             return sv
         }
         var current: NSView? = probe.superview
         while let v = current {
-            if let sv = v as? NSScrollView, firstTableView(in: sv) != nil {
+            if let sv = v as? NSScrollView, firstMultiColumnTableView(in: sv) != nil {
                 return sv
             }
             current = v.superview
         }
         if let root = probe.window?.contentView {
-            return firstTableScrollView(in: root)
+            return firstMultiColumnTableScrollView(in: root)
         }
         return nil
     }
 
-    private static func firstTableView(in view: NSView) -> NSTableView? {
-        if let t = view as? NSTableView { return t }
+    /// Recursively finds the first `NSTableView` with at least
+    /// `minMultiColumnCount` columns. Depth-first; returns as soon
+    /// as a qualifying view is seen.
+    private static func firstMultiColumnTableView(in view: NSView) -> NSTableView? {
+        if let t = view as? NSTableView, t.numberOfColumns >= minMultiColumnCount {
+            return t
+        }
         for sub in view.subviews {
-            if let found = firstTableView(in: sub) { return found }
+            if let found = firstMultiColumnTableView(in: sub) { return found }
         }
         return nil
     }
 
-    private static func firstTableScrollView(in view: NSView) -> NSScrollView? {
-        if let sv = view as? NSScrollView, firstTableView(in: sv) != nil {
+    private static func firstMultiColumnTableScrollView(in view: NSView) -> NSScrollView? {
+        if let sv = view as? NSScrollView, firstMultiColumnTableView(in: sv) != nil {
             return sv
         }
         for sub in view.subviews {
-            if let found = firstTableScrollView(in: sub) { return found }
+            if let found = firstMultiColumnTableScrollView(in: sub) { return found }
         }
         return nil
     }
