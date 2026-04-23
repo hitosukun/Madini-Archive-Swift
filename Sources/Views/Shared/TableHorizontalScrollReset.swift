@@ -348,8 +348,16 @@ struct TableHorizontalScrollReset: NSViewRepresentable {
     /// ancestor would land on the sidebar List's NSTableView (since
     /// `NavigationSplitView` lays out sidebar → content → detail in
     /// that subview order) and we'd scroll the wrong view. Requiring
-    /// at least two columns rules out every `List`-backed table and
-    /// zeroes in on our actual data table.
+    /// at least two columns rules out every plain `List`-backed
+    /// table.
+    ///
+    /// **Caveat:** `NavigationSplitView`'s sidebar in `.sidebar`
+    /// list style is backed by a MULTI-column `NSOutlineView`
+    /// subclass (`SwiftUIOutlineTableView`) — the hidden columns
+    /// hold the disclosure triangle, icon, label, accessory, etc.
+    /// That's why we ALSO reject any class in the `NSOutlineView`
+    /// hierarchy below. Without that filter, a multi-column check
+    /// alone lands on the sidebar outline, not the data Table.
     private static let minMultiColumnCount = 2
 
     private static func locateTableView(from probe: NSView) -> NSTableView? {
@@ -391,10 +399,13 @@ struct TableHorizontalScrollReset: NSViewRepresentable {
     }
 
     /// Recursively finds the first `NSTableView` with at least
-    /// `minMultiColumnCount` columns. Depth-first; returns as soon
-    /// as a qualifying view is seen.
+    /// `minMultiColumnCount` columns, rejecting any class in the
+    /// `NSOutlineView` hierarchy (= sidebar List). Depth-first;
+    /// returns as soon as a qualifying view is seen.
     private static func firstMultiColumnTableView(in view: NSView) -> NSTableView? {
-        if let t = view as? NSTableView, t.numberOfColumns >= minMultiColumnCount {
+        if let t = view as? NSTableView,
+           !(t is NSOutlineView),
+           t.numberOfColumns >= minMultiColumnCount {
             return t
         }
         for sub in view.subviews {
