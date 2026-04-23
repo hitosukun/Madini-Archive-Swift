@@ -953,8 +953,30 @@ struct DesignMockRootView: View {
     }
 
     private var sidebar: some View {
-        DesignMockSidebar(
-            selection: $selectedSidebarItemID,
+        // Custom binding so a USER click on a Library / Sources row
+        // clears any DSL-filled search text lingering from a previous
+        // HISTORY pick. Without this, clicking a HISTORY filter
+        // entry stuffs `source:claude` (or similar) into the toolbar,
+        // then clicking "Bookmarks" / "Sources → chatgpt" appears to
+        // do nothing — the DSL in `searchText` overrides the sidebar-
+        // derived scope in `composedQuery`, so the fetch query never
+        // actually matches what the user just clicked. Clearing
+        // `searchText` through the setter (NOT in `.onChange`) means
+        // it only fires for List-driven writes; the programmatic
+        // `selectedSidebarItemID = allThreads.id` inside
+        // `onSelectHistoryEntry` bypasses this setter and leaves the
+        // just-restored DSL in place.
+        let sidebarSelection = Binding<DesignMockSidebarItem.ID?>(
+            get: { selectedSidebarItemID },
+            set: { newValue in
+                if let newValue, newValue != selectedSidebarItemID {
+                    searchText = ""
+                }
+                selectedSidebarItemID = newValue
+            }
+        )
+        return DesignMockSidebar(
+            selection: sidebarSelection,
             sources: store.sources,
             promptBookmarks: store.promptBookmarks,
             databaseInfo: store.databaseInfo,
