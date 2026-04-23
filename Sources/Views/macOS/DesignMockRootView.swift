@@ -479,6 +479,11 @@ struct DesignMockRootView: View {
     /// because it still drives viewer-mode data, saved filters, and
     /// the (upcoming) prompt-level bookmark surface.
     @State private var libraryViewModel: LibraryViewModel?
+    /// Rolling list of recently-opened thread ids. Paired with the
+    /// filter history in the sidebar HISTORY section so "what did I
+    /// look at" is one surface, not two. Persisted to UserDefaults —
+    /// see `RecentThreadsStore` for cap / eviction rules.
+    @StateObject private var recentThreadsStore = RecentThreadsStore()
 
     var body: some View {
         rootSplitView
@@ -588,9 +593,42 @@ struct DesignMockRootView: View {
         .onChange(of: store.conversations.map(\.id)) { _, newIDs in
             repairSelectionIfNeeded(currentIDs: newIDs)
         }
+        // Record the "currently displayed" thread into the recent-
+        // threads store whenever it changes. We key the observer on
+        // the single-conversation id (not the whole selection set) so
+        // multi-select lassoes don't spam the history list — only
+        // "which thread is the reader showing" counts as an open.
+        // Debouncing isn't needed here because each id transition
+        // corresponds to a deliberate user pick; back-to-back writes
+        // only happen when the user is actively clicking, and the
+        // store's move-to-top semantics collapse same-id re-records.
+        .onChange(of: selectedConversation?.id) { _, _ in
+            recordCurrentThreadInHistory()
+        }
         .onAppear {
             repairSelectionIfNeeded(currentIDs: store.conversations.map(\.id))
+            // Seed with whatever is already displayed on first paint
+            // so the very first thread the user lands on shows up in
+            // History without needing to pick a second one first.
+            recordCurrentThreadInHistory()
         }
+    }
+
+    /// Shared entry point for "the reader is now showing this
+    /// thread". Reads the currently-displayed `DesignMockConversation`
+    /// and forwards its snapshot into `RecentThreadsStore`. No-op when
+    /// no thread is displayed (empty archive / stale selection
+    /// between fetches) so the history list doesn't develop phantom
+    /// rows.
+    private func recordCurrentThreadInHistory() {
+        guard let conv = selectedConversation else { return }
+        recentThreadsStore.record(
+            id: conv.id,
+            title: conv.title,
+            source: conv.source,
+            model: conv.model,
+            primaryTime: conv.updated
+        )
     }
 
     /// If the selection set is missing or stale (first launch, or the
@@ -698,6 +736,7 @@ struct DesignMockRootView: View {
             databaseInfo: store.databaseInfo,
             totalCount: store.totalCount,
             libraryViewModel: libraryViewModel,
+            recentThreads: recentThreadsStore.entries,
             onSelectHistoryEntry: { entry in
                 // Push the entry's filter back onto the toolbar field.
                 // The `.onChange(of: composedQuery)` wiring then re-runs
@@ -709,6 +748,25 @@ struct DesignMockRootView: View {
                 // filter and over-narrow the list.
                 searchText = DesignMockQueryLanguage.searchText(from: entry.filters)
                 selectedSidebarItemID = DesignMockSidebarItem.allThreads.id
+            },
+            onSelectRecentThread: { entry in
+                // Clicking a recent-thread history row = "open this
+                // thread again". We clear every filter surface so the
+                // target is guaranteed to be in the fetch page
+                // (sidebar narrowing or a stale search could otherwise
+                // filter it out and the click would silently land on
+                // whichever thread happens to be first in the
+                // narrowed list), then select it. Layout is forced to
+                // `.default` so the reader pane is visible — picking a
+                // thread from history should always show the thread,
+                // even when the user is currently in table mode.
+                searchText = ""
+                selectedSidebarItemID = DesignMockSidebarItem.allThreads.id
+                selectedConversationIDs = [entry.id]
+                selectedLayoutMode = .default
+            },
+            onRemoveRecentThread: { entry in
+                recentThreadsStore.remove(id: entry.id)
             }
         )
         .navigationSplitViewColumnWidth(min: 240, ideal: 270, max: 320)
@@ -869,11 +927,23 @@ private struct DesignMockSidebar: View {
     /// the shell; the HISTORY section below reads its `unifiedFilters`
     /// array, and Phase-4 prompt-bookmark surfaces will too.
     let libraryViewModel: LibraryViewModel?
+    /// Rolling list of recently-opened threads, rendered in the same
+    /// HISTORY section as filter history so the user sees "what I
+    /// searched" and "what I opened" in one surface.
+    let recentThreads: [RecentThreadsStore.Entry]
     /// Callback for when the user picks a history entry. The parent
     /// translates the entry's `ArchiveSearchFilter` back into the
     /// toolbar search field, which then flows through `composedQuery`
     /// → store fetch via the normal typing path.
     let onSelectHistoryEntry: (SavedFilterEntry) -> Void
+    /// Called when the user clicks a recent-thread row. Parent is
+    /// responsible for clearing filters and selecting the thread so
+    /// the reader pane updates.
+    let onSelectRecentThread: (RecentThreadsStore.Entry) -> Void
+    /// Called from the recent-thread row's context menu ("Remove from
+    /// history"). Lets users prune the list without affecting the
+    /// underlying thread.
+    let onRemoveRecentThread: (RecentThreadsStore.Entry) -> Void
     /// Which sources are currently expanded. We seed from `sources` on
     /// first appear *and* whenever the source list changes shape (e.g. a
     /// real-data fetch finally lands), so newly-visible multi-model
@@ -934,46 +1004,61 @@ private struct DesignMockSidebar: View {
                 }
             }
 
-            // HISTORY — the old Tags section's slot. Lists the 20 most
-            // recent + pinned filter entries from
-            // `LibraryViewModel.unifiedFilters`.
+            // HISTORY — the old Tags section's slot. Two parallel
+            // streams live here:
             //
-            // ⭐ behavior:
-            //   - unpinned row → pin silently (no modal). The row's
-            //     current auto-generated label sticks as the name.
+            //   1. Filter history (`SavedFiltersSection`) — pinned +
+            //      recent searches from `LibraryViewModel.unifiedFilters`.
+            //   2. Thread history (`RecentThreadRow` x N) — the
+            //      rolling list of threads the user recently opened.
+            //
+            // Both render under the same "History" header so "what I
+            // searched" and "what I opened" live in one glance. The
+            // section hides entirely when both streams are empty so
+            // the sidebar doesn't draw a headed-but-empty collapsible
+            // on a fresh DB.
+            //
+            // ⭐ behavior on the filter rows:
+            //   - unpinned row → pin silently (no modal). Keeps the
+            //     auto-generated label.
             //   - pinned row → open the rename alert pre-filled with
-            //     the current name. Second-tap-to-rename is the only
-            //     path to change a pinned entry's label from the
-            //     sidebar; "Unpin" lives on the context menu.
-            //
-            // Only renders when the VM has wired up and there's at
-            // least one entry — otherwise we'd draw an empty
-            // collapsible header with no body.
-            if let libraryViewModel, !libraryViewModel.unifiedFilters.isEmpty {
+            //     the current name. "Unpin" lives on the context
+            //     menu.
+            if historySectionHasContent {
                 Section("History") {
-                    SavedFiltersSection(
-                        entries: libraryViewModel.unifiedFilters,
-                        onSelect: { entry in
-                            onSelectHistoryEntry(entry)
-                        },
-                        onTogglePin: { entry in
-                            if entry.pinned {
-                                // Second tap on a pinned ⭐ = rename.
-                                // Pre-fill with current label so the
-                                // common case (tiny tweak to the name)
-                                // doesn't force retyping.
-                                renameDraftText = entry.name
-                                renamingEntry = entry
-                            } else {
-                                // First tap = pin silently. No modal
-                                // in the way of the common case.
-                                libraryViewModel.togglePinned(entry)
+                    if let libraryViewModel, !libraryViewModel.unifiedFilters.isEmpty {
+                        SavedFiltersSection(
+                            entries: libraryViewModel.unifiedFilters,
+                            onSelect: { entry in
+                                onSelectHistoryEntry(entry)
+                            },
+                            onTogglePin: { entry in
+                                if entry.pinned {
+                                    // Second tap on a pinned ⭐ = rename.
+                                    renameDraftText = entry.name
+                                    renamingEntry = entry
+                                } else {
+                                    // First tap = pin silently.
+                                    libraryViewModel.togglePinned(entry)
+                                }
+                            },
+                            onDelete: { entry in
+                                libraryViewModel.deleteFilterEntry(entry)
                             }
-                        },
-                        onDelete: { entry in
-                            libraryViewModel.deleteFilterEntry(entry)
-                        }
-                    )
+                        )
+                    }
+                    ForEach(recentThreads) { entry in
+                        RecentThreadRow(entry: entry)
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                onSelectRecentThread(entry)
+                            }
+                            .contextMenu {
+                                Button("Remove from History", role: .destructive) {
+                                    onRemoveRecentThread(entry)
+                                }
+                            }
+                    }
                 }
             }
         }
@@ -1010,6 +1095,16 @@ private struct DesignMockSidebar: View {
                 renamingEntry = nil
             }
         }
+    }
+
+    /// True when either the filter-history list or the recent-threads
+    /// list has something to show. Used to gate the whole "History"
+    /// section so an empty archive doesn't render a collapsible
+    /// header floating above nothing.
+    private var historySectionHasContent: Bool {
+        let hasFilters = libraryViewModel?.unifiedFilters.isEmpty == false
+        let hasThreads = !recentThreads.isEmpty
+        return hasFilters || hasThreads
     }
 
     private var databaseSubtitle: String? {
@@ -1848,6 +1943,45 @@ private struct FindInPageNavStrip: View {
         .shadow(color: .black.opacity(0.15), radius: 6, y: 3)
         .animation(.easeInOut(duration: 0.15), value: matchCount)
         .animation(.easeInOut(duration: 0.15), value: currentIndex)
+    }
+}
+
+/// Sidebar row for one `RecentThreadsStore.Entry`. Visually lighter
+/// than the main card list row — no snippet, no prompts count,
+/// just "title · model" — so the sidebar stays scannable even when
+/// the list fills up to its 20-entry cap. The model text takes the
+/// service's brand color (same as `ConversationRowView`) so the
+/// user can tell chatgpt vs claude vs gemini threads apart without
+/// reading the model string.
+private struct RecentThreadRow: View {
+    let entry: RecentThreadsStore.Entry
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "clock.arrow.circlepath")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .frame(width: 14, alignment: .center)
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text(entry.title)
+                    .lineLimit(1)
+                if let model = entry.model {
+                    Text(model)
+                        .font(.caption2)
+                        .lineLimit(1)
+                        .foregroundStyle(SourceAppearance.color(forModel: model))
+                } else if let source = entry.source {
+                    Text(source)
+                        .font(.caption2)
+                        .lineLimit(1)
+                        .foregroundStyle(SourceAppearance.color(for: source))
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 3)
+        .padding(.horizontal, 6)
     }
 }
 
