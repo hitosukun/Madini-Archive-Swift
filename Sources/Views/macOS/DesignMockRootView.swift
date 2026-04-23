@@ -881,9 +881,9 @@ private struct DesignMockSidebar: View {
     /// collapses of the ones they've already interacted with.
     @State private var expandedSources: Set<String> = []
     @State private var haveSeededExpansion: Bool = false
-    /// Drives the "name-on-pin" alert. Pinning an already-pinned row
-    /// routes around this (straight unpin) — only fresh pins or
-    /// rename-of-pinned rows materialize into the alert.
+    /// Drives the rename alert. Only materializes when the user clicks
+    /// ⭐ on an already-pinned row (second-tap-to-rename). Fresh
+    /// pins bypass this entirely — pinning is silent now.
     @State private var renamingEntry: SavedFilterEntry?
     @State private var renameDraftText: String = ""
 
@@ -936,12 +936,19 @@ private struct DesignMockSidebar: View {
 
             // HISTORY — the old Tags section's slot. Lists the 20 most
             // recent + pinned filter entries from
-            // `LibraryViewModel.unifiedFilters`. Hover-⭐ opens the
-            // rename alert to promote a recent row into a named /
-            // pinned entry; ⭐ on an already-pinned row unpins without
-            // prompting. Only renders when the VM has wired up and
-            // there's at least one entry — otherwise we'd draw an
-            // empty section header with no body.
+            // `LibraryViewModel.unifiedFilters`.
+            //
+            // ⭐ behavior:
+            //   - unpinned row → pin silently (no modal). The row's
+            //     current auto-generated label sticks as the name.
+            //   - pinned row → open the rename alert pre-filled with
+            //     the current name. Second-tap-to-rename is the only
+            //     path to change a pinned entry's label from the
+            //     sidebar; "Unpin" lives on the context menu.
+            //
+            // Only renders when the VM has wired up and there's at
+            // least one entry — otherwise we'd draw an empty
+            // collapsible header with no body.
             if let libraryViewModel, !libraryViewModel.unifiedFilters.isEmpty {
                 Section("History") {
                     SavedFiltersSection(
@@ -951,14 +958,16 @@ private struct DesignMockSidebar: View {
                         },
                         onTogglePin: { entry in
                             if entry.pinned {
-                                // Unpin path: no dialog, just flip the bit.
-                                libraryViewModel.togglePinned(entry)
-                            } else {
-                                // Fresh pin: pop the rename alert with
-                                // the entry's current (auto-generated
-                                // or previously saved) name pre-filled.
+                                // Second tap on a pinned ⭐ = rename.
+                                // Pre-fill with current label so the
+                                // common case (tiny tweak to the name)
+                                // doesn't force retyping.
                                 renameDraftText = entry.name
                                 renamingEntry = entry
+                            } else {
+                                // First tap = pin silently. No modal
+                                // in the way of the common case.
+                                libraryViewModel.togglePinned(entry)
                             }
                         },
                         onDelete: { entry in
@@ -975,29 +984,31 @@ private struct DesignMockSidebar: View {
         .onAppear {
             seedExpansionIfNeeded()
         }
-        // Rename alert. Using a binding-driven `.alert` (rather than a
-        // sheet) keeps this feeling like a lightweight "give this a
-        // name" gesture — the alert sits on top of the list without
-        // obscuring the row being named, matches macOS stock rename
-        // flows, and dismisses on ⏎ / ⎋ for free.
+        // Rename alert. Only materializes for pinned rows on a second
+        // ⭐ tap; first-time pinning skips this entirely. Using a
+        // binding-driven `.alert` keeps it feeling like a lightweight
+        // rename gesture — ⏎ saves, ⎋ cancels, and the tray behind
+        // stays visible so the user sees which row they're renaming.
         .alert(
-            "Name this search",
+            "Rename",
             isPresented: Binding(
                 get: { renamingEntry != nil },
                 set: { isPresented in if !isPresented { renamingEntry = nil } }
             ),
             presenting: renamingEntry
         ) { entry in
-            TextField("e.g. Q2 rollouts", text: $renameDraftText)
-            Button("Pin") {
+            TextField("Name", text: $renameDraftText)
+            Button("Save") {
+                // `renameAndPin` is safe to call on an already-pinned
+                // row — it skips the re-pin step and just writes the
+                // new label. Kept as the one entry point so we don't
+                // split the rename path across two VM methods.
                 libraryViewModel?.renameAndPin(entry, newName: renameDraftText)
                 renamingEntry = nil
             }
             Button("Cancel", role: .cancel) {
                 renamingEntry = nil
             }
-        } message: { _ in
-            Text("Pinning this search keeps it at the top of History under a name you'll recognize later.")
         }
     }
 
