@@ -2238,7 +2238,18 @@ private struct DesignMockReaderPaneContent: View {
                 emptyState
             }
         }
-        .background(.background)
+        // Paper-white backing (same `Color(nsColor: .textBackgroundColor)`
+        // the center-pane thread table uses) so the pinned
+        // `ConversationHeaderView`'s `NSVisualEffectView` material has
+        // the same opaque white surface to blur against as the center
+        // pane's picker strip does. The prior `.background(.background)`
+        // resolved to `windowBackgroundColor`, which is both grayer AND
+        // picks up the titlebar-transparency of the host window, so
+        // the right-pane header read as noticeably more see-through
+        // than the center-pane one despite both using the exact same
+        // `VisualEffectBar` helper — user's "右ペインは透過しすぎてる"
+        // report.
+        .background(Color(nsColor: .textBackgroundColor))
     }
 
     /// Combined task key: any of these three shifting means we need to
