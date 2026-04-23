@@ -530,7 +530,20 @@ private struct LoadedConversationDetailView: View {
                         )
                         .padding(.horizontal, 24)
                         .padding(.vertical, 10)
+                        // `VisualEffectBar` = `NSVisualEffectView` with
+                        // `.headerView` material. SwiftUI's `.bar`
+                        // material was unreliable here — it read as a
+                        // near-opaque tint whenever the message body
+                        // didn't happen to be scrolled under the
+                        // header, which is most of the time for short
+                        // conversations. The AppKit view gives real
+                        // translucent Finder-style chrome regardless
+                        // of the scroll position.
+                        #if os(macOS)
+                        .background { VisualEffectBar() }
+                        #else
                         .background(.bar)
+                        #endif
                     }
                     }
                 }

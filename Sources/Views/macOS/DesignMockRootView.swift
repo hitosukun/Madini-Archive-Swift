@@ -1686,14 +1686,21 @@ private struct DesignMockDefaultContentPane<TableContent: View>: View {
                             .padding(.bottom, 4)
                     }
                 }
-                // `.bar` material on the inset wrapper (NOT on the
-                // individual rows) so the whole strip — picker row +
-                // any error banner — sits on one continuous frosted
-                // pane, and the scroll content genuinely blurs behind
-                // it instead of showing through. No bottom divider: the
-                // blur edge against the non-frosted content below is
-                // sharp enough on its own.
-                .background(.bar)
+                // `NSVisualEffectView` with `.headerView` material via
+                // the `VisualEffectBar` helper — Finder's path-bar
+                // chrome. SwiftUI's `Material.bar` in a `.background(...)`
+                // call is flaky here: it only renders as real frosted
+                // glass when opaque pixels happen to sit behind it, and
+                // on an empty pane (or during the first scroll frame
+                // before content reaches the inset) it falls back to a
+                // near-opaque tint with no blur. Reaching for the
+                // AppKit view directly gives consistent translucent
+                // chrome regardless of what's momentarily behind it.
+                // No bottom divider; the blur edge against the pane's
+                // non-frosted content below is sharp enough on its own.
+                .background {
+                    VisualEffectBar()
+                }
             }
     }
 
