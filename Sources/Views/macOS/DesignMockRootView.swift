@@ -2646,11 +2646,15 @@ private struct DesignMockSidebarItem: Identifiable {
             AnyShapeStyle(DesignMockSource.color(for: source))
         case .model(let source, _):
             AnyShapeStyle(DesignMockSource.color(for: source))
-        case .bookmarks:
-            AnyShapeStyle(.yellow)
         case .tag:
             AnyShapeStyle(.purple)
         default:
+            // Bookmarks used to render in yellow to match the bookmark
+            // pill color the reader uses on individual prompts, but it
+            // stuck out as the only bright icon in the Library section
+            // (All / Archive DB / Auto-intake all use the default
+            // secondary style). Folded into the default branch so the
+            // whole Library section reads as one neutral column.
             AnyShapeStyle(.secondary)
         }
     }

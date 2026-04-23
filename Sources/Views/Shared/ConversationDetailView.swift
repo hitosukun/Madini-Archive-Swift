@@ -261,16 +261,65 @@ private struct LoadedConversationDetailView: View {
     /// self-healing even if a scroll is interrupted.
     @State private var programmaticScrollLock: UUID?
 
+    /// Internal one-shot that fires when the pinned header row is
+    /// double-clicked. Unlike `scrollToTopToken` (which is an external
+    /// `@Binding` — `.constant(nil)` in call sites that don't care,
+    /// silently dropping writes), this is live @State so a double-tap
+    /// always round-trips through the `.onChange` handler below.
+    @State private var internalScrollToTopToken: UUID?
+
     var body: some View {
         let detailBody = Group {
             if shouldUseDocumentViewer {
                 DocumentConversationView(detail: detail)
             } else {
                 ScrollViewReader { proxy in
-                    ScrollView {
+                    VStack(spacing: 0) {
+                        // Pinned thread-title / metadata row. Extracted
+                        // from the scroll content (where it used to
+                        // sit at the top of the LazyVStack) so it
+                        // stays on-screen as the user scrolls through
+                        // a long conversation — same affordance the
+                        // user relies on in Mail's message header /
+                        // Finder's path bar. Double-clicking the row
+                        // scrolls back to the conversation's top,
+                        // making the same strip serve as a
+                        // "jump home" target. The scroll animation
+                        // reuses the existing `scrollToTopToken`
+                        // plumbing so external callers (outline
+                        // popover's "top" action, etc.) still work.
+                        ConversationHeaderView(
+                            summary: detail.summary,
+                            onDoubleTapToTop: {
+                                // A fresh UUID so two rapid double-
+                                // clicks both register — `.onChange`
+                                // only fires on value transitions.
+                                internalScrollToTopToken = UUID()
+                            }
+                        )
+                        .padding(.horizontal, 24)
+                        .padding(.vertical, 10)
+                        .background(.regularMaterial)
+                        .overlay(alignment: .bottom) {
+                            // Hairline separator between the pinned
+                            // header and the scroll content. `.bar`
+                            // material + divider is the AppKit idiom
+                            // for a source-list / inspector header.
+                            Divider()
+                        }
+                        ScrollView {
                         LazyVStack(alignment: .leading, spacing: 0) {
-                            ConversationHeaderView(summary: detail.summary)
-                                .padding(.bottom, 16)
+                            // Invisible top-anchor. `ConversationHeaderView`
+                            // used to carry `Self.topAnchorID`, but the
+                            // header was promoted to a pinned strip
+                            // above the ScrollView and no longer lives
+                            // inside `LazyVStack`. A zero-height
+                            // `Color.clear` anchor keeps the existing
+                            // `proxy.scrollTo(topAnchorID)` call-sites
+                            // working without needing to reach into the
+                            // header, and renders nothing visible.
+                            Color.clear
+                                .frame(height: 0)
                                 .id(Self.topAnchorID)
 
                             ForEach(Array(detail.messages.enumerated()), id: \.element.id) { index, message in
@@ -453,32 +502,29 @@ private struct LoadedConversationDetailView: View {
                     // next tap reassigns and re-triggers this handler.
                     .onChange(of: scrollToTopToken) { _, newValue in
                         guard newValue != nil else { return }
-                        // Hold the programmatic-scroll lock for the
-                        // same reason the prompt-tap path does: the
-                        // scroll observer would otherwise spot the
-                        // first prompt crossing the threshold
-                        // mid-animation and re-write
-                        // `selectedPromptID` away from our deliberate
-                        // nil, undoing the "no prompt highlighted at
-                        // the header" visual.
-                        let token = UUID()
-                        programmaticScrollLock = token
-                        scrollDrivenSelection = nil
-                        selectedPromptID = nil
-                        withAnimation(.easeInOut(duration: 0.2)) {
-                            proxy.scrollTo(Self.topAnchorID, anchor: .top)
-                        }
-                        Task { @MainActor in
-                            try? await Task.sleep(nanoseconds: 450_000_000)
-                            if programmaticScrollLock == token {
-                                programmaticScrollLock = nil
-                            }
-                        }
+                        performScrollToTop(using: proxy)
                         // Clear so consecutive taps with the same
                         // trivial outcome still fire a change event.
                         Task { @MainActor in
                             scrollToTopToken = nil
                         }
+                    }
+                    // Internal scroll-to-top, driven by a double-click
+                    // on the pinned header row. Kept separate from
+                    // `scrollToTopToken` (the external binding) so
+                    // the header still reaches the top when no
+                    // external caller wired the binding — in the
+                    // DesignMock shell the binding resolves to
+                    // `.constant(nil)`, and writing to a constant
+                    // sink is a no-op. A local state token bypasses
+                    // that and funnels into the same helper.
+                    .onChange(of: internalScrollToTopToken) { _, newValue in
+                        guard newValue != nil else { return }
+                        performScrollToTop(using: proxy)
+                        Task { @MainActor in
+                            internalScrollToTopToken = nil
+                        }
+                    }
                     }
                 }
             }
@@ -570,6 +616,31 @@ private struct LoadedConversationDetailView: View {
         programmaticScrollLock = token
         withAnimation(.easeInOut(duration: 0.2)) {
             proxy.scrollTo(id, anchor: .top)
+        }
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 450_000_000)
+            if programmaticScrollLock == token {
+                programmaticScrollLock = nil
+            }
+        }
+    }
+
+    /// Scroll the body back to `Self.topAnchorID`. Shared by the
+    /// external `scrollToTopToken` binding (outline popover, future
+    /// imperative callers) and the internal double-click-on-pinned-
+    /// header gesture. Clears the prompt selection first so
+    /// `scrollToSelectedPrompt` doesn't yank the viewport back to a
+    /// mid-body position on the next layout pass, then holds the
+    /// programmatic-scroll lock while the animation runs so the
+    /// scroll-position observer can't repopulate `selectedPromptID`
+    /// with the first prompt crossing the threshold mid-flight.
+    private func performScrollToTop(using proxy: ScrollViewProxy) {
+        let token = UUID()
+        programmaticScrollLock = token
+        scrollDrivenSelection = nil
+        selectedPromptID = nil
+        withAnimation(.easeInOut(duration: 0.2)) {
+            proxy.scrollTo(Self.topAnchorID, anchor: .top)
         }
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 450_000_000)
@@ -714,9 +785,35 @@ private struct DocumentConversationView: View {
 
 private struct ConversationHeaderView: View {
     let summary: ConversationSummary
+    /// Fired on double-click (and tap-twice on iPadOS) when the caller
+    /// wants the row to double as a "back to top" affordance. `nil`
+    /// means "decorative header only, don't attach the gesture" — used
+    /// by layout paths that keep this view inline inside the scroll
+    /// content (where a double-tap-to-top gesture would be surprising
+    /// because the header is already at the top). The pinned-above-
+    /// the-ScrollView rendering passes a live closure that fires the
+    /// ScrollViewReader's top-anchor jump.
+    var onDoubleTapToTop: (() -> Void)? = nil
 
     var body: some View {
         HStack(spacing: 8) {
+            // Thread title on the left, time + source pill on the
+            // right. Title gets `layoutPriority(1)` + `Spacer()` push
+            // so it absorbs available width without shoving the
+            // metadata off-screen; truncation happens on the title
+            // first, which is the right default (the metadata is
+            // always short — a pill plus a formatted date — and is
+            // what the user scans to identify the thread at a
+            // glance). `textSelection(.enabled)` so the title is
+            // copy-paste-friendly.
+            Text(summary.title ?? "Untitled")
+                .font(.callout.weight(.semibold))
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .foregroundStyle(.primary)
+                .textSelection(.enabled)
+                .layoutPriority(1)
+
             Spacer(minLength: 8)
 
             // Source-origin pill sits immediately to the LEFT of the
@@ -737,6 +834,15 @@ private struct ConversationHeaderView: View {
             }
         }
         .padding(.horizontal, 4)
+        // Hit-test the whole row (including the Spacer) so a
+        // double-click anywhere in the pinned header — not just on
+        // the title text — registers as "jump to top". Without
+        // `contentShape` the gap between the title and the pill
+        // would be dead space.
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2) {
+            onDoubleTapToTop?()
+        }
     }
 
 }
