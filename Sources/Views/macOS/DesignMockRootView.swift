@@ -807,16 +807,21 @@ struct DesignMockRootView: View {
                 }
             }
         case .default:
-            // The `.id(...)` on the NavigationSplitView forces a rebuild
-            // when the center display mode flips. `navigationSplitViewColumnWidth`
-            // only influences the *initial* layout of a given split-view
-            // instance — without the identity change, switching from cards
-            // (narrow center) to table (wider center) would leave the pane
-            // stuck at whichever width was active first. Rebuilding makes
-            // SwiftUI adopt the new ideal. The per-mode ideal comes from
-            // `currentCenterIdeal`, which reads whichever `@AppStorage` slot
-            // matches the active mode, so user drag-resizes survive across
-            // launches.
+            // Center pane is just the thread list now — no header strip,
+            // no in-pane view-mode switcher. The picker (Table vs Cards)
+            // and the "N threads" count were removed per user request;
+            // the Table option lived on as a separate outer layout mode
+            // (`.table`) reached from the window toolbar, and the count
+            // wasn't worth the vertical real estate it consumed above
+            // the card list. Loading and error states still surface —
+            // in-flight pagination shows the inline spinner at the list
+            // footer, and `store.lastError` is surfaced via the shell's
+            // toolbar / status chrome rather than a per-pane banner.
+            //
+            // The `.id(...)` on the NavigationSplitView keeps a stable
+            // identity for the default layout so SwiftUI doesn't tear
+            // down and rebuild the pane as sidebar selection / filter
+            // state churns.
             NavigationSplitView {
                 sidebar
             } content: {
@@ -824,15 +829,12 @@ struct DesignMockRootView: View {
                     AutoIntakePane()
                         .navigationSplitViewColumnWidth(min: 320, ideal: currentCenterIdeal, max: 760)
                 } else {
-                    DesignMockDefaultContentPane(
+                    DesignMockThreadListPane(
                         conversations: store.conversations,
-                        conversationSelection: $selectedConversationIDs,
+                        selection: $selectedConversationIDs,
                         pendingPromptID: $pendingPromptID,
                         expandedPromptConversationID: $expandedPromptConversationID,
-                        totalCount: store.totalCount,
-                        isLoading: store.isLoading,
                         isLoadingMore: store.isLoadingMore,
-                        lastError: store.lastError,
                         onReachEnd: {
                             store.loadMoreIfNeeded(services: services)
                         }
@@ -1473,15 +1475,45 @@ private struct DesignMockThreadListPane: View {
                 ForEach(conversations) { conversation in
                     DesignMockConversationListRow(conversation: conversation)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                        // Selection highlight is applied INSIDE the
+                        // horizontal padding (background layer before
+                        // `.padding(.horizontal, 12)`) rather than
+                        // around the whole row. Two reasons:
+                        //
+                        // 1. Bleed-through. The selection tint is
+                        //    `Color.accentColor.opacity(0.14)` over
+                        //    paper-white. If the highlight ran edge-
+                        //    to-edge, the leftmost few points of the
+                        //    middle pane would be faintly blue, and
+                        //    `NavigationSplitView`'s sidebar — which
+                        //    uses a `withinWindow`-blended
+                        //    `NSVisualEffectView` — would blur those
+                        //    blue pixels and the tint would show
+                        //    through behind the sidebar (user report:
+                        //    "水色ハイライトがサイドバーの裏側まで
+                        //    貫通して透過してる"). Inset the tint by
+                        //    the padding and the sidebar sees only
+                        //    paper-white at the pane boundary, with
+                        //    nothing to blur through.
+                        //
+                        // 2. Chrome consistency. Mail / Finder / Notes
+                        //    all render list selection as an inset
+                        //    rounded rectangle rather than a full-
+                        //    width strip; the inset highlight reads
+                        //    as "a pill around this row" instead of
+                        //    "a colored band across the pane".
+                        .background(
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                .fill(
+                                    selection.contains(conversation.id)
+                                        ? Color.accentColor.opacity(0.14)
+                                        : Color.clear
+                                )
+                        )
                         .padding(.horizontal, 12)
                         // Padding is INSIDE the hit shape — tapping in
                         // the edge margin still registers as the row.
                         .contentShape(Rectangle())
-                        .background(
-                            selection.contains(conversation.id)
-                                ? Color.accentColor.opacity(0.14)
-                                : Color.clear
-                        )
                         // `.id(conversation.id)` attaches a
                         // `ScrollViewReader`-visible anchor to each row,
                         // so `proxy.scrollTo(id, anchor: .top)` lands
@@ -1588,124 +1620,6 @@ private struct DesignMockThreadListPane: View {
     private var expandedConversation: DesignMockConversation? {
         guard let expandedPromptConversationID else { return nil }
         return conversations.first { $0.id == expandedPromptConversationID }
-    }
-}
-
-private struct DesignMockDefaultContentPane: View {
-    let conversations: [DesignMockConversation]
-    @Binding var conversationSelection: Set<DesignMockConversation.ID>
-    @Binding var pendingPromptID: String?
-    @Binding var expandedPromptConversationID: DesignMockConversation.ID?
-    let totalCount: Int
-    let isLoading: Bool
-    let isLoadingMore: Bool
-    let lastError: String?
-    let onReachEnd: () -> Void
-
-    var body: some View {
-        // `.safeAreaInset(edge: .top)` instead of a plain VStack so the
-        // scroll content (table rows / cards / gallery tiles) flows
-        // BEHIND the header strip and the `.bar` material frosts what's
-        // underneath — the same "frosted glass" chrome Finder / Mail /
-        // Safari use for their pinned header rows. In a plain VStack
-        // the header sat ABOVE the content and nothing scrolled behind
-        // it, so `.bar` rendered against the window background and the
-        // chrome didn't actually participate in any blur. With a safe-
-        // area inset, AppKit's NSScrollView extends its clip bounds up
-        // under the inset and the material has real content to blur,
-        // which is what makes the strip read as translucent glass
-        // rather than an opaque-ish solid bar.
-        contentView
-            .safeAreaInset(edge: .top, spacing: 0) {
-                VStack(spacing: 0) {
-                    // Top strip: thread-count (plus an optional spinner
-                    // while the first page loads) hugs the RIGHT.
-                    // Vertical padding matches the reader pane's pinned
-                    // `ConversationHeaderView` (`.padding(.vertical, 10)`)
-                    // so the two bar heights line up pixel-for-pixel
-                    // across the split-view seam.
-                    //
-                    // The view-mode picker that used to live on the left
-                    // (Table vs Cards) was removed — default mode now
-                    // renders only the card list. Table view survives
-                    // as the separate `.table` outer layout mode
-                    // reached from the window toolbar, which is the
-                    // mode where the table actually has room to
-                    // breathe. Having a duplicate table option inside
-                    // default mode fought the narrow center pane and
-                    // ran into repeated horizontal-scroll issues that
-                    // were never worth the feature.
-                    HStack(spacing: 12) {
-                        Spacer()
-
-                        // Count / load status. Keeps the "N threads"
-                        // total visible at the top of the pane so the
-                        // user always knows the scope of what the
-                        // keyword query is searching, and shows a
-                        // spinner while the first page is still loading.
-                        if isLoading && conversations.isEmpty {
-                            ProgressView()
-                                .controlSize(.small)
-                        }
-
-                        Text(countLabel)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .monospacedDigit()
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 10)
-
-                    if let lastError {
-                        Text(lastError)
-                            .font(.caption)
-                            .foregroundStyle(.red)
-                            .padding(.horizontal, 12)
-                            .padding(.bottom, 4)
-                    }
-                }
-                // Layer stack (back → front):
-                //   1. opaque paper-white (`textBackgroundColor`), the
-                //      same color the thread table's NSTableView paints.
-                //   2. `VisualEffectBar` (`.headerView` material).
-                //   3. the picker / count labels above.
-                //
-                // Pinning the paper-white backing directly to the inset
-                // (rather than relying on a pane-level background) keeps
-                // the strip consistent across layout-mode transitions
-                // — SwiftUI can re-attach the inset before the outer
-                // pane background re-commits, and without a local
-                // backing the material would render against raw window
-                // chrome for a few frames (way too see-through). The
-                // right-pane header uses the same stacking for the
-                // same reason.
-                .background { VisualEffectBar() }
-                .background(Color(nsColor: .textBackgroundColor))
-            }
-    }
-
-    private var countLabel: String {
-        // Show only the denominator (the DB total). The previously
-        // displayed `loaded / total` fraction exposed the pagination
-        // cursor, which is internal plumbing the user doesn't need
-        // to see — what matters is the scope of the current filter.
-        // `totalCount == 0` falls back to the in-memory list so the
-        // label still renders meaningfully before the count query
-        // resolves.
-        let total = totalCount > 0 ? totalCount : conversations.count
-        return "\(total) threads"
-    }
-
-    @ViewBuilder
-    private var contentView: some View {
-        DesignMockThreadListPane(
-            conversations: conversations,
-            selection: $conversationSelection,
-            pendingPromptID: $pendingPromptID,
-            expandedPromptConversationID: $expandedPromptConversationID,
-            isLoadingMore: isLoadingMore,
-            onReachEnd: onReachEnd
-        )
     }
 }
 

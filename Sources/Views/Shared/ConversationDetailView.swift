@@ -261,13 +261,6 @@ private struct LoadedConversationDetailView: View {
     /// self-healing even if a scroll is interrupted.
     @State private var programmaticScrollLock: UUID?
 
-    /// Internal one-shot that fires when the pinned header row is
-    /// double-clicked. Unlike `scrollToTopToken` (which is an external
-    /// `@Binding` — `.constant(nil)` in call sites that don't care,
-    /// silently dropping writes), this is live @State so a double-tap
-    /// always round-trips through the `.onChange` handler below.
-    @State private var internalScrollToTopToken: UUID?
-
     var body: some View {
         let detailBody = Group {
             if shouldUseDocumentViewer {
@@ -275,34 +268,35 @@ private struct LoadedConversationDetailView: View {
             } else {
                 ScrollViewReader { proxy in
                     VStack(spacing: 0) {
-                        // Pinned thread-title / metadata row is attached
-                        // to the ScrollView below via `.safeAreaInset(
-                        // edge: .top)` rather than sitting above it in
-                        // this VStack. That lets the scroll content
-                        // pass UNDER the header row so a `.bar`
-                        // material on the inset genuinely blurs what's
-                        // scrolling behind it — the frosted-glass
-                        // chrome Finder / Mail / Safari use for their
-                        // pinned headers. In a plain stacked layout
-                        // there's nothing behind the header for the
-                        // material to blur, so it reads as a flat
-                        // opaque bar with a visible seam against the
-                        // window toolbar above, which is exactly what
-                        // the user asked to fix ("スクロールに対して
-                        // すりガラスのように透過").
+                        // Thread-title / metadata row lives INSIDE the
+                        // scroll content (first element in the
+                        // LazyVStack) rather than as a pinned
+                        // `.safeAreaInset(edge: .top)` strip above the
+                        // ScrollView. It used to be pinned so a frosted-
+                        // glass chrome could blur scrolling content
+                        // behind it, but the user asked to unpin the
+                        // header so it scrolls away naturally with the
+                        // rest of the conversation — no persistent
+                        // strip at the top of the reader. The
+                        // `VisualEffectBar` backing and the `.safeArea`
+                        // plumbing went with it. Double-tap-to-top is
+                        // also dropped: once the header scrolls away,
+                        // there's nothing to double-tap, and the
+                        // `scrollToTopToken` external binding still
+                        // routes through the `Self.topAnchorID` that
+                        // the header now carries inline.
                         ScrollView {
                         LazyVStack(alignment: .leading, spacing: 0) {
-                            // Invisible top-anchor. `ConversationHeaderView`
-                            // used to carry `Self.topAnchorID`, but the
-                            // header was promoted to a pinned strip
-                            // above the ScrollView and no longer lives
-                            // inside `LazyVStack`. A zero-height
-                            // `Color.clear` anchor keeps the existing
-                            // `proxy.scrollTo(topAnchorID)` call-sites
-                            // working without needing to reach into the
-                            // header, and renders nothing visible.
-                            Color.clear
-                                .frame(height: 0)
+                            // Inline conversation header. Carries
+                            // `Self.topAnchorID` so `proxy.scrollTo(
+                            // topAnchorID)` call-sites (scroll-to-top
+                            // token, external "jump to top" requests)
+                            // still land at the header row — same
+                            // anchor id the old invisible `Color.clear`
+                            // placeholder used to carry when the header
+                            // was a pinned safe-area inset.
+                            ConversationHeaderView(summary: detail.summary)
+                                .padding(.bottom, 16)
                                 .id(Self.topAnchorID)
 
                             ForEach(Array(detail.messages.enumerated()), id: \.element.id) { index, message in
@@ -492,73 +486,14 @@ private struct LoadedConversationDetailView: View {
                             scrollToTopToken = nil
                         }
                     }
-                    // Internal scroll-to-top, driven by a double-click
-                    // on the pinned header row. Kept separate from
-                    // `scrollToTopToken` (the external binding) so
-                    // the header still reaches the top when no
-                    // external caller wired the binding — in the
-                    // DesignMock shell the binding resolves to
-                    // `.constant(nil)`, and writing to a constant
-                    // sink is a no-op. A local state token bypasses
-                    // that and funnels into the same helper.
-                    .onChange(of: internalScrollToTopToken) { _, newValue in
-                        guard newValue != nil else { return }
-                        performScrollToTop(using: proxy)
-                        Task { @MainActor in
-                            internalScrollToTopToken = nil
-                        }
-                    }
-                    // Frosted-glass pinned header. Attaching the
-                    // `ConversationHeaderView` as a top safe-area
-                    // inset (rather than stacking it above the
-                    // ScrollView in a VStack) is what makes the
-                    // material actually translucent: the scroll
-                    // content flows UP under the inset and the
-                    // `.bar` material blurs it, same as Finder's
-                    // path bar or Mail's message header. Double-
-                    // click routes through `internalScrollToTopToken`
-                    // so the strip also doubles as a "jump to top"
-                    // affordance; `scrollToTopToken` (the external
-                    // binding) keeps working unchanged for outline-
-                    // popover / keyboard call sites.
-                    .safeAreaInset(edge: .top, spacing: 0) {
-                        ConversationHeaderView(
-                            summary: detail.summary,
-                            onDoubleTapToTop: {
-                                internalScrollToTopToken = UUID()
-                            }
-                        )
-                        .padding(.horizontal, 24)
-                        .padding(.vertical, 10)
-                        // Layer stack (back → front):
-                        //   1. opaque paper-white (`textBackgroundColor`)
-                        //   2. `VisualEffectBar` (`.headerView` material)
-                        //   3. the `ConversationHeaderView` labels
-                        //
-                        // The paper-white layer is what kept the center
-                        // pane looking consistent — its thread table
-                        // already paints that color as its NSTableView
-                        // background, so the inset's material always
-                        // has an opaque surface to blur. The right
-                        // pane used to rely on the outer-`Group`
-                        // `.background(...)` for that surface, but
-                        // during a mode transition (user flips outer
-                        // layout → `.default` while a thread is already
-                        // selected) the outer background hadn't re-
-                        // committed before the inset re-attached, and
-                        // the material rendered against bare window
-                        // chrome for a few frames — way too see-
-                        // through, user's "別のモードから切り替えた
-                        // 時にそうなる" report. Pinning the backing
-                        // color directly to the inset closes that
-                        // timing window.
-                        #if os(macOS)
-                        .background { VisualEffectBar() }
-                        .background(Color(nsColor: .textBackgroundColor))
-                        #else
-                        .background(.bar)
-                        #endif
-                    }
+                    // Header used to live here as a pinned
+                    // `.safeAreaInset(edge: .top)` with a
+                    // `VisualEffectBar` frosted-glass backing. The
+                    // user asked to unpin it, so the header moved
+                    // inline into the LazyVStack above — it now
+                    // scrolls with the conversation body like any
+                    // other row, and there's no fixed strip at the
+                    // top of the reader.
                     }
                 }
             }
