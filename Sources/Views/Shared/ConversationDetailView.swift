@@ -275,42 +275,21 @@ private struct LoadedConversationDetailView: View {
             } else {
                 ScrollViewReader { proxy in
                     VStack(spacing: 0) {
-                        // Pinned thread-title / metadata row. Extracted
-                        // from the scroll content (where it used to
-                        // sit at the top of the LazyVStack) so it
-                        // stays on-screen as the user scrolls through
-                        // a long conversation — same affordance the
-                        // user relies on in Mail's message header /
-                        // Finder's path bar. Double-clicking the row
-                        // scrolls back to the conversation's top,
-                        // making the same strip serve as a
-                        // "jump home" target. The scroll animation
-                        // reuses the existing `scrollToTopToken`
-                        // plumbing so external callers (outline
-                        // popover's "top" action, etc.) still work.
-                        ConversationHeaderView(
-                            summary: detail.summary,
-                            onDoubleTapToTop: {
-                                // A fresh UUID so two rapid double-
-                                // clicks both register — `.onChange`
-                                // only fires on value transitions.
-                                internalScrollToTopToken = UUID()
-                            }
-                        )
-                        .padding(.horizontal, 24)
-                        .padding(.vertical, 10)
-                        // Fully transparent — NO explicit `.background(...)`.
-                        // The previous `.bar` material rendered a hair
-                        // darker than the window toolbar chrome and a
-                        // subtle seam was visible between the toolbar
-                        // and this pinned strip. Letting the pane /
-                        // window background show through untouched lets
-                        // the toolbar's titlebar blur extend straight
-                        // down into the strip so the seam disappears.
-                        // No bottom divider either; the material /
-                        // content shift below is enough structural
-                        // definition ("透過 / 境界線を消して 継ぎ目が
-                        // ない" per the user's request).
+                        // Pinned thread-title / metadata row is attached
+                        // to the ScrollView below via `.safeAreaInset(
+                        // edge: .top)` rather than sitting above it in
+                        // this VStack. That lets the scroll content
+                        // pass UNDER the header row so a `.bar`
+                        // material on the inset genuinely blurs what's
+                        // scrolling behind it — the frosted-glass
+                        // chrome Finder / Mail / Safari use for their
+                        // pinned headers. In a plain stacked layout
+                        // there's nothing behind the header for the
+                        // material to blur, so it reads as a flat
+                        // opaque bar with a visible seam against the
+                        // window toolbar above, which is exactly what
+                        // the user asked to fix ("スクロールに対して
+                        // すりガラスのように透過").
                         ScrollView {
                         LazyVStack(alignment: .leading, spacing: 0) {
                             // Invisible top-anchor. `ConversationHeaderView`
@@ -528,6 +507,30 @@ private struct LoadedConversationDetailView: View {
                         Task { @MainActor in
                             internalScrollToTopToken = nil
                         }
+                    }
+                    // Frosted-glass pinned header. Attaching the
+                    // `ConversationHeaderView` as a top safe-area
+                    // inset (rather than stacking it above the
+                    // ScrollView in a VStack) is what makes the
+                    // material actually translucent: the scroll
+                    // content flows UP under the inset and the
+                    // `.bar` material blurs it, same as Finder's
+                    // path bar or Mail's message header. Double-
+                    // click routes through `internalScrollToTopToken`
+                    // so the strip also doubles as a "jump to top"
+                    // affordance; `scrollToTopToken` (the external
+                    // binding) keeps working unchanged for outline-
+                    // popover / keyboard call sites.
+                    .safeAreaInset(edge: .top, spacing: 0) {
+                        ConversationHeaderView(
+                            summary: detail.summary,
+                            onDoubleTapToTop: {
+                                internalScrollToTopToken = UUID()
+                            }
+                        )
+                        .padding(.horizontal, 24)
+                        .padding(.vertical, 10)
+                        .background(.bar)
                     }
                     }
                 }

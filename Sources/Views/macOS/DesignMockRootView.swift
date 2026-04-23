@@ -1623,72 +1623,78 @@ private struct DesignMockDefaultContentPane<TableContent: View>: View {
     @ViewBuilder let tableContent: () -> TableContent
 
     var body: some View {
-        VStack(spacing: 0) {
-            // Top strip: view-mode picker hugs the LEFT edge; thread-count
-            // (plus an optional spinner while the first page loads) hugs
-            // the RIGHT. Vertical padding matches the reader pane's
-            // pinned `ConversationHeaderView` (`.padding(.vertical, 10)`)
-            // so the two bar heights line up pixel-for-pixel across the
-            // split-view seam. The strip carries NO explicit background —
-            // it's fully transparent so the window-toolbar blur above
-            // continues straight down into this row without any colour
-            // / material mismatch (user explicitly wanted "透過 / 境界線
-            // を消して 継ぎ目がない").
-            HStack(spacing: 12) {
-                Picker("Center View", selection: $displayMode) {
-                    ForEach(DesignMockCenterDisplayMode.allCases) { mode in
-                        Image(systemName: mode.symbol)
-                            .accessibilityLabel(Text(mode.title))
-                            .tag(mode)
+        // `.safeAreaInset(edge: .top)` instead of a plain VStack so the
+        // scroll content (table rows / cards / gallery tiles) flows
+        // BEHIND the header strip and the `.bar` material frosts what's
+        // underneath — the same "frosted glass" chrome Finder / Mail /
+        // Safari use for their pinned header rows. In a plain VStack
+        // the header sat ABOVE the content and nothing scrolled behind
+        // it, so `.bar` rendered against the window background and the
+        // chrome didn't actually participate in any blur. With a safe-
+        // area inset, AppKit's NSScrollView extends its clip bounds up
+        // under the inset and the material has real content to blur,
+        // which is what makes the strip read as translucent glass
+        // rather than an opaque-ish solid bar.
+        contentView
+            .safeAreaInset(edge: .top, spacing: 0) {
+                VStack(spacing: 0) {
+                    // Top strip: view-mode picker hugs the LEFT edge;
+                    // thread-count (plus an optional spinner while the
+                    // first page loads) hugs the RIGHT. Vertical padding
+                    // matches the reader pane's pinned
+                    // `ConversationHeaderView` (`.padding(.vertical, 10)`)
+                    // so the two bar heights line up pixel-for-pixel
+                    // across the split-view seam.
+                    HStack(spacing: 12) {
+                        Picker("Center View", selection: $displayMode) {
+                            ForEach(DesignMockCenterDisplayMode.allCases) { mode in
+                                Image(systemName: mode.symbol)
+                                    .accessibilityLabel(Text(mode.title))
+                                    .tag(mode)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .controlSize(.small)
+                        .frame(width: 92)
+
+                        Spacer()
+
+                        // Count / load status. Keeps the "N threads"
+                        // total visible at the top of the pane so the
+                        // user always knows the scope of what the
+                        // keyword query is searching, and shows a
+                        // spinner while the first page is still loading.
+                        if isLoading && conversations.isEmpty {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+
+                        Text(countLabel)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+
+                    if let lastError {
+                        Text(lastError)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .padding(.horizontal, 12)
+                            .padding(.bottom, 4)
                     }
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .controlSize(.small)
-                .frame(width: 92)
-
-                Spacer()
-
-                // Count / load status. Keeps the "N threads" total
-                // visible at the top of the pane so the user always
-                // knows the scope of what the keyword query is
-                // searching, and shows a spinner while the first page
-                // is still loading.
-                if isLoading && conversations.isEmpty {
-                    ProgressView()
-                        .controlSize(.small)
-                }
-
-                Text(countLabel)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
+                // `.bar` material on the inset wrapper (NOT on the
+                // individual rows) so the whole strip — picker row +
+                // any error banner — sits on one continuous frosted
+                // pane, and the scroll content genuinely blurs behind
+                // it instead of showing through. No bottom divider: the
+                // blur edge against the non-frosted content below is
+                // sharp enough on its own.
+                .background(.bar)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-            // Fully transparent — NO `.background(...)` at all. The
-            // previous `.bar` material rendered a hair darker than the
-            // window toolbar chrome, so a subtle seam was visible where
-            // this strip met the toolbar above. By letting the window /
-            // pane background show through untouched, the toolbar's
-            // titlebar blur extends straight down into this strip and
-            // the seam disappears. No bottom divider either — the
-            // material shift to the table / cards area below is enough
-            // structural definition.
-
-            if let lastError {
-                Text(lastError)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .padding(.horizontal, 12)
-                    .padding(.bottom, 4)
-                // No background here either — keeping the error banner
-                // transparent so it inherits the same seamless chrome
-                // as the strip above.
-            }
-
-            contentView
-        }
     }
 
     private var countLabel: String {
