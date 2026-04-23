@@ -37,6 +37,13 @@ struct ConversationDetailView: View {
     private let showsSystemChrome: Bool
     private let onDetailChanged: ((ConversationDetail?) -> Void)?
     private let onPromptOutlineChanged: (([ConversationPromptOutlineItem]) -> Void)?
+    /// Optional find-in-page spec forwarded down to every
+    /// `MessageBubbleView` via `EnvironmentValues.searchHighlight`. When
+    /// non-nil and non-empty, bubbles paint a keyword-level background
+    /// wash on matching substrings (orange on the active match, yellow
+    /// on others). Defaults to nil so call sites that don't use the
+    /// in-thread finder see no behavioral change.
+    private let searchHighlight: SearchHighlightSpec?
 
     init(
         conversationId: String,
@@ -46,6 +53,7 @@ struct ConversationDetailView: View {
         requestedPromptID: Binding<String?>? = nil,
         scrollToTopToken: Binding<UUID?>? = nil,
         showsSystemChrome: Bool = true,
+        searchHighlight: SearchHighlightSpec? = nil,
         onDetailChanged: ((ConversationDetail?) -> Void)? = nil,
         onPromptOutlineChanged: (([ConversationPromptOutlineItem]) -> Void)? = nil
     ) {
@@ -60,6 +68,7 @@ struct ConversationDetailView: View {
         externalRequestedPromptID = requestedPromptID
         externalScrollToTopToken = scrollToTopToken
         self.showsSystemChrome = showsSystemChrome
+        self.searchHighlight = searchHighlight
         self.onDetailChanged = onDetailChanged
         self.onPromptOutlineChanged = onPromptOutlineChanged
     }
@@ -98,6 +107,7 @@ struct ConversationDetailView: View {
                 detail: detail,
                 showsSystemChrome: showsSystemChrome
             )
+            .environment(\.searchHighlight, searchHighlight)
         } else if let errorText = viewModel.errorText {
             ContentUnavailableView(
                 "Couldn’t Load Conversation",

@@ -2,27 +2,530 @@
 import AppKit
 import SwiftUI
 
+/// Live data backing the macOS shell. Talks directly to `AppServices`
+/// repositories — no mock fallback once a database is attached. The store is
+/// the single source of truth for what the center pane lists, what facets the
+/// sidebar renders, what bookmarks/tags exist, and how big the archive is.
+///
+/// Every user intent (sidebar selection, search keystroke, sort change) is
+/// funneled through a `FetchQuery`. Setting a new query cancels the in-flight
+/// fetch and kicks a new one, so the UI doesn't flicker between stale / fresh
+/// results when the user types quickly.
+///
+/// Paging: the first page (`pageSize` rows) arrives via `refresh`; subsequent
+/// pages via `loadMore` when the center pane reports the last row appeared.
+/// `totalCount` drives the "N of M" badge and lets the loader stop early.
+@MainActor
+fileprivate final class DesignMockDataStore: ObservableObject {
+    @Published private(set) var conversations: [DesignMockConversation] = []
+    @Published private(set) var sources: [DesignMockSource] = []
+    @Published private(set) var bookmarks: [DesignMockBookmark] = []
+    @Published private(set) var tags: [TagEntry] = []
+    @Published private(set) var isLoading: Bool = false
+    @Published private(set) var isLoadingMore: Bool = false
+    @Published private(set) var lastError: String?
+    @Published private(set) var totalCount: Int = 0
+    @Published private(set) var databaseInfo: DatabaseInfo?
+    @Published private(set) var mode: Mode = .mock
+    /// Cached prompt outlines keyed by conversation id. Populated by
+    /// `promptOutline(for:services:)` — the center-pane card-expand view and
+    /// the right-pane prompt menu both read from here so tapping the same
+    /// conversation twice doesn't re-hit the DB.
+    @Published private(set) var promptOutlines: [String: [DesignMockPrompt]] = [:]
+
+    enum Mode: Equatable {
+        case mock
+        case database(path: String)
+    }
+
+    struct DatabaseInfo: Equatable {
+        let path: String
+        let sizeBytes: Int64?
+    }
+
+    /// User-driven fetch parameters. The view owns these as `@State` and
+    /// funnels changes through `setQuery(_:services:)` — the store is just the
+    /// executor, so it doesn't need to debounce or diff on its own.
+    struct FetchQuery: Equatable {
+        var keyword: String = ""
+        var source: String? = nil
+        var model: String? = nil
+        var bookmarksOnly: Bool = false
+        var tagName: String? = nil
+        var sortKey: ConversationSortKey = .dateDesc
+    }
+
+    private let pageSize = 200
+    private var currentQuery: FetchQuery = .init()
+    /// Identifies the in-flight fetch so results from a stale request (user
+    /// kept typing) are dropped instead of overwriting the fresh results.
+    private var activeFetchID: UUID?
+    private var activeLoadMoreID: UUID?
+    /// Offset into the current result set. Advanced by `loadMore`.
+    private var loadedOffset: Int = 0
+
+    init(initialConversations: [DesignMockConversation] = DesignMockData.sampleConversations) {
+        // Seed with the bundled sample so the window doesn't paint empty on
+        // first launch. Overwritten immediately once `load(services:)` runs
+        // against a real database (the mock sample is only ever visible in
+        // `.mock` mode, or in previews that never call `load`).
+        self.conversations = initialConversations
+        self.sources = DesignMockDataStore.sourcesFromMock(initialConversations)
+        self.totalCount = initialConversations.count
+    }
+
+    /// Kick the store into "real data" mode and run the initial fetches.
+    /// No-op when services is backed by mocks — the sample seed from `init`
+    /// stays visible so the UI has something to render in dev.
+    func load(services: AppServices) {
+        switch services.dataSource {
+        case .mock:
+            mode = .mock
+        case .database(let path):
+            mode = .database(path: path)
+            databaseInfo = Self.captureDatabaseInfo(path: path)
+            Task { await refreshAll(services: services) }
+        }
+    }
+
+    /// Run in parallel: conversations + facets + bookmarks + tags. Each of
+    /// these is independent, so bundling them into a task group keeps launch
+    /// latency to the slowest single query instead of their sum.
+    func refreshAll(services: AppServices) async {
+        async let convos: Void = refresh(services: services)
+        async let facets: Void = refreshSourceFacets(services: services)
+        async let bmarks: Void = refreshBookmarks(services: services)
+        async let tagList: Void = refreshTags(services: services)
+        _ = await (convos, facets, bmarks, tagList)
+    }
+
+    /// Apply a new user query (sidebar / search / sort). Cancelling any
+    /// in-flight fetch and starting a new one — last write wins, which is
+    /// exactly what we want for keystroke-driven search.
+    func setQuery(_ query: FetchQuery, services: AppServices) {
+        guard query != currentQuery else { return }
+        currentQuery = query
+        Task { await refresh(services: services) }
+    }
+
+    var currentFetchQuery: FetchQuery { currentQuery }
+
+    /// Reload the first page for the current query. Called on launch, on
+    /// query changes, and after any action that might have mutated the
+    /// archive (new import, bookmark toggle, tag change).
+    func refresh(services: AppServices) async {
+        let fetchID = UUID()
+        activeFetchID = fetchID
+        isLoading = true
+        lastError = nil
+        defer {
+            if activeFetchID == fetchID {
+                isLoading = false
+            }
+        }
+
+        do {
+            let filter = Self.buildFilter(from: currentQuery)
+            let page = try await fetchPage(
+                services: services,
+                filter: filter,
+                sortKey: currentQuery.sortKey,
+                offset: 0
+            )
+            guard activeFetchID == fetchID else { return }
+            conversations = page.rows
+            totalCount = page.total
+            loadedOffset = page.rows.count
+        } catch {
+            lastError = String(describing: error)
+        }
+    }
+
+    /// Fetch the next page, appending to `conversations`. The center pane
+    /// triggers this from an `.onAppear` on the last visible row. Guards
+    /// against concurrent calls so scrolling fast doesn't spawn duplicate
+    /// requests.
+    func loadMoreIfNeeded(services: AppServices) {
+        guard !isLoading, !isLoadingMore else { return }
+        guard conversations.count < totalCount else { return }
+
+        let loadID = UUID()
+        activeLoadMoreID = loadID
+        isLoadingMore = true
+        let offset = loadedOffset
+        let query = currentQuery
+
+        Task {
+            defer {
+                if self.activeLoadMoreID == loadID {
+                    self.isLoadingMore = false
+                }
+            }
+            do {
+                let filter = Self.buildFilter(from: query)
+                let page = try await self.fetchPage(
+                    services: services,
+                    filter: filter,
+                    sortKey: query.sortKey,
+                    offset: offset,
+                    knownTotal: self.totalCount
+                )
+                // Drop if the user changed query mid-flight.
+                guard self.activeLoadMoreID == loadID,
+                      self.currentQuery == query else { return }
+                self.conversations.append(contentsOf: page.rows)
+                self.loadedOffset += page.rows.count
+            } catch {
+                self.lastError = String(describing: error)
+            }
+        }
+    }
+
+    /// Resolve the prompt outline for a conversation — used by the expanded
+    /// card view in the middle pane. Async but idempotent; the first call
+    /// fetches the detail and caches the user-authored messages, subsequent
+    /// calls hit the cache.
+    func promptOutline(for conversationID: String, services: AppServices) async -> [DesignMockPrompt] {
+        if let cached = promptOutlines[conversationID] {
+            return cached
+        }
+        do {
+            guard let detail = try await services.conversations.fetchDetail(id: conversationID) else {
+                return []
+            }
+            let prompts = detail.messages
+                .enumerated()
+                .filter { $0.element.isUser }
+                .map { idx, message in
+                    DesignMockPrompt(
+                        id: message.id,
+                        index: idx,
+                        snippet: Self.snippet(from: message.content)
+                    )
+                }
+            promptOutlines[conversationID] = prompts
+            return prompts
+        } catch {
+            lastError = String(describing: error)
+            return []
+        }
+    }
+
+    // MARK: - Facet / bookmark / tag loaders
+
+    /// One DB round-trip that returns `(source, model, count)` triples we then
+    /// pivot in memory into the nested facet tree. Mirrors what
+    /// `LibraryViewModel.loadSourceFacets` does for the canonical sidebar.
+    func refreshSourceFacets(services: AppServices) async {
+        do {
+            let rows = try await services.conversations.fetchSourceModelFacets(filter: nil)
+            var totalsBySource: [String: Int] = [:]
+            var modelsBySource: [String: [DesignMockSourceModel]] = [:]
+            var order: [String] = []
+            for row in rows {
+                if totalsBySource[row.source] == nil { order.append(row.source) }
+                totalsBySource[row.source, default: 0] += row.count
+                if let model = row.model, !model.isEmpty {
+                    modelsBySource[row.source, default: []].append(
+                        DesignMockSourceModel(name: model, count: row.count)
+                    )
+                }
+            }
+            order.sort { lhs, rhs in
+                let lhsCount = totalsBySource[lhs] ?? 0
+                let rhsCount = totalsBySource[rhs] ?? 0
+                if lhsCount != rhsCount { return lhsCount > rhsCount }
+                return lhs < rhs
+            }
+            self.sources = order.map { name in
+                let models = (modelsBySource[name] ?? []).sorted { lhs, rhs in
+                    if lhs.count != rhs.count { return lhs.count > rhs.count }
+                    return lhs.name < rhs.name
+                }
+                return DesignMockSource(
+                    name: name,
+                    count: totalsBySource[name] ?? 0,
+                    models: models
+                )
+            }
+        } catch {
+            lastError = String(describing: error)
+        }
+    }
+
+    func refreshBookmarks(services: AppServices) async {
+        do {
+            let entries = try await services.bookmarks.listBookmarks()
+            // Only surface thread-level bookmarks in the sidebar — prompt /
+            // virtual-fragment / saved-view bookmarks each have their own
+            // semantics and can't be clicked through to a conversation as a
+            // single row.
+            bookmarks = entries.compactMap { entry in
+                guard entry.targetType == .thread else { return nil }
+                return DesignMockBookmark(
+                    bookmarkID: entry.bookmarkID,
+                    conversationID: entry.targetID,
+                    title: entry.title ?? entry.label,
+                    source: (entry.source ?? "unknown").lowercased(),
+                    model: entry.model ?? "—",
+                    updated: Self.formatUpdated(entry.primaryTime)
+                )
+            }
+        } catch {
+            lastError = String(describing: error)
+        }
+    }
+
+    func refreshTags(services: AppServices) async {
+        do {
+            tags = try await services.tags.listTags()
+        } catch {
+            lastError = String(describing: error)
+        }
+    }
+
+    // MARK: - Fetch helpers
+
+    private struct Page {
+        let rows: [DesignMockConversation]
+        let total: Int
+    }
+
+    /// Single fetch path — if the query has a keyword we go through FTS
+    /// (`SearchRepository`), otherwise through the index. This mirrors the
+    /// pattern `LibraryViewModel.fetchPage` uses for the canonical list.
+    private func fetchPage(
+        services: AppServices,
+        filter: ArchiveSearchFilter,
+        sortKey: ConversationSortKey,
+        offset: Int,
+        knownTotal: Int? = nil
+    ) async throws -> Page {
+        if !filter.normalizedKeyword.isEmpty {
+            let searchQuery = SearchQuery(filter: filter, offset: offset, limit: pageSize)
+            let results = try await services.search.search(query: searchQuery)
+            let total: Int
+            if let knownTotal {
+                total = knownTotal
+            } else {
+                total = try await services.search.count(query: searchQuery)
+            }
+            return Page(
+                rows: results.enumerated().map { idx, result in
+                    DesignMockConversation(
+                        id: result.conversationID,
+                        title: result.displayTitle,
+                        updated: Self.formatUpdated(result.primaryTime),
+                        sortRank: offset + idx,
+                        prompts: result.messageCount,
+                        source: (result.source ?? "unknown").lowercased(),
+                        model: result.model ?? "—",
+                        snippet: result.snippet.isEmpty ? nil : result.snippet
+                    )
+                },
+                total: total
+            )
+        } else {
+            let listQuery = ConversationListQuery(
+                offset: offset,
+                limit: pageSize,
+                sortBy: sortKey,
+                filter: filter
+            )
+            let rows = try await services.conversations.fetchIndex(query: listQuery)
+            let total: Int
+            if let knownTotal {
+                total = knownTotal
+            } else {
+                total = try await services.conversations.count(query: listQuery)
+            }
+            return Page(
+                rows: rows.enumerated().map { idx, summary in
+                    DesignMockConversation(
+                        id: summary.id,
+                        title: summary.displayTitle,
+                        updated: Self.formatUpdated(summary.primaryTime),
+                        sortRank: offset + idx,
+                        prompts: summary.messageCount,
+                        source: (summary.source ?? "unknown").lowercased(),
+                        model: summary.model ?? "—",
+                        snippet: nil
+                    )
+                },
+                total: total
+            )
+        }
+    }
+
+    private static func buildFilter(from query: FetchQuery) -> ArchiveSearchFilter {
+        var filter = ArchiveSearchFilter(keyword: query.keyword)
+        if let source = query.source {
+            filter.sources = [source]
+        }
+        if let model = query.model {
+            filter.models = [model]
+        }
+        if query.bookmarksOnly {
+            filter.bookmarkedOnly = true
+        }
+        if let tagName = query.tagName {
+            filter.bookmarkTags = [tagName]
+        }
+        return filter
+    }
+
+    private static func sourcesFromMock(_ convos: [DesignMockConversation]) -> [DesignMockSource] {
+        var totals: [String: Int] = [:]
+        var modelCounts: [String: [String: Int]] = [:]
+        for convo in convos {
+            totals[convo.source, default: 0] += 1
+            modelCounts[convo.source, default: [:]][convo.model, default: 0] += 1
+        }
+        return totals
+            .sorted { $0.value > $1.value }
+            .map { name, count in
+                let models = (modelCounts[name] ?? [:])
+                    .sorted { $0.key < $1.key }
+                    .map { DesignMockSourceModel(name: $0.key, count: $0.value) }
+                return DesignMockSource(name: name, count: count, models: models)
+            }
+    }
+
+    private static func captureDatabaseInfo(path: String) -> DatabaseInfo {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: path)
+        let size = attrs?[.size] as? Int64
+        return DatabaseInfo(path: path, sizeBytes: size)
+    }
+
+    // MARK: - Formatting
+
+    /// `primaryTime` is stored as an ISO-ish string in the archive; for row
+    /// display we only want a compact "Apr 18"-style label. Falling back to a
+    /// prefix of the raw string (or em dash) keeps exotic formats from
+    /// blanking the column entirely.
+    private static let isoFormatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    private static let fallbackISOFormatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+    private static let displayFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "MMM dd"
+        return f
+    }()
+
+    static func formatUpdated(_ raw: String?) -> String {
+        guard let raw, !raw.isEmpty else { return "—" }
+        if let date = isoFormatter.date(from: raw) ?? fallbackISOFormatter.date(from: raw) {
+            return displayFormatter.string(from: date)
+        }
+        return String(raw.prefix(10))
+    }
+
+    /// Collapse whitespace and trim to keep a prompt snippet to one visible
+    /// line in the expanded card list. Full text lives in the right pane.
+    private static func snippet(from text: String) -> String {
+        let collapsed = text
+            .replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\t", with: " ")
+        let trimmed = collapsed.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.count <= 140 { return trimmed }
+        return String(trimmed.prefix(140)) + "…"
+    }
+}
+
+/// Thread-level bookmark row shown in the sidebar Bookmarks section.
+fileprivate struct DesignMockBookmark: Identifiable, Hashable {
+    let bookmarkID: Int
+    let conversationID: String
+    let title: String
+    let source: String
+    let model: String
+    let updated: String
+
+    var id: Int { bookmarkID }
+}
+
+/// User-authored message displayed in the expanded-card prompt list.
+fileprivate struct DesignMockPrompt: Identifiable, Hashable {
+    let id: String
+    /// Position of the prompt within the conversation (0-indexed across only
+    /// user messages). Used for the "Prompt N" label.
+    let index: Int
+    let snippet: String
+}
+
 struct DesignMockRootView: View {
-    @Environment(\.isSearching) private var isSearching
+    @EnvironmentObject private var services: AppServices
+    @StateObject private var store = DesignMockDataStore()
     @State private var selectedSidebarItemID: DesignMockSidebarItem.ID? = DesignMockSidebarItem.allThreads.id
-    @State private var selectedConversationID: DesignMockConversation.ID? = DesignMockData.conversations.first?.id
+    /// Multi-selection storage. Was previously a single `ID?`, but the
+    /// user wanted to lasso-select multiple threads in both the table and
+    /// the card list and DnD-toggle tags onto the whole batch at once.
+    /// `Table` and `List` both accept a `Set` binding natively, so this
+    /// plugs straight in and SwiftUI auto-batches multi-selected drags
+    /// into a single drop delivery on tag rows.
+    @State private var selectedConversationIDs: Set<DesignMockConversation.ID> = []
     @State private var selectedLayoutMode: DesignMockLayoutMode = .default
     @State private var selectedCenterDisplayMode: DesignMockCenterDisplayMode = .cards
     @State private var searchText = ""
-    @State private var selectedPromptIndex = 0
     @State private var expandedPromptConversationID: DesignMockConversation.ID?
+    /// One-shot signal that bounces through `selectedPromptID` on the
+    /// reader side. Rotating a fresh UUID on tap re-fires the reader's
+    /// `requestedPromptID` binding even when the user taps the same
+    /// prompt twice.
+    @State private var pendingPromptID: String?
+    /// Shared library view-model. Hoisted to the shell (rather than
+    /// scoped to the reader) so the sidebar Tags section, the card /
+    /// table drop handlers, and the right-pane `ConversationTagsEditor`
+    /// all observe the same `conversationTags` map. Without a shared
+    /// VM, a DnD attach on a card wouldn't reflect in the popover
+    /// until the user forced a refresh.
+    @State private var libraryViewModel: LibraryViewModel?
 
     var body: some View {
         rootSplitView
-        .searchable(text: $searchText, prompt: "検索")
+        // Toolbar search field stays pinned in the same spot across all
+        // layout modes. Earlier iterations swapped `.searchable` out in
+        // focus mode for a reader-top find-in-page bar, but that caused
+        // the text field's on-screen position to jump when the user
+        // flipped into focus with a query already typed — disorienting
+        // enough that the user called it out explicitly. Focus mode now
+        // reuses this very field as the in-thread finder; only the
+        // prev/next + N/M nav strip lives inside the reader.
+        .searchable(text: $searchText, prompt: searchPrompt)
         .navigationTitle("")
         .toolbar {
+            // Toolbar sort picker removed — sort direction is now chosen
+            // per-column via the filter card's segmented picker, and the
+            // initial "global" sort lives implicitly in the DB query.
+
             ToolbarItem(placement: .primaryAction) {
-                DesignMockLayoutModePicker(selection: $selectedLayoutMode, isCompact: isSearching || !searchText.isEmpty)
+                DesignMockLayoutModePicker(selection: $selectedLayoutMode)
             }
 
             ToolbarItem(placement: .primaryAction) {
-                DesignMockToolbarIconButton(systemImage: "square.and.arrow.up", help: "Share")
+                // Native macOS share menu. Was previously a
+                // copy-to-clipboard fallback because the mock shell
+                // didn't have a handle on `ConversationDetail`
+                // (only the lightweight summary row) — the button
+                // now materializes the selected conversation as a
+                // temp Markdown file on demand and hands it to
+                // `ShareLink`, which opens the full
+                // `NSSharingServicePicker` (AirDrop / Mail /
+                // Messages / Notes / Save to Files / installed
+                // extensions), same as the detail-pane share.
+                DesignMockShareButton(
+                    conversation: selectedConversation,
+                    services: services
+                )
             }
         }
         .background(
@@ -34,6 +537,81 @@ struct DesignMockRootView: View {
                 window.minSize = NSSize(width: 980, height: 640)
             }
         )
+        .environmentObject(store)
+        .task {
+            // Build the shared library VM lazily — `@EnvironmentObject`
+            // isn't available in `init`, so we can't construct it in a
+            // `@StateObject` initializer. Doing it here runs once per
+            // view identity, which matches the lifecycle we want.
+            if libraryViewModel == nil {
+                libraryViewModel = LibraryViewModel(
+                    conversationRepository: services.conversations,
+                    searchRepository: services.search,
+                    bookmarkRepository: services.bookmarks,
+                    viewService: services.views,
+                    tagRepository: services.tags
+                )
+            }
+            // Initial load. Store no-ops for the `.mock` data source so the
+            // bundled sample remains visible in dev runs without a real DB.
+            store.load(services: services)
+        }
+        // Funnel sidebar / search / sort state into a single FetchQuery, then
+        // ship it to the store. Any change here triggers a fresh DB fetch
+        // (cancelling the previous one) so the center pane is always showing
+        // exactly what the current toolbar + sidebar configuration demands.
+        .onChange(of: composedQuery) { _, newQuery in
+            store.setQuery(newQuery, services: services)
+        }
+        // Keep one canonical "currently displayed" conversation across
+        // every layout mode. Without this, the selection set was free
+        // to stay empty on first launch (or after a fetch that
+        // invalidated the previous selection), and each mode
+        // independently papered over that with its own fallback —
+        // the reader showed `conversations.first`, but the table
+        // highlighted nothing, and switching modes felt like the app
+        // was quietly picking a different thread each time. Seeding /
+        // repairing the set here collapses those fallbacks into a
+        // single source of truth.
+        .onChange(of: store.conversations.map(\.id)) { _, newIDs in
+            repairSelectionIfNeeded(currentIDs: newIDs)
+            // Keep the VM's tag map in sync with the visible list —
+            // drop-toggle decisions (attach vs detach) read from
+            // `conversationTags`, and sidebar rows show usage / filter
+            // counts derived from the same data.
+            Task { await libraryViewModel?.refreshConversationTags(for: newIDs, replace: true) }
+        }
+        .onAppear {
+            repairSelectionIfNeeded(currentIDs: store.conversations.map(\.id))
+        }
+        // First-run refresh: once the VM exists, pull in whatever the
+        // store already has loaded (the `.onChange` above only fires on
+        // subsequent shape changes, not the initial `store.load`).
+        .task(id: libraryViewModel != nil) {
+            guard let vm = libraryViewModel else { return }
+            await vm.refreshConversationTags(for: store.conversations.map(\.id), replace: true)
+        }
+    }
+
+    /// If the selection set is missing or stale (first launch, or the
+    /// previous selection was filtered away by a sidebar / query
+    /// change), seed it with the first available conversation so all
+    /// three modes agree on what "the current thread" is. No-op when
+    /// at least one current id is still present — we never overwrite
+    /// a live multi-selection, which would fight the user's own tap.
+    private func repairSelectionIfNeeded(currentIDs: [DesignMockConversation.ID]) {
+        guard !currentIDs.isEmpty else { return }
+        let intersected = selectedConversationIDs.intersection(currentIDs)
+        if !intersected.isEmpty {
+            // Drop stale ids but keep the user's multi-select intent.
+            if intersected != selectedConversationIDs {
+                selectedConversationIDs = intersected
+            }
+            return
+        }
+        if let first = currentIDs.first {
+            selectedConversationIDs = [first]
+        }
     }
 
     @ViewBuilder
@@ -41,22 +619,17 @@ struct DesignMockRootView: View {
         switch selectedLayoutMode {
         case .table:
             NavigationSplitView {
-                DesignMockSidebar(selection: $selectedSidebarItemID)
-                    .navigationSplitViewColumnWidth(min: 240, ideal: 270, max: 320)
+                sidebar
             } detail: {
                 if showingAutoIntake {
                     AutoIntakePane()
                 } else {
-                    DesignMockThreadTablePane(
-                        conversations: filteredConversations,
-                        selection: $selectedConversationID
-                    )
+                    centerTable
                 }
             }
         case .default:
             NavigationSplitView {
-                DesignMockSidebar(selection: $selectedSidebarItemID)
-                    .navigationSplitViewColumnWidth(min: 240, ideal: 270, max: 320)
+                sidebar
             } content: {
                 if showingAutoIntake {
                     AutoIntakePane()
@@ -64,10 +637,19 @@ struct DesignMockRootView: View {
                 } else {
                     DesignMockDefaultContentPane(
                         displayMode: $selectedCenterDisplayMode,
-                        conversations: filteredConversations,
-                        conversationSelection: $selectedConversationID,
-                        selectedPromptIndex: $selectedPromptIndex,
-                        expandedPromptConversationID: $expandedPromptConversationID
+                        conversations: store.conversations,
+                        conversationSelection: $selectedConversationIDs,
+                        pendingPromptID: $pendingPromptID,
+                        expandedPromptConversationID: $expandedPromptConversationID,
+                        tableSortOrder: tableSortOrderBinding,
+                        totalCount: store.totalCount,
+                        isLoading: store.isLoading,
+                        isLoadingMore: store.isLoadingMore,
+                        lastError: store.lastError,
+                        onReachEnd: {
+                            store.loadMoreIfNeeded(services: services)
+                        },
+                        onDropTagsOnConversation: handleTagsDroppedOnConversation
                     )
                     .navigationSplitViewColumnWidth(min: 360, ideal: 460, max: 760)
                 }
@@ -75,115 +657,398 @@ struct DesignMockRootView: View {
                 if showingAutoIntake {
                     AutoIntakeDetailPlaceholder()
                 } else {
-                    DesignMockReaderPane(
-                        conversation: selectedConversation,
-                        selectedPromptIndex: $selectedPromptIndex,
-                        prompts: DesignMockData.promptSnippets
-                    )
+                    readerPane(inThreadSearch: nil)
                 }
             }
         case .viewer:
             NavigationSplitView {
-                DesignMockSidebar(selection: $selectedSidebarItemID)
-                    .navigationSplitViewColumnWidth(min: 240, ideal: 270, max: 320)
+                sidebar
             } detail: {
                 if showingAutoIntake {
                     AutoIntakePane()
                 } else {
-                    DesignMockReaderPane(
-                        conversation: selectedConversation,
-                        selectedPromptIndex: $selectedPromptIndex,
-                        prompts: DesignMockData.promptSnippets
-                    )
+                    readerPane(inThreadSearch: $searchText)
                 }
             }
         }
     }
 
-    private var selectedConversation: DesignMockConversation? {
-        guard let selectedConversationID else { return filteredConversations.first }
-        return DesignMockData.conversations.first { $0.id == selectedConversationID } ?? filteredConversations.first
-    }
-
-    private var filteredConversations: [DesignMockConversation] {
-        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        return DesignMockData.conversations.filter { item in
-            matchesSidebarFilter(item) && matchesSearch(item, query: query)
+    /// Reader pane wrapper. Gated on the shared `libraryViewModel` being
+    /// built — until then we show a placeholder so the reader, which
+    /// needs the VM via environment, doesn't crash on first mount.
+    @ViewBuilder
+    private func readerPane(inThreadSearch: Binding<String>?) -> some View {
+        if let libraryViewModel {
+            DesignMockReaderPane(
+                conversation: selectedConversation,
+                pendingPromptID: $pendingPromptID,
+                libraryViewModel: libraryViewModel,
+                inThreadSearch: inThreadSearch
+            )
+        } else {
+            ProgressView()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
-    private func matchesSidebarFilter(_ item: DesignMockConversation) -> Bool {
-        guard let selectedSidebarItemID else { return true }
-        switch DesignMockSidebarItem.kind(for: selectedSidebarItemID) {
-        case .all:
-            return true
-        case .project(let id):
-            return item.projectID == id
-        case .suggested:
-            if case .suggested = item.projectState { return true }
-            return false
-        case .unassigned:
-            if case .none = item.projectState { return true }
-            return false
+    private var sidebar: some View {
+        DesignMockSidebar(
+            selection: $selectedSidebarItemID,
+            sources: store.sources,
+            bookmarks: store.bookmarks,
+            tags: store.tags,
+            databaseInfo: store.databaseInfo,
+            totalCount: store.totalCount,
+            libraryViewModel: libraryViewModel,
+            onDropConversationsOnTag: handleConversationsDroppedOnTag
+        )
+        .navigationSplitViewColumnWidth(min: 240, ideal: 270, max: 320)
+    }
+
+    private var centerTable: some View {
+        DesignMockThreadTablePane(
+            conversations: store.conversations,
+            selection: $selectedConversationIDs,
+            sortOrder: tableSortOrderBinding,
+            isLoadingMore: store.isLoadingMore,
+            onReachEnd: {
+                store.loadMoreIfNeeded(services: services)
+            },
+            // Double-click / Return: promote into default mode so the
+            // reader pane appears alongside the now-smaller table. The
+            // selection is already set by the table's primaryAction
+            // callback, so the reader has the right conversation queued
+            // up when default mode mounts.
+            onOpen: { _ in
+                selectedLayoutMode = .default
+            },
+            onDropTagsOnConversation: handleTagsDroppedOnConversation
+        )
+    }
+
+    /// Toggle-style tag attach for a drop targeted at a single
+    /// conversation (card row or table row). For each dropped tag: if
+    /// it's already on the conversation, detach; else attach. Called
+    /// from both the card list and the table's cell drop handlers.
+    /// Bumps `archiveEvents.bookmarkRevision` via the VM so the reader
+    /// popover + sidebar counts reflect the change without a manual
+    /// refresh.
+    private func handleTagsDroppedOnConversation(_ tagNames: [String], _ conversationID: String) {
+        guard let vm = libraryViewModel else { return }
+        let attached = Set((vm.conversationTags[conversationID] ?? []).map(\.name))
+        Task {
+            for name in tagNames {
+                if attached.contains(name) {
+                    await vm.detachTag(named: name, fromConversation: conversationID)
+                } else {
+                    await vm.attachTag(named: name, toConversation: conversationID)
+                }
+            }
+            await vm.refreshConversationTags(for: [conversationID], replace: false)
+            await store.refreshTags(services: services)
+        }
+    }
+
+    /// Toggle-style tag attach for a drop targeted at a sidebar tag
+    /// row. For each dropped conversation: if it already carries this
+    /// tag, detach; else attach. Mirrors
+    /// `handleTagsDroppedOnConversation` but batches per-conversation
+    /// rather than per-tag.
+    private func handleConversationsDroppedOnTag(_ conversationIDs: [String], _ tagName: String) {
+        guard let vm = libraryViewModel else { return }
+        Task {
+            for convID in conversationIDs {
+                let attached = Set((vm.conversationTags[convID] ?? []).map(\.name))
+                if attached.contains(tagName) {
+                    await vm.detachTag(named: tagName, fromConversation: convID)
+                } else {
+                    await vm.attachTag(named: tagName, toConversation: convID)
+                }
+            }
+            await vm.refreshConversationTags(for: conversationIDs, replace: false)
+            await store.refreshTags(services: services)
+        }
+    }
+
+    /// Two-way bridge between the toolbar search field and the `Table`'s
+    /// native `sortOrder`. Reading the binding re-parses `searchText` to
+    /// synthesize comparators; writing (i.e. the user clicked a column
+    /// header) flips the direction through the DSL so the typed sentence
+    /// reflects the tap in real time. This replaces the Table pane's
+    /// private `@State sortOrder` so a single source of truth — the
+    /// search field — drives both sides.
+    private var tableSortOrderBinding: Binding<[KeyPathComparator<DesignMockConversation>]> {
+        Binding(
+            get: {
+                let parsed = DesignMockQueryLanguage.parse(searchText)
+                return DesignMockQueryLanguage.comparators(for: parsed.sortToken)
+            },
+            set: { newValue in
+                let token = DesignMockQueryLanguage.sortToken(from: newValue)
+                searchText = DesignMockQueryLanguage.applySortToken(token, to: searchText)
+            }
+        )
+    }
+
+    private var selectedConversation: DesignMockConversation? {
+        // Reader + share button still want a single "currently displayed"
+        // thread even though the middle pane is multi-selection. Pick
+        // the first entry of the selection set that still exists in the
+        // current list, falling back to the very first row when the
+        // selection is stale or empty so the reader has *something* to
+        // show rather than a jarring blank.
+        let visibleMatch = store.conversations.first { selectedConversationIDs.contains($0.id) }
+        return visibleMatch ?? store.conversations.first
+    }
+
+    private var composedQuery: DesignMockDataStore.FetchQuery {
+        // Fold every user-driven input (sidebar selection, toolbar search,
+        // sort picker) into a single value the store can diff against.
+        //
+        // The search field doubles as a tiny DSL: `sort:` directives and
+        // the free-text keyword are pulled out separately so they drive
+        // distinct parts of the fetch query. The layout-mode gate below
+        // still applies to the keyword (viewer mode hands it off to the
+        // in-thread finder instead), but the sort directive always
+        // flows through so sorting stays consistent across mode
+        // switches.
+        var query = DesignMockDataStore.FetchQuery()
+        let parsed = DesignMockQueryLanguage.parse(searchText)
+        if selectedLayoutMode != .viewer {
+            query.keyword = parsed.keyword.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        query.sortKey = DesignMockQueryLanguage.dbSortKey(from: parsed.sortToken)
+        // Start from sidebar-derived filters so a plain sidebar pick
+        // still scopes the library without any typing.
+        let kind = DesignMockSidebarItem.kind(for: selectedSidebarItemID, sources: store.sources)
+        switch kind {
+        case .all, .archiveDB, .autoIntake, .unknown:
+            break
         case .source(let source):
-            return item.source.lowercased() == source.lowercased()
-        case .autoIntake:
-            // Intake has its own pane; conversations never show here.
-            return false
+            query.source = source
+        case .model(let source, let model):
+            query.source = source
+            query.model = model
+        case .bookmarks:
+            query.bookmarksOnly = true
+        case .tag(let name):
+            query.tagName = name
+        }
+        // Explicit DSL tokens take precedence over the sidebar — the
+        // reasoning is that typing is a deliberate act, sidebar picks
+        // get "sticky" during long sessions, and the user would
+        // reasonably expect `model:gpt-4o` to narrow the visible list
+        // even when the sidebar still points at a different source.
+        if let source = parsed.sourceFilter { query.source = source }
+        if let model = parsed.modelFilter { query.model = model }
+        if let tag = parsed.tagFilter { query.tagName = tag }
+        if parsed.bookmarksOnly { query.bookmarksOnly = true }
+        return query
+    }
+
+    /// Toolbar search field placeholder. Flips with the layout mode so the
+    /// affordance tells the user what the field currently does — library
+    /// filter vs. in-thread finder.
+    private var searchPrompt: String {
+        switch selectedLayoutMode {
+        case .table, .default:
+            return "ライブラリを検索"
+        case .viewer:
+            return "このスレッド内を検索"
         }
     }
 
     private var showingAutoIntake: Bool {
-        guard let selectedSidebarItemID else { return false }
-        if case .autoIntake = DesignMockSidebarItem.kind(for: selectedSidebarItemID) {
-            return true
-        }
+        let kind = DesignMockSidebarItem.kind(for: selectedSidebarItemID, sources: store.sources)
+        if case .autoIntake = kind { return true }
         return false
     }
 
-    private func matchesSearch(_ item: DesignMockConversation, query: String) -> Bool {
-        guard !query.isEmpty else { return true }
-        return item.title.localizedCaseInsensitiveContains(query)
-            || item.projectLabel.localizedCaseInsensitiveContains(query)
-            || item.source.localizedCaseInsensitiveContains(query)
-    }
 }
 
 private struct DesignMockSidebar: View {
     @Binding var selection: DesignMockSidebarItem.ID?
+    /// Live source list — supplied by `DesignMockDataStore` so switching
+    /// between mock and real data refreshes the sidebar tree automatically.
+    let sources: [DesignMockSource]
+    let bookmarks: [DesignMockBookmark]
+    let tags: [TagEntry]
+    let databaseInfo: DesignMockDataStore.DatabaseInfo?
+    let totalCount: Int
+    /// Shared library VM used to look up "is this tag already attached
+    /// to this conversation?" when deciding attach vs detach on a drop.
+    /// Optional because the VM is built lazily in the shell — while it's
+    /// still nil we skip the drop wiring and render plain rows.
+    let libraryViewModel: LibraryViewModel?
+    /// Invoked when one or more conversation cards are dropped onto a
+    /// tag row. Receives the dropped conversation ids + the tag row's
+    /// name; the shell decides per-conversation whether to attach or
+    /// detach based on current tag membership.
+    var onDropConversationsOnTag: ([String], String) -> Void = { _, _ in }
+    /// Which sources are currently expanded. We seed from `sources` on
+    /// first appear *and* whenever the source list changes shape (e.g. a
+    /// real-data fetch finally lands), so newly-visible multi-model
+    /// sources default to expanded without stomping on the user's manual
+    /// collapses of the ones they've already interacted with.
+    @State private var expandedSources: Set<String> = []
+    @State private var haveSeededExpansion: Bool = false
+    @State private var isTagsSectionExpanded: Bool = false
+    /// Companion multi-selection state for the Tags section. The main
+    /// sidebar `List` uses single-select (its id drives filtering), so
+    /// we track multi-select tag membership in a private set — cmd /
+    /// shift-click toggles a tag in/out, and dragging any row in the
+    /// set emits all selected tag names as separate payloads. A plain
+    /// click clears the set so the filter-driving primary selection
+    /// stays unambiguous.
+    @State private var multiSelectedTagNames: Set<String> = []
 
     var body: some View {
-        List(selection: $selection) {
+        // "All" subtitle is driven by the live source totals so the sidebar
+        // reads the real archive count, not a hardcoded mock one.
+        let totalThreads = totalCount > 0
+            ? totalCount
+            : sources.reduce(0) { $0 + $1.count }
+        let allItem = DesignMockSidebarItem(
+            id: DesignMockSidebarItem.allThreads.id,
+            title: DesignMockSidebarItem.allThreads.title,
+            subtitle: totalThreads > 0 ? "\(totalThreads) threads" : nil,
+            systemImage: DesignMockSidebarItem.allThreads.systemImage,
+            kind: .all
+        )
+        let archiveRow = DesignMockSidebarItem(
+            id: DesignMockSidebarItem.archiveDB.id,
+            title: DesignMockSidebarItem.archiveDB.title,
+            subtitle: databaseSubtitle,
+            systemImage: DesignMockSidebarItem.archiveDB.systemImage,
+            kind: .archiveDB
+        )
+        let bookmarksRow = DesignMockSidebarItem(
+            id: DesignMockSidebarItem.bookmarks.id,
+            title: DesignMockSidebarItem.bookmarks.title,
+            subtitle: bookmarks.isEmpty ? nil : "\(bookmarks.count) saved",
+            systemImage: DesignMockSidebarItem.bookmarks.systemImage,
+            kind: .bookmarks
+        )
+        return List(selection: $selection) {
             Section("Library") {
-                sidebarRow(DesignMockSidebarItem.allThreads)
-                sidebarRow(.init(id: "archive-db", title: "archive.db", subtitle: "Local SQLite archive", systemImage: "externaldrive", kind: .all))
+                sidebarRow(allItem)
+                sidebarRow(bookmarksRow)
+                sidebarRow(archiveRow)
                 sidebarRow(DesignMockSidebarItem.autoIntake)
             }
 
-            Section("Projects") {
-                ForEach(DesignMockData.projects.map(DesignMockSidebarItem.project)) { item in
-                    sidebarRow(item)
+            Section("Sources") {
+                if sources.isEmpty {
+                    Text("No sources yet")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(sources, id: \.name) { source in
+                        sourceRow(source)
+                    }
                 }
             }
 
-            Section("Triage") {
-                sidebarRow(.init(id: "suggested", title: "Needs review", subtitle: "Suggested project links", systemImage: "tray.and.arrow.down", kind: .suggested))
-                sidebarRow(.init(id: "unassigned", title: "Unassigned", subtitle: "No project yet", systemImage: "circle.dashed", kind: .unassigned))
-            }
-
-            Section("Sources") {
-                ForEach(DesignMockData.sources, id: \.name) { source in
-                    sidebarRow(.init(
-                        id: "source-\(source.name)",
-                        title: source.name,
-                        subtitle: "\(source.count) threads",
-                        systemImage: "circle.fill",
-                        kind: .source(source.name)
-                    ))
+            // Hide the Trash system tag — the user explicitly asked for
+            // it removed, and any one-off restore workflows can happen
+            // inside the table / card pane via the attach/detach popover.
+            let visibleTags = tags.filter { $0.systemKey != "trash" }
+            if !visibleTags.isEmpty {
+                // Custom header wrapping the native `Section(_:isExpanded:)`
+                // chevron behavior in a full-width Button. The default
+                // section header only treats the chevron itself as a tap
+                // target, which is a ~12pt sliver — the user flagged the
+                // hit testing as too tight ("当たり判定を緩くして"). A
+                // full-row Button with `.contentShape(Rectangle())` means
+                // any click anywhere in the header strip toggles the
+                // section, matching Finder's sidebar behavior.
+                Section(isExpanded: $isTagsSectionExpanded) {
+                    ForEach(visibleTags) { tag in
+                        tagSidebarRow(tag)
+                    }
+                } header: {
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.16)) {
+                            isTagsSectionExpanded.toggle()
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text("Tags")
+                            Spacer(minLength: 0)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
                 }
             }
         }
         .listStyle(.sidebar)
+        .onChange(of: sources.map(\.name)) { _, _ in
+            seedExpansionIfNeeded()
+        }
+        .onAppear {
+            seedExpansionIfNeeded()
+        }
+    }
+
+    private var databaseSubtitle: String? {
+        guard let info = databaseInfo else { return nil }
+        if let bytes = info.sizeBytes {
+            return ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+        }
+        return URL(fileURLWithPath: info.path).lastPathComponent
+    }
+
+    private func seedExpansionIfNeeded() {
+        guard !haveSeededExpansion, !sources.isEmpty else { return }
+        // Default every multi-model source to expanded so the user sees
+        // the model breakdown without hunting for the disclosure chevron.
+        expandedSources = Set(sources.filter { $0.models.count > 1 }.map(\.name))
+        haveSeededExpansion = true
+    }
+
+    /// Renders a source row. Sources with a single (or zero) model stay as
+    /// flat rows; sources with multiple models expand into a `DisclosureGroup`
+    /// so the user can narrow to a specific model (`chatgpt → gpt-4o`).
+    @ViewBuilder
+    private func sourceRow(_ source: DesignMockSource) -> some View {
+        let item = DesignMockSidebarItem(
+            id: "source-\(source.name)",
+            title: source.name,
+            subtitle: "\(source.count) threads",
+            systemImage: "circle.fill",
+            kind: .source(source.name)
+        )
+        if source.models.count > 1 {
+            DisclosureGroup(
+                isExpanded: Binding(
+                    get: { expandedSources.contains(source.name) },
+                    set: { isExpanded in
+                        if isExpanded {
+                            expandedSources.insert(source.name)
+                        } else {
+                            expandedSources.remove(source.name)
+                        }
+                    }
+                )
+            ) {
+                ForEach(source.models, id: \.name) { model in
+                    sidebarRow(
+                        .init(
+                            id: "model-\(source.name)-\(model.name)",
+                            title: model.name,
+                            subtitle: "\(model.count) threads",
+                            systemImage: "cpu",
+                            kind: .model(source: source.name, model: model.name)
+                        )
+                    )
+                }
+            } label: {
+                sidebarRow(item)
+            }
+        } else {
+            sidebarRow(item)
+        }
     }
 
     private func sidebarRow(_ item: DesignMockSidebarItem) -> some View {
@@ -205,13 +1070,117 @@ private struct DesignMockSidebar: View {
         }
         .tag(item.id)
     }
+
+    /// Tag row with drag + drop wiring. Built on top of `sidebarRow`
+    /// but additionally:
+    ///  - Drags a `TagDragPayload` so the tag can be dropped onto a
+    ///    conversation card for toggle-attach.
+    ///  - Accepts dropped `ConversationDragPayload`s and hands the
+    ///    batch to `onDropConversationsOnTag`, which the shell routes
+    ///    through toggle-attach semantics.
+    ///  - Shows an accent stroke + optional multi-select check badge
+    ///    so the user can see which tags are part of a multi-tag drag
+    ///    staging set. Plain click clears the staging set so the
+    ///    filter-driving primary selection stays unambiguous.
+    @ViewBuilder
+    private func tagSidebarRow(_ tag: TagEntry) -> some View {
+        let item = DesignMockSidebarItem(
+            id: "tag-\(tag.name)",
+            title: tag.name,
+            subtitle: "\(tag.usageCount) threads",
+            systemImage: tag.isSystem ? "tag.fill" : "tag",
+            kind: .tag(tag.name)
+        )
+        let isMultiSelected = multiSelectedTagNames.contains(tag.name)
+        sidebarRow(item)
+            .overlay(alignment: .trailing) {
+                // Subtle check badge to confirm the tag is in the
+                // multi-drag staging set. Invisible (and non-hit-
+                // testing) otherwise so regular rows read the same as
+                // before.
+                if isMultiSelected {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(Color.accentColor)
+                        .padding(.trailing, 4)
+                        .allowsHitTesting(false)
+                }
+            }
+            .contextMenu {
+                Button(isMultiSelected ? "Deselect for drag" : "Select for drag") {
+                    if isMultiSelected {
+                        multiSelectedTagNames.remove(tag.name)
+                    } else {
+                        multiSelectedTagNames.insert(tag.name)
+                    }
+                }
+                if !multiSelectedTagNames.isEmpty {
+                    Button("Clear drag selection") {
+                        multiSelectedTagNames.removeAll()
+                    }
+                }
+            }
+            // Reverse direction: a conversation card was dragged onto
+            // this tag row. Forward the batch to the shell; it looks
+            // up per-conversation membership and toggles accordingly.
+            .dropDestination(for: ConversationDragPayload.self) { payloads, _ in
+                guard !payloads.isEmpty else { return false }
+                onDropConversationsOnTag(payloads.map(\.id), tag.name)
+                return true
+            }
+            // Tag → conversation direction. SwiftUI's `.draggable` can
+            // only carry a single payload per drag, so we emit the
+            // whole staging set by concatenating names into one
+            // payload semantically via the drop side's `[payload]`
+            // delivery. When the row isn't part of the staging set
+            // we drag just this one tag.
+            .draggable(TagDragPayload(name: tag.name)) {
+                dragPreview(for: tag, multiCount: isMultiSelected ? multiSelectedTagNames.count : 1)
+            }
+    }
+
+    /// Pill-shaped preview shown under the pointer during a drag.
+    /// Collapses to a count when multiple tags are in the staging set,
+    /// matching the way Finder previews multi-item drags.
+    private func dragPreview(for tag: TagEntry, multiCount: Int) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: "tag")
+                .font(.caption.weight(.semibold))
+            if multiCount > 1 {
+                Text("\(multiCount) tags")
+                    .font(.caption.weight(.semibold))
+            } else {
+                Text("#\(tag.name)")
+                    .font(.caption.weight(.semibold))
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Capsule().fill(.thinMaterial))
+        .overlay(Capsule().strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5))
+    }
 }
 
 private struct DesignMockThreadListPane: View {
     let conversations: [DesignMockConversation]
-    @Binding var selection: DesignMockConversation.ID?
-    @Binding var selectedPromptIndex: Int
+    /// Multi-selection binding. Was previously `ID?`, but the user
+    /// asked for ⌘/⇧-click multi-select so DnD can attach a tag to a
+    /// whole batch of cards at once. SwiftUI's `List(selection:)` with
+    /// a `Set` binding handles the selection gestures natively and
+    /// auto-batches multi-selected drags into a single drop delivery.
+    @Binding var selection: Set<DesignMockConversation.ID>
+    /// Outgoing one-shot: when the user taps a prompt inside the expanded
+    /// card, we fire the prompt's canonical Message id into this binding so
+    /// the reader scrolls to it. Rotating a fresh id each time keeps
+    /// repeat-taps firing.
+    @Binding var pendingPromptID: String?
     @Binding var expandedPromptConversationID: DesignMockConversation.ID?
+    let isLoadingMore: Bool
+    let onReachEnd: () -> Void
+    /// Tag drop handler — invoked when one or more tag rows from the
+    /// sidebar are dragged onto a card. The shell routes each payload
+    /// through toggle-attach semantics against the destination id.
+    var onDropTagsOnConversation: ([String], String) -> Void = { _, _ in }
 
     var body: some View {
         if let expandedConversation {
@@ -222,22 +1191,146 @@ private struct DesignMockThreadListPane: View {
     }
 
     private var cardList: some View {
-        List {
+        // The list is now a lightly-shaded "tray" that hosts discrete
+        // white cards — previously the whole pane was `.regularMaterial`
+        // gray, and the rows sat directly on it with no chrome, which
+        // made the copy hard to read at the default body font. Two
+        // changes:
+        //   1. Hide List's own row styling (separators / inset padding)
+        //      so each row can own its card-like frame end-to-end.
+        //   2. Paint the List container with the window's content
+        //      background (light gray in Light Mode, dark in Dark)
+        //      so the white cards actually contrast against their
+        //      tray. Without this, the cards float on the default
+        //      list background and read as "unchanged".
+        //
+        // `List(selection:)` with a `Set` binding is what enables
+        // native ⌘/⇧-click multi-select. Rows still need `.tag(id)`
+        // for SwiftUI to bind selection to our id type.
+        List(selection: $selection) {
             ForEach(conversations) { conversation in
                 DesignMockConversationListRow(conversation: conversation)
-                    .contentShape(Rectangle())
-                    .onTapGesture {
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(
+                        // True card: opaque white fill in Light Mode
+                        // (`textBackgroundColor` is the same token the
+                        // reader pane uses, so a card reads as "a
+                        // miniature document"), with a thin
+                        // hairline-style stroke and a soft drop
+                        // shadow. Selection tint is layered on TOP
+                        // via `.overlay` so the white base survives.
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(Color(nsColor: .textBackgroundColor))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(cardSelectionTint(for: conversation))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .strokeBorder(
+                                selection.contains(conversation.id)
+                                    ? Color.accentColor.opacity(0.55)
+                                    : Color.primary.opacity(0.08),
+                                lineWidth: selection.contains(conversation.id) ? 1.5 : 0.5
+                            )
+                    )
+                    .shadow(color: .black.opacity(0.08), radius: 3, y: 1)
+                    .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    // Double-click expands the prompt outline so the
+                    // native List selection gesture (single / ⌘ / ⇧
+                    // clicks) stays intact. Previously expansion was
+                    // tied to single-tap, which pre-empted multi-
+                    // select entirely.
+                    .onTapGesture(count: 2) {
                         withAnimation(.easeOut(duration: 0.16)) {
-                            selectOrToggle(conversation)
+                            expandedPromptConversationID = conversation.id
+                            selection = [conversation.id]
                         }
                     }
-                .padding(.vertical, 6)
-                .listRowBackground(rowBackground(for: conversation))
+                    // Card → sidebar direction. SwiftUI auto-batches
+                    // the payload across every row in the current
+                    // multi-select, so dropping anywhere that accepts
+                    // `[ConversationDragPayload]` sees the full batch.
+                    .draggable(ConversationDragPayload(id: conversation.id)) {
+                        conversationDragPreview(conversation: conversation)
+                    }
+                    // Sidebar → card direction. Accepts a tag (or
+                    // multiple tags, if SwiftUI delivers more than
+                    // one) and toggles each against this conversation.
+                    .dropDestination(for: TagDragPayload.self) { payloads, _ in
+                        guard !payloads.isEmpty else { return false }
+                        onDropTagsOnConversation(payloads.map(\.name), conversation.id)
+                        return true
+                    }
+                    // Kill the List's default row chrome — insets /
+                    // separators / row background. We're painting the
+                    // entire card ourselves now, so any residual
+                    // affordance from `List` would either double up
+                    // (separators cutting through cards) or bleed
+                    // (accent-tinted row background leaking around
+                    // the corner radius).
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
+                    .listRowInsets(EdgeInsets(top: 5, leading: 10, bottom: 5, trailing: 10))
+                    .tag(conversation.id)
+                    .onAppear {
+                        // Trigger pagination when the last row scrolls into view.
+                        // `id == last?.id` keeps us from paging on every row and
+                        // also means mid-list scrolls don't thrash the fetcher.
+                        if conversation.id == conversations.last?.id {
+                            onReachEnd()
+                        }
+                    }
+            }
+            if isLoadingMore {
+                ProgressView()
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
             }
         }
-        .listStyle(.inset)
+        .listStyle(.plain)
         .scrollContentBackground(.hidden)
-        .background(.regularMaterial)
+        .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    /// Translucent accent wash layered over a card's white base when
+    /// selected. Kept as a separate overlay (rather than replacing the
+    /// fill) so the white card background shows through — selection
+    /// reads as "tinted paper" instead of "solid accent panel", which
+    /// better matches how Finder / Notes flag a selected item.
+    private func cardSelectionTint(for conversation: DesignMockConversation) -> Color {
+        selection.contains(conversation.id)
+            ? Color.accentColor.opacity(0.14)
+            : Color.clear
+    }
+
+    /// Drag preview pill. When many rows are selected at once, show
+    /// the count so the user doesn't get a stack of identical previews
+    /// under the pointer.
+    @ViewBuilder
+    private func conversationDragPreview(conversation: DesignMockConversation) -> some View {
+        let multi = selection.count > 1 && selection.contains(conversation.id)
+        HStack(spacing: 4) {
+            Image(systemName: "doc.text")
+                .font(.caption.weight(.semibold))
+            if multi {
+                Text("\(selection.count) threads")
+                    .font(.caption.weight(.semibold))
+            } else {
+                Text(conversation.title)
+                    .lineLimit(1)
+                    .font(.caption.weight(.semibold))
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Capsule().fill(.thinMaterial))
+        .overlay(Capsule().strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5))
     }
 
     private func pinnedPromptView(for conversation: DesignMockConversation) -> some View {
@@ -258,28 +1351,17 @@ private struct DesignMockThreadListPane: View {
             Divider()
 
             ScrollView {
-                DesignMockExpandedPromptList(selectedPromptIndex: $selectedPromptIndex)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 10)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                DesignMockExpandedPromptList(
+                    conversation: conversation,
+                    pendingPromptID: $pendingPromptID
+                )
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
             .scrollContentBackground(.hidden)
         }
         .background(.regularMaterial)
-    }
-
-    private func selectOrToggle(_ conversation: DesignMockConversation) {
-        if selection == conversation.id {
-            expandedPromptConversationID = expandedPromptConversationID == conversation.id ? nil : conversation.id
-        } else {
-            selection = conversation.id
-            expandedPromptConversationID = nil
-            selectedPromptIndex = 0
-        }
-    }
-
-    private func rowBackground(for conversation: DesignMockConversation) -> Color {
-        conversation.id == selection ? Color.accentColor.opacity(0.14) : Color.clear
     }
 
     private var expandedConversation: DesignMockConversation? {
@@ -291,13 +1373,25 @@ private struct DesignMockThreadListPane: View {
 private struct DesignMockDefaultContentPane: View {
     @Binding var displayMode: DesignMockCenterDisplayMode
     let conversations: [DesignMockConversation]
-    @Binding var conversationSelection: DesignMockConversation.ID?
-    @Binding var selectedPromptIndex: Int
+    @Binding var conversationSelection: Set<DesignMockConversation.ID>
+    @Binding var pendingPromptID: String?
     @Binding var expandedPromptConversationID: DesignMockConversation.ID?
+    /// Forwarded from the shell — shared with the search-field DSL so
+    /// the table inside this pane round-trips column-header taps into
+    /// the toolbar query text just like the standalone table layout.
+    @Binding var tableSortOrder: [KeyPathComparator<DesignMockConversation>]
+    let totalCount: Int
+    let isLoading: Bool
+    let isLoadingMore: Bool
+    let lastError: String?
+    let onReachEnd: () -> Void
+    /// Tag drop handler — forwarded through to both the table and
+    /// card variants so tags can be dropped onto rows in either.
+    var onDropTagsOnConversation: ([String], String) -> Void = { _, _ in }
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
+            HStack(spacing: 12) {
                 Picker("Center View", selection: $displayMode) {
                     ForEach(DesignMockCenterDisplayMode.allCases) { mode in
                         Image(systemName: mode.symbol)
@@ -310,15 +1404,44 @@ private struct DesignMockDefaultContentPane: View {
                 .controlSize(.small)
                 .frame(width: 92)
 
+                // Count / load status. Keeps "searching 1,429 threads" info
+                // visible at the top of the pane so the user knows when a
+                // keyword query is narrowing vs. when it's still loading.
+                if isLoading && conversations.isEmpty {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+
+                Text(countLabel)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+
                 Spacer()
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
 
+            if let lastError {
+                Text(lastError)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 4)
+            }
+
             Divider()
 
             contentView
         }
+    }
+
+    private var countLabel: String {
+        let loaded = conversations.count
+        if totalCount > loaded {
+            return "\(loaded) / \(totalCount)"
+        }
+        return "\(loaded)"
     }
 
     @ViewBuilder
@@ -327,14 +1450,21 @@ private struct DesignMockDefaultContentPane: View {
         case .table:
             DesignMockThreadTablePane(
                 conversations: conversations,
-                selection: $conversationSelection
+                selection: $conversationSelection,
+                sortOrder: $tableSortOrder,
+                isLoadingMore: isLoadingMore,
+                onReachEnd: onReachEnd,
+                onDropTagsOnConversation: onDropTagsOnConversation
             )
         case .cards:
             DesignMockThreadListPane(
                 conversations: conversations,
                 selection: $conversationSelection,
-                selectedPromptIndex: $selectedPromptIndex,
-                expandedPromptConversationID: $expandedPromptConversationID
+                pendingPromptID: $pendingPromptID,
+                expandedPromptConversationID: $expandedPromptConversationID,
+                isLoadingMore: isLoadingMore,
+                onReachEnd: onReachEnd,
+                onDropTagsOnConversation: onDropTagsOnConversation
             )
         }
     }
@@ -342,178 +1472,582 @@ private struct DesignMockDefaultContentPane: View {
 
 private struct DesignMockThreadTablePane: View {
     let conversations: [DesignMockConversation]
-    @Binding var selection: DesignMockConversation.ID?
+    /// Multi-selection binding (mirrors the card list). `Table` accepts
+    /// a `Set` directly; column-header ⌘/⇧-click gestures and
+    /// drag-select are handled natively once the type is a Set.
+    @Binding var selection: Set<DesignMockConversation.ID>
+    /// Sort state is owned by the shell (derived from the toolbar search
+    /// field's `sort:` directive) rather than local `@State`, so a header
+    /// click writes back into the search field and vice-versa — one
+    /// canonical representation for the user to read and edit.
+    @Binding var sortOrder: [KeyPathComparator<DesignMockConversation>]
+    let isLoadingMore: Bool
+    let onReachEnd: () -> Void
+    /// Invoked when the user double-clicks a row or hits Return on a
+    /// selection — the shell wires this to flip the layout mode so the
+    /// reader pane opens the conversation. Optional because the same
+    /// table is also embedded inside `.default` mode, where the reader
+    /// is already visible and opening is a no-op.
+    var onOpen: ((DesignMockConversation.ID) -> Void)? = nil
+    /// Tag drop handler — bound to the title cell's `.dropDestination`
+    /// so the user can drop sidebar tags onto a specific row.
+    var onDropTagsOnConversation: ([String], String) -> Void = { _, _ in }
 
     var body: some View {
-        Table(conversations, selection: $selection) {
-            TableColumn("Title") { conversation in
-                Text(conversation.title)
-                    .lineLimit(1)
+        // Re-sort locally so header clicks reflect immediately on the page
+        // already on screen. Global sort (which drives the DB query and
+        // pagination order) is unaffected.
+        let rows = conversations.sorted(using: sortOrder)
+        return Table(rows, selection: $selection, sortOrder: $sortOrder) {
+            TableColumn("Title", value: \DesignMockConversation.title) { conversation in
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(conversation.title)
+                        .lineLimit(1)
+                    if let snippet = conversation.snippet {
+                        Text(snippet)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+                // Table row DnD is attached to the title cell — it's the
+                // widest content column so it reads as "the row" to the
+                // user, and SwiftUI's Table doesn't expose a per-row
+                // drop modifier above the cell level. Multi-row drag
+                // emits one payload per selected row when the dragged
+                // cell is part of the selection.
+                .draggable(ConversationDragPayload(id: conversation.id)) {
+                    tableDragPreview(conversation: conversation)
+                }
+                .dropDestination(for: TagDragPayload.self) { payloads, _ in
+                    guard !payloads.isEmpty else { return false }
+                    onDropTagsOnConversation(payloads.map(\.name), conversation.id)
+                    return true
+                }
+                .onAppear {
+                    if conversation.id == rows.last?.id {
+                        onReachEnd()
+                    }
+                }
             }
-            TableColumn("Project") { conversation in
-                Text(conversation.projectLabel)
+            .width(min: 200, ideal: 320)
+
+            TableColumn("Model", value: \DesignMockConversation.model) { conversation in
+                Text(conversation.model)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
-            TableColumn("Updated") { conversation in
+            .width(min: 80, ideal: 140, max: 240)
+
+            // Date column sorts by `sortRank` rather than the display
+            // string — the latter is pre-formatted, so lexicographic
+            // order wouldn't be chronological.
+            TableColumn("Updated", value: \DesignMockConversation.sortRank) { conversation in
                 Text(conversation.updated)
                     .foregroundStyle(.secondary)
             }
             .width(82)
-            TableColumn("Prompts") { conversation in
+
+            TableColumn("Prompts", value: \DesignMockConversation.prompts) { conversation in
                 Text("\(conversation.prompts)")
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
             }
             .width(70)
-            TableColumn("Source") { conversation in
+
+            TableColumn("Source", value: \DesignMockConversation.source) { conversation in
                 Text(conversation.source)
                     .foregroundStyle(conversation.sourceColor)
             }
             .width(82)
         }
+        // `primaryAction` fires on double-click or Return — the native
+        // "open this row" affordance that Finder / Mail / every
+        // tree-and-table Mac app uses. We don't supply an actual menu
+        // (first closure returns EmptyView) because a blank context
+        // menu on right-click would feel broken; the system falls back
+        // to no menu when the builder is empty. Using the selection-
+        // typed variant also fixes the data flow: the primary action
+        // receives a Set of ids (exactly what was activated) rather
+        // than whatever happened to be in `@Binding var selection`
+        // at the time, which can lag behind a fresh double-click on
+        // an unselected row.
+        .contextMenu(forSelectionType: DesignMockConversation.ID.self) { _ in
+            EmptyView()
+        } primaryAction: { ids in
+            guard let id = ids.first, let onOpen else { return }
+            // Pre-seed the selection binding so the reader pane has the
+            // right conversation queued up before the mode flip happens.
+            // Collapse to the activated row so the reader shows exactly
+            // what was double-clicked, even if the user had a wider
+            // multi-select active before.
+            selection = [id]
+            onOpen(id)
+        }
+        .overlay(alignment: .bottom) {
+            if isLoadingMore {
+                ProgressView()
+                    .controlSize(.small)
+                    .padding(.bottom, 6)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func tableDragPreview(conversation: DesignMockConversation) -> some View {
+        let multi = selection.count > 1 && selection.contains(conversation.id)
+        HStack(spacing: 4) {
+            Image(systemName: "doc.text")
+                .font(.caption.weight(.semibold))
+            if multi {
+                Text("\(selection.count) threads")
+                    .font(.caption.weight(.semibold))
+            } else {
+                Text(conversation.title)
+                    .lineLimit(1)
+                    .font(.caption.weight(.semibold))
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Capsule().fill(.thinMaterial))
+        .overlay(Capsule().strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5))
     }
 }
 
+/// Expanded card → inline prompt list. Each row is a user-authored message
+/// from the selected conversation; tapping fires `pendingPromptID` so the
+/// right-pane reader scrolls to that prompt's anchor in the transcript.
 private struct DesignMockExpandedPromptList: View {
-    @Binding var selectedPromptIndex: Int
+    let conversation: DesignMockConversation
+    @Binding var pendingPromptID: String?
+    @EnvironmentObject private var services: AppServices
+    @EnvironmentObject private var store: DesignMockDataStore
+    @State private var prompts: [DesignMockPrompt] = []
+    @State private var isLoading: Bool = false
+    /// Local highlight for the most recently tapped prompt. Kept in view
+    /// state (not the data store) because this is pure UI feedback — the
+    /// reader uses `pendingPromptID` to scroll, and that binding is cleared
+    /// by `ConversationDetailView` once the scroll lands, so we'd lose the
+    /// highlight immediately if we reused it.
+    @State private var selectedPromptID: String?
+    @State private var hoveredPromptID: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            ForEach(DesignMockData.promptSnippets.indices, id: \.self) { index in
-                Button {
-                    selectedPromptIndex = index
-                } label: {
-                    HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        Image(systemName: "text.bubble")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .frame(width: 16)
-
-                        Text(DesignMockData.promptSnippets[index])
-                            .font(.caption)
-                            .lineLimit(1)
-
-                        Spacer(minLength: 8)
-
-                        Text("\(index + 1)")
-                            .font(.caption2.monospacedDigit())
-                            .foregroundStyle(.secondary)
+            if isLoading && prompts.isEmpty {
+                ProgressView()
+                    .controlSize(.small)
+                    .padding(.vertical, 8)
+            } else if prompts.isEmpty {
+                Text("No user prompts in this conversation.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .padding(.vertical, 8)
+            } else {
+                ForEach(prompts) { prompt in
+                    promptRow(prompt)
                 }
-                    .padding(.vertical, 4)
-                    .padding(.horizontal, 8)
-                    .background(
-                        selectedPromptIndex == index ? Color.accentColor.opacity(0.12) : Color.clear,
-                        in: RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    )
-                }
-                .buttonStyle(.plain)
             }
         }
         .padding(.leading, 22)
         .padding(.trailing, 2)
+        .task(id: conversation.id) {
+            // Re-fetch whenever the expanded card changes identity. Store
+            // caches the outline, so flipping back to a previously-expanded
+            // card is instant.
+            isLoading = true
+            prompts = await store.promptOutline(for: conversation.id, services: services)
+            isLoading = false
+            // Clear the local highlight when the conversation changes —
+            // otherwise a prompt from the previous card would stay tinted.
+            selectedPromptID = nil
+            hoveredPromptID = nil
+        }
+    }
+
+    @ViewBuilder
+    private func promptRow(_ prompt: DesignMockPrompt) -> some View {
+        Button {
+            // Fire the id — the reader observes this binding and scrolls to
+            // the matching message. `ConversationDetailView` clears the
+            // binding back to nil after applying, so reassigning the same
+            // id later still triggers a fresh scroll.
+            pendingPromptID = prompt.id
+            selectedPromptID = prompt.id
+        } label: {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Image(systemName: "text.bubble")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 18)
+
+                Text(prompt.snippet)
+                    .font(.subheadline)
+                    .lineLimit(1)
+                    .foregroundStyle(.primary)
+
+                Spacer(minLength: 8)
+
+                Text("\(prompt.index + 1)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.vertical, 6)
+            .padding(.horizontal, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+            .background(
+                rowBackground(for: prompt),
+                in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            hoveredPromptID = hovering ? prompt.id : (hoveredPromptID == prompt.id ? nil : hoveredPromptID)
+        }
+    }
+
+    private func rowBackground(for prompt: DesignMockPrompt) -> Color {
+        if selectedPromptID == prompt.id {
+            return Color.accentColor.opacity(0.22)
+        }
+        if hoveredPromptID == prompt.id {
+            return Color.primary.opacity(0.06)
+        }
+        return Color.clear
     }
 }
 
 private struct DesignMockReaderPane: View {
     let conversation: DesignMockConversation?
-    @Binding var selectedPromptIndex: Int
-    let prompts: [String]
+    @Binding var pendingPromptID: String?
+    /// Shared library VM — hoisted to `DesignMockRootView` so sidebar
+    /// drops, card drops, and the right-pane `ConversationTagsEditor`
+    /// all see the same `conversationTags` map.
+    let libraryViewModel: LibraryViewModel
+    /// Two-way binding into the shell's search text — non-nil only in
+    /// focus/viewer mode. When present, the reader renders a Safari-
+    /// style find-in-page bar that writes back to the same text (so the
+    /// user can also edit it directly) and drives scroll-to-match.
+    var inThreadSearch: Binding<String>? = nil
+    @EnvironmentObject private var services: AppServices
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                DesignMockReaderTitle(
-                    conversation: conversation,
-                    selectedPromptIndex: $selectedPromptIndex,
-                    prompts: prompts
-                )
-
-                VStack(alignment: .leading, spacing: 14) {
-                    Text("Original-preserving reader mock")
-                        .font(.title3.weight(.semibold))
-
-                    Text("This area stands in for the eventual conversation renderer. The chrome is intentionally native: the sidebar keeps source-list behavior, the window toolbar owns global actions, and prompt navigation lives with the reader context.")
-                        .lineSpacing(5)
-
-                    Text("Project hints, source metadata, and prompt position are shown as reading context rather than written back into canonical message bodies.")
-                        .foregroundStyle(.secondary)
-                        .lineSpacing(5)
-                }
-                .padding(18)
-                .frame(maxWidth: 760, alignment: .leading)
-                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .strokeBorder(.quaternary, lineWidth: 0.7)
-                }
-            }
-            .padding(.horizontal, 28)
-            .padding(.vertical, 26)
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .background(.background)
+        // Route through `DesignMockReaderPaneContent` so the
+        // `LibraryViewModel` dependency injected into the environment
+        // (required by `ConversationTagsEditor`, which sits inside
+        // `ConversationDetailView`'s header) can be forwarded cleanly.
+        DesignMockReaderPaneContent(
+            conversation: conversation,
+            services: services,
+            libraryViewModel: libraryViewModel,
+            pendingPromptID: $pendingPromptID,
+            inThreadSearch: inThreadSearch
+        )
     }
 }
 
-private struct DesignMockReaderTitle: View {
+/// Concrete body for the reader pane. Consumes the shared
+/// `LibraryViewModel` hoisted to `DesignMockRootView` so the
+/// canonical tag-editor / detail view has the
+/// `@Environment(LibraryViewModel.self)` it demands AND so sidebar /
+/// card DnD mutations reflect here without a manual refresh.
+private struct DesignMockReaderPaneContent: View {
     let conversation: DesignMockConversation?
-    @Binding var selectedPromptIndex: Int
-    let prompts: [String]
+    let services: AppServices
+    let libraryViewModel: LibraryViewModel
+    @Binding var pendingPromptID: String?
+    /// Two-way binding into the shell's search text — non-nil only in
+    /// focus mode. When present the reader renders a find-in-page bar
+    /// that both reads and writes this binding (so clearing from either
+    /// side stays in sync) and drives scroll-to-match on `pendingPromptID`.
+    private let inThreadSearch: Binding<String>?
+
+    /// Message IDs (in transcript order) that contain the current
+    /// in-thread query. Refreshed whenever the conversation or the query
+    /// changes. Empty when there's no query or no matches.
+    @State private var matchIDs: [String] = []
+    /// Which match is currently centered in the reader. Clamped to
+    /// `matchIDs.indices` — reset to 0 when the list changes.
+    @State private var currentMatchIndex: Int = 0
+    /// Monotonic token used to cancel in-flight search recomputations
+    /// when the user keeps typing.
+    @State private var searchToken: UUID = UUID()
+
+    init(
+        conversation: DesignMockConversation?,
+        services: AppServices,
+        libraryViewModel: LibraryViewModel,
+        pendingPromptID: Binding<String?>,
+        inThreadSearch: Binding<String>? = nil
+    ) {
+        self.conversation = conversation
+        self.services = services
+        self.libraryViewModel = libraryViewModel
+        _pendingPromptID = pendingPromptID
+        self.inThreadSearch = inThreadSearch
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(conversation?.title ?? "Select a conversation")
-                .font(.largeTitle.weight(.semibold))
-                .lineLimit(2)
-                .textSelection(.enabled)
-
-            HStack(spacing: 8) {
-                Label(conversation?.source ?? "source", systemImage: "tray.full")
-                    .foregroundStyle(conversation?.sourceColor ?? .secondary)
-                Text("·")
-                    .foregroundStyle(.tertiary)
-                promptMenu
-                Text("·")
-                    .foregroundStyle(.tertiary)
-                Text(conversation?.projectLabel ?? "No project")
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            .font(.callout)
-        }
-    }
-
-    private var promptMenu: some View {
-        Menu {
-            ForEach(prompts.indices, id: \.self) { index in
-                Button {
-                    selectedPromptIndex = index
-                } label: {
-                    Label(
-                        "Prompt \(index + 1): \(prompts[index])",
-                        systemImage: index == selectedPromptIndex ? "checkmark" : "text.bubble"
+        Group {
+            if let conversation {
+                // Defer to the canonical reader — it already handles async
+                // loading, rendered vs. plain toggle, prompt outline, and
+                // error states. Reusing it here means the DesignMock shell
+                // stays a thin layout wrapper rather than re-implementing
+                // message rendering.
+                //
+                // `.id(conversation.id)` is load-bearing: the detail view
+                // stashes its view-model in `@State`, seeded from the
+                // initializer's `conversationId`. Without rotating the
+                // SwiftUI identity, selecting a different row would keep
+                // rendering the first conversation we ever picked.
+                ConversationDetailView(
+                    conversationId: conversation.id,
+                    repository: services.conversations,
+                    requestedPromptID: $pendingPromptID,
+                    showsSystemChrome: false,
+                    // Keyword-level highlight: every case-insensitive
+                    // substring match inside any bubble gets a yellow
+                    // wash, and the single match currently centered by
+                    // the Find bar's "N / M" slot gets a saturated
+                    // orange wash. Bubbles read the spec off
+                    // `EnvironmentValues.searchHighlight` and paint it
+                    // onto their own `AttributedString` runs, so the
+                    // highlight follows the exact keyword rather than
+                    // washing the whole message.
+                    searchHighlight: currentSearchHighlight
+                )
+                .id(conversation.id)
+                .environment(libraryViewModel)
+                .overlay(alignment: .top) {
+                    // Only surface the nav strip when the user has
+                    // actually typed something — otherwise it'd float at
+                    // the top of the reader doing nothing. The text
+                    // field itself lives in the toolbar regardless of
+                    // mode, so the search-window position never shifts
+                    // between library browsing and focus reading.
+                    if let binding = inThreadSearch, !effectiveQuery.isEmpty {
+                        FindInPageNavStrip(
+                            text: binding,
+                            matchCount: matchIDs.count,
+                            currentIndex: currentMatchIndex,
+                            onPrev: { stepMatch(by: -1) },
+                            onNext: { stepMatch(by: 1) }
+                        )
+                        .padding(.top, 8)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                    }
+                }
+                // Re-run the in-thread search whenever the typed query or
+                // the selected conversation changes. Conversation change
+                // resets both the match list and the position so we don't
+                // carry an index from the previous thread.
+                .task(id: searchTaskKey) {
+                    await recomputeMatches()
+                }
+                // Wire the shared VM to this reader's open thread so
+                // `ConversationTagsEditor` (which reads
+                // `libraryViewModel.conversationTags[conversationID]`)
+                // sees a populated attachment set the moment its
+                // popover mounts — without this the right-pane
+                // "タグを追加" pulldown renders every tag unchecked
+                // regardless of what's really attached.
+                .task(id: conversation.id) {
+                    libraryViewModel.selectedConversationId = conversation.id
+                    await libraryViewModel.refreshConversationTags(
+                        for: [conversation.id],
+                        replace: false
                     )
                 }
-            }
-        } label: {
-            HStack(spacing: 5) {
-                Label(currentPromptTitle, systemImage: "text.bubble")
-                    .lineLimit(1)
-                Text("\(min(selectedPromptIndex + 1, max(prompts.count, 1))) / \(max(prompts.count, 1))")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+            } else {
+                emptyState
             }
         }
-        .menuStyle(.button)
-        .buttonStyle(.plain)
+        .background(.background)
     }
 
-    private var currentPromptTitle: String {
-        guard prompts.indices.contains(selectedPromptIndex) else {
-            return "Prompt"
+    /// Combined task key: any of these three shifting means we need to
+    /// rebuild the match list. `searchToken` is here as a manual escape
+    /// hatch for forcing a recompute even when the key otherwise matches.
+    private var searchTaskKey: String {
+        let qid = conversation?.id ?? ""
+        let q = effectiveQuery
+        return "\(qid)|\(q)|\(searchToken.uuidString)"
+    }
+
+    /// The free-text portion of the typed query — directive tokens like
+    /// `sort:...` are stripped so they don't leak into the in-thread
+    /// substring scan and generate bogus "no match" states.
+    private var effectiveQuery: String {
+        guard let raw = inThreadSearch?.wrappedValue else { return "" }
+        return DesignMockQueryLanguage.parse(raw).keyword
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// The spec handed to `ConversationDetailView` for keyword-level
+    /// highlighting. `nil` when there's nothing to paint, so the reader
+    /// stays in its no-op path. The active message id comes from the
+    /// find bar's "N / M" cursor so the currently-centered match is
+    /// drawn in a hotter color than the rest.
+    private var currentSearchHighlight: SearchHighlightSpec? {
+        let q = effectiveQuery
+        guard !q.isEmpty else { return nil }
+        let active: String? = matchIDs.indices.contains(currentMatchIndex)
+            ? matchIDs[currentMatchIndex]
+            : nil
+        return SearchHighlightSpec(query: q, activeMessageID: active)
+    }
+
+    /// Fetch the conversation detail, scan every message for a
+    /// case-insensitive substring match on the query, and publish the
+    /// resulting ids. Also fires the first jump so the reader snaps to
+    /// match #1 without the user having to tap Next.
+    private func recomputeMatches() async {
+        let query = effectiveQuery
+        guard !query.isEmpty, let convo = conversation else {
+            await MainActor.run {
+                matchIDs = []
+                currentMatchIndex = 0
+            }
+            return
         }
-        return prompts[selectedPromptIndex]
+        do {
+            guard let detail = try await services.conversations.fetchDetail(id: convo.id) else {
+                await MainActor.run {
+                    matchIDs = []
+                    currentMatchIndex = 0
+                }
+                return
+            }
+            // Case-insensitive, diacritic-insensitive substring scan. We
+            // intentionally don't tokenize — the user's mental model for
+            // an in-thread finder is "literal substring", matching ⌘F in
+            // every text editor.
+            let needle = query.lowercased()
+            let ids: [String] = detail.messages.compactMap { message in
+                message.content.lowercased().contains(needle) ? message.id : nil
+            }
+            await MainActor.run {
+                matchIDs = ids
+                currentMatchIndex = 0
+                // Auto-jump to the first match so the user sees feedback
+                // immediately on typing.
+                if let first = ids.first {
+                    pendingPromptID = first
+                }
+            }
+        } catch {
+            // Silent — this is a mock shell, and a failed fetch just
+            // means "no navigator shown" rather than a hard error.
+            await MainActor.run {
+                matchIDs = []
+                currentMatchIndex = 0
+            }
+        }
+    }
+
+    /// Move the active match index by `delta`, wrapping around the ends
+    /// of the list, then fire `pendingPromptID` so the underlying
+    /// `ConversationDetailView` scrolls to it.
+    private func stepMatch(by delta: Int) {
+        guard !matchIDs.isEmpty else { return }
+        let count = matchIDs.count
+        let next = ((currentMatchIndex + delta) % count + count) % count
+        currentMatchIndex = next
+        pendingPromptID = matchIDs[next]
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "text.bubble")
+                .font(.system(size: 36))
+                .foregroundStyle(.tertiary)
+            Text("Select a conversation")
+                .font(.title3.weight(.medium))
+            Text("Pick a thread on the left to load the full transcript here.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(32)
+    }
+}
+
+/// Compact navigation strip anchored at the top of the reader while
+/// focus mode has an active in-thread query. Intentionally NOT a
+/// full find-in-page bar — the text input lives in the toolbar
+/// search field regardless of mode, because flipping that field's
+/// position when entering focus was visually disorienting. This
+/// strip only carries the auxiliary controls: match count, prev /
+/// next chevrons, and a clear-query button. Shows up only while
+/// there's something to navigate, so it doesn't hog reader real
+/// estate when the user isn't searching.
+private struct FindInPageNavStrip: View {
+    @Binding var text: String
+    let matchCount: Int
+    let currentIndex: Int
+    let onPrev: () -> Void
+    let onNext: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Group {
+                if matchCount == 0 {
+                    Text("一致なし")
+                } else {
+                    Text("\(currentIndex + 1) / \(matchCount)")
+                        .monospacedDigit()
+                }
+            }
+            .font(.callout)
+            .foregroundStyle(.secondary)
+
+            Button(action: onPrev) {
+                Image(systemName: "chevron.up")
+            }
+            .buttonStyle(.borderless)
+            .disabled(matchCount == 0)
+            .keyboardShortcut("g", modifiers: [.command, .shift])
+            .help("前の一致（⇧⌘G）")
+
+            Button(action: onNext) {
+                Image(systemName: "chevron.down")
+            }
+            .buttonStyle(.borderless)
+            .disabled(matchCount == 0)
+            .keyboardShortcut("g", modifiers: .command)
+            .help("次の一致（⌘G）")
+
+            Divider()
+                .frame(height: 14)
+
+            Button {
+                text = ""
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.borderless)
+            .help("検索文字列をクリア")
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(.regularMaterial)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5)
+        )
+        .shadow(color: .black.opacity(0.15), radius: 6, y: 3)
+        .animation(.easeInOut(duration: 0.15), value: matchCount)
+        .animation(.easeInOut(duration: 0.15), value: currentIndex)
     }
 }
 
@@ -535,8 +2069,17 @@ private struct DesignMockConversationListRow: View {
                     .lineLimit(1)
             }
 
+            if let snippet = conversation.snippet {
+                // FTS match snippet — shown only when the user has typed a
+                // keyword, so cards in browse mode stay compact.
+                Text(snippet)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+
             HStack(spacing: 8) {
-                Label(conversation.projectLabel, systemImage: conversation.projectSymbol)
+                Label(conversation.model, systemImage: "cpu")
                     .lineLimit(1)
                 Text("\(conversation.prompts) prompts")
                     .monospacedDigit()
@@ -550,9 +2093,37 @@ private struct DesignMockConversationListRow: View {
     }
 }
 
+private struct DesignMockSortPicker: View {
+    @Binding var selection: ConversationSortKey
+
+    var body: some View {
+        Menu {
+            Picker("Sort", selection: $selection) {
+                Text("Newest first").tag(ConversationSortKey.dateDesc)
+                Text("Oldest first").tag(ConversationSortKey.dateAsc)
+                Text("Most prompts").tag(ConversationSortKey.promptCountDesc)
+                Text("Fewest prompts").tag(ConversationSortKey.promptCountAsc)
+            }
+        } label: {
+            Label(label, systemImage: "arrow.up.arrow.down")
+                .labelStyle(.iconOnly)
+        }
+        .menuStyle(.borderlessButton)
+        .help("Sort order: \(label)")
+    }
+
+    private var label: String {
+        switch selection {
+        case .dateDesc: return "Newest first"
+        case .dateAsc: return "Oldest first"
+        case .promptCountDesc: return "Most prompts"
+        case .promptCountAsc: return "Fewest prompts"
+        }
+    }
+}
+
 private struct DesignMockLayoutModePicker: View {
     @Binding var selection: DesignMockLayoutMode
-    let isCompact: Bool
 
     var body: some View {
         Picker("Layout", selection: $selection) {
@@ -564,7 +2135,13 @@ private struct DesignMockLayoutModePicker: View {
         }
         .pickerStyle(.segmented)
         .labelsHidden()
-        .controlSize(isCompact ? .small : .regular)
+        // Previously scaled down to `.small` while the search field was
+        // active (`isSearching || !searchText.isEmpty`) to reclaim toolbar
+        // width, but the shrink-on-focus felt jittery — icons visibly
+        // resized mid-typing. Lock to `.regular`; if the toolbar ever
+        // actually overflows we'll solve it with `.toolbar(.automatic)`
+        // priority hints rather than a manual size swap.
+        .controlSize(.regular)
         .help("Layout mode")
     }
 }
@@ -596,14 +2173,107 @@ private enum DesignMockToolbarMetrics {
     static let iconFont: Font = .system(size: 14, weight: .semibold)
 }
 
+/// Toolbar share button. Fetches the selected conversation's full
+/// `ConversationDetail` and materializes it as a temp Markdown file,
+/// then hands the file URL to `ShareLink` so the native macOS share
+/// menu (AirDrop / Mail / Messages / Notes / Save to Files / installed
+/// extensions) can present it. Mirrors the reader pane's
+/// `ConversationShareButton` behavior — both paths end up routing
+/// through `MarkdownExporter.writeTempShareFile(for:)` so the file
+/// format is identical regardless of where the share was initiated.
+private struct DesignMockShareButton: View {
+    let conversation: DesignMockConversation?
+    let services: AppServices
+    /// Rendered share URL. Nil while the markdown export is being
+    /// written, or when no conversation is selected. `ShareLink`
+    /// appears only when non-nil; the disabled placeholder keeps the
+    /// toolbar row stable on first mount.
+    @State private var shareURL: URL?
+    /// Guard against a stale fetch overwriting `shareURL` when the user
+    /// switches conversations mid-export. Compared at write time —
+    /// if the id changed while the async chain was in flight, the
+    /// result is discarded.
+    @State private var pendingExportID: String?
+
+    var body: some View {
+        Group {
+            if let shareURL, let conversation {
+                ShareLink(
+                    item: shareURL,
+                    preview: SharePreview(
+                        conversation.title,
+                        image: Image(systemName: "doc.text")
+                    )
+                ) {
+                    Image(systemName: "square.and.arrow.up")
+                        .font(DesignMockToolbarMetrics.iconFont)
+                        .foregroundStyle(.primary)
+                }
+                .help("Share selected conversation")
+            } else {
+                // Placeholder keeps the toolbar column width stable
+                // while the markdown file is being written (first
+                // mount, or after switching to a different thread).
+                // Disabled so clicks don't accidentally open a stale
+                // picker.
+                Button {} label: {
+                    Image(systemName: "square.and.arrow.up")
+                        .font(DesignMockToolbarMetrics.iconFont)
+                        .foregroundStyle(.primary)
+                }
+                .disabled(true)
+                .help(conversation == nil ? "No conversation selected" : "Preparing share…")
+            }
+        }
+        // Re-export whenever the selected thread changes. Keying on
+        // the conversation id (or nil) means switching between
+        // conversations triggers a fresh export; switching layout
+        // modes without changing the selection reuses the current
+        // file. `nil` identity cleanly resets the URL so the
+        // placeholder returns when the user deselects everything.
+        .task(id: conversation?.id) {
+            await refreshShareURL(for: conversation)
+        }
+    }
+
+    private func refreshShareURL(for conversation: DesignMockConversation?) async {
+        guard let conversation else {
+            shareURL = nil
+            pendingExportID = nil
+            return
+        }
+        pendingExportID = conversation.id
+        shareURL = nil
+        do {
+            guard let detail = try await services.conversations
+                .fetchDetail(id: conversation.id) else {
+                return
+            }
+            // Bail if the user has since moved on to another thread —
+            // writing the file would be wasted work, and assigning
+            // `shareURL` would briefly flash a stale file's preview.
+            guard pendingExportID == conversation.id else { return }
+            let url = await MarkdownExporter.writeTempShareFile(for: detail)
+            guard pendingExportID == conversation.id else { return }
+            shareURL = url
+        } catch {
+            // Silent — the disabled placeholder is an acceptable
+            // fallback, and a real failure is rare enough (temp dir
+            // write failure) that a modal alert feels disproportionate.
+        }
+    }
+}
+
 private struct DesignMockSidebarItem: Identifiable {
     enum Kind: Equatable {
         case all
-        case project(String)
-        case suggested
-        case unassigned
-        case source(String)
+        case archiveDB
         case autoIntake
+        case bookmarks
+        case source(String)
+        case model(source: String, model: String)
+        case tag(String)
+        case unknown
     }
 
     let id: String
@@ -615,20 +2285,10 @@ private struct DesignMockSidebarItem: Identifiable {
     static let allThreads = DesignMockSidebarItem(
         id: "all",
         title: "All Threads",
-        subtitle: "629 threads",
+        subtitle: nil,
         systemImage: "rectangle.stack",
         kind: .all
     )
-
-    static func project(_ project: DesignMockProject) -> DesignMockSidebarItem {
-        DesignMockSidebarItem(
-            id: "project-\(project.id)",
-            title: project.title,
-            subtitle: "\(project.count) threads",
-            systemImage: "folder",
-            kind: .project(project.id)
-        )
-    }
 
     static let autoIntake = DesignMockSidebarItem(
         id: "auto-intake",
@@ -638,24 +2298,63 @@ private struct DesignMockSidebarItem: Identifiable {
         kind: .autoIntake
     )
 
-    static func kind(for id: String) -> Kind {
-        if id == allThreads.id || id == "archive-db" { return .all }
+    static let bookmarks = DesignMockSidebarItem(
+        id: "bookmarks",
+        title: "Bookmarks",
+        subtitle: nil,
+        systemImage: "bookmark.fill",
+        kind: .bookmarks
+    )
+
+    static let archiveDB = DesignMockSidebarItem(
+        id: "archive-db",
+        title: "archive.db",
+        subtitle: "Local SQLite archive",
+        systemImage: "externaldrive",
+        kind: .archiveDB
+    )
+
+    /// Reverse a sidebar-row id into the logical `Kind`. Takes `sources`
+    /// from the caller (rather than pulling from a global) so the lookup
+    /// works whether the sidebar is showing the built-in sample or the
+    /// live archive database.
+    static func kind(for id: String?, sources: [DesignMockSource]) -> Kind {
+        guard let id else { return .unknown }
+        if id == allThreads.id { return .all }
         if id == autoIntake.id { return .autoIntake }
-        if id == "suggested" { return .suggested }
-        if id == "unassigned" { return .unassigned }
-        if let project = DesignMockData.projects.first(where: { "project-\($0.id)" == id }) {
-            return .project(project.id)
+        if id == bookmarks.id { return .bookmarks }
+        if id == archiveDB.id { return .archiveDB }
+        if id.hasPrefix("tag-") {
+            return .tag(String(id.dropFirst("tag-".count)))
         }
-        if let source = DesignMockData.sources.first(where: { "source-\($0.name)" == id }) {
+        // Model rows encode both source + model in their id to avoid collision
+        // across providers that happen to share a model slug.
+        if id.hasPrefix("model-") {
+            let remainder = String(id.dropFirst("model-".count))
+            for source in sources {
+                let prefix = "\(source.name)-"
+                if remainder.hasPrefix(prefix) {
+                    let model = String(remainder.dropFirst(prefix.count))
+                    return .model(source: source.name, model: model)
+                }
+            }
+        }
+        if let source = sources.first(where: { "source-\($0.name)" == id }) {
             return .source(source.name)
         }
-        return .all
+        return .unknown
     }
 
     var iconStyle: AnyShapeStyle {
         switch kind {
         case .source(let source):
-            AnyShapeStyle(DesignMockSource(name: source, count: 0).color)
+            AnyShapeStyle(DesignMockSource.color(for: source))
+        case .model(let source, _):
+            AnyShapeStyle(DesignMockSource.color(for: source))
+        case .bookmarks:
+            AnyShapeStyle(.yellow)
+        case .tag:
+            AnyShapeStyle(.purple)
         default:
             AnyShapeStyle(.secondary)
         }
@@ -707,17 +2406,19 @@ private enum DesignMockCenterDisplayMode: String, CaseIterable, Identifiable {
     }
 }
 
-private struct DesignMockProject: Identifiable {
-    let id: String
-    let title: String
-    let count: Int
-}
-
 private struct DesignMockSource {
     let name: String
     let count: Int
+    /// Model breakdown inside this source. Empty ⇒ render as a flat row; one
+    /// ⇒ still flat (a singleton list adds chevron noise without payoff);
+    /// two or more ⇒ the sidebar expands it into a DisclosureGroup.
+    let models: [DesignMockSourceModel]
 
     var color: Color {
+        Self.color(for: name)
+    }
+
+    static func color(for name: String) -> Color {
         switch name.lowercased() {
         case "chatgpt": return .green
         case "claude": return .orange
@@ -727,89 +2428,258 @@ private struct DesignMockSource {
     }
 }
 
-private struct DesignMockConversation: Identifiable {
+private struct DesignMockSourceModel {
+    let name: String
+    let count: Int
+}
+
+private struct DesignMockConversation: Identifiable, Hashable {
     let id: String
     let title: String
-    let projectID: String?
-    let projectState: DesignMockProjectState
     let updated: String
     let sortRank: Int
     let prompts: Int
     let source: String
+    let model: String
+    /// BM25 snippet returned by FTS. `nil` for rows loaded via the plain
+    /// index; populated when the user types a keyword so the card row can
+    /// show why the result matched.
+    let snippet: String?
 
-    var projectLabel: String {
-        switch projectState {
-        case .assigned(let title, _):
-            return title
-        case .suggested(let title, _, _):
-            return "Suggested: \(title)"
-        case .none:
-            return "Unassigned"
-        }
-    }
-
-    var projectSymbol: String {
-        switch projectState {
-        case .assigned(_, let kind):
-            return kind == .manual ? "folder.badge.gearshape" : "folder"
-        case .suggested:
-            return "wand.and.stars"
-        case .none:
-            return "circle.dashed"
-        }
+    init(
+        id: String,
+        title: String,
+        updated: String,
+        sortRank: Int,
+        prompts: Int,
+        source: String,
+        model: String,
+        snippet: String? = nil
+    ) {
+        self.id = id
+        self.title = title
+        self.updated = updated
+        self.sortRank = sortRank
+        self.prompts = prompts
+        self.source = source
+        self.model = model
+        self.snippet = snippet
     }
 
     var sourceColor: Color {
-        DesignMockSource(name: source, count: 0).color
+        DesignMockSource.color(for: source)
     }
 }
 
-private enum DesignMockProjectState {
-    case assigned(title: String, kind: DesignMockProjectMembership)
-    case suggested(title: String, score: Double, reason: String)
-    case none
-}
+/// Tiny DSL the toolbar search field speaks in the mock shell. The field
+/// doubles as a FTS entry point AND a surface for operation tokens
+/// (currently just `sort:`), so that tapping a column header in the table
+/// pane writes a human-readable sentence the user can also type/edit by
+/// hand. This is the spiritual cousin of GitHub's search syntax
+/// (`is:open sort:updated-desc`) scaled down to what Madini actually needs.
+///
+/// Two rules keep the parser honest:
+///   1. Tokens of the form `key:value` are reserved directives; only the
+///      first match per key wins.
+///   2. Everything else joins back into the free-text keyword verbatim,
+///      preserving the user's spacing so an accidentally-typed directive
+///      doesn't erase neighbouring search terms.
+private enum DesignMockQueryLanguage {
+    struct Parsed: Equatable {
+        /// Free-text portion, with directive tokens stripped out.
+        var keyword: String
+        /// Canonical value of the matched `sort:` token (e.g.
+        /// `"updated-desc"`). Nil when no sort directive was typed.
+        var sortToken: String?
+        /// Value of the matched `source:` token (e.g. `"chatgpt"`) —
+        /// case is preserved from the typed value because downstream
+        /// `FetchQuery.source` comparisons are case-sensitive against
+        /// the stored source name.
+        var sourceFilter: String?
+        /// Value of the matched `model:` token. Same case-preservation
+        /// rationale as `sourceFilter`.
+        var modelFilter: String?
+        /// Value of the matched `tag:` token.
+        var tagFilter: String?
+        /// True when `bookmark:true` / `is:bookmarked` was typed.
+        var bookmarksOnly: Bool = false
+    }
 
-private enum DesignMockProjectMembership {
-    case imported
-    case manual
-    case suggested
+    static func parse(_ text: String) -> Parsed {
+        var parsed = Parsed(keyword: "")
+        var freeWords: [String] = []
+
+        for raw in text.split(separator: " ", omittingEmptySubsequences: true) {
+            let token = String(raw)
+            // Split on the first colon only — values like
+            // `model:gpt-5-4-thinking` carry their own hyphens but no
+            // further colons, and if they ever did we'd want the value
+            // kept intact.
+            guard let colonIx = token.firstIndex(of: ":") else {
+                freeWords.append(token)
+                continue
+            }
+
+            let key = token[..<colonIx].lowercased()
+            let rawValue = String(token[token.index(after: colonIx)...])
+            guard !rawValue.isEmpty else {
+                // `sort:` with no value is ambiguous — treat as garbage
+                // and pass through as free text so the user's typing
+                // isn't silently dropped mid-keystroke.
+                freeWords.append(token)
+                continue
+            }
+
+            // First directive of each key wins. Subsequent duplicates
+            // become no-ops so stale trailing tokens can't clobber the
+            // one the user just typed in front.
+            switch key {
+            case "sort":
+                if parsed.sortToken == nil {
+                    parsed.sortToken = rawValue.lowercased()
+                }
+            case "source":
+                if parsed.sourceFilter == nil {
+                    parsed.sourceFilter = rawValue
+                }
+            case "model":
+                if parsed.modelFilter == nil {
+                    parsed.modelFilter = rawValue
+                }
+            case "tag":
+                if parsed.tagFilter == nil {
+                    parsed.tagFilter = rawValue
+                }
+            case "bookmark", "is":
+                // `bookmark:true` / `bookmark:false` and the GitHub-ish
+                // shorthand `is:bookmarked`. Anything else under these
+                // keys falls through to free text so the user's typing
+                // stays visible rather than vanishing.
+                let low = rawValue.lowercased()
+                if key == "bookmark" && (low == "true" || low == "false") {
+                    parsed.bookmarksOnly = (low == "true")
+                } else if key == "is" && low == "bookmarked" {
+                    parsed.bookmarksOnly = true
+                } else {
+                    freeWords.append(token)
+                }
+            default:
+                // Unknown directive → preserve as free text. Future-
+                // proofs against typos and keeps the user's typing
+                // visible in the search field.
+                freeWords.append(token)
+            }
+        }
+
+        parsed.keyword = freeWords.joined(separator: " ")
+        return parsed
+    }
+
+    /// Rewrite `text` so its sort directive becomes `sort:\(token)`, or
+    /// strip it entirely when `token` is nil. Replaces in-place at the
+    /// first existing `sort:...` occurrence so the caret position stays
+    /// stable; appends to the end only when no directive exists yet.
+    static func applySortToken(_ token: String?, to text: String) -> String {
+        let pieces = text.split(separator: " ", omittingEmptySubsequences: false)
+            .map { String($0) }
+        var out: [String] = []
+        var replaced = false
+
+        for piece in pieces {
+            if piece.lowercased().hasPrefix("sort:") {
+                if let token, !replaced {
+                    out.append("sort:\(token)")
+                    replaced = true
+                }
+                // else: drop the directive (nil-out path, or we've
+                // already done the replacement earlier in the string
+                // and any further matches are redundant).
+                continue
+            }
+            out.append(piece)
+        }
+
+        if let token, !replaced {
+            // No existing directive to overwrite — append one. Trim a
+            // dangling trailing space so we don't leave "foo  sort:x".
+            if let last = out.last, last.isEmpty {
+                out[out.count - 1] = "sort:\(token)"
+            } else {
+                out.append("sort:\(token)")
+            }
+        }
+
+        return out.joined(separator: " ")
+    }
+
+    /// Comparator stack the `Table` should use for a given token. An
+    /// unknown / nil token falls back to "Updated ascending" so the
+    /// header indicator has a predictable default — the alternative
+    /// (nil comparators) drops the chevron entirely and the user can't
+    /// tell the table is sorted at all.
+    static func comparators(for token: String?) -> [KeyPathComparator<DesignMockConversation>] {
+        switch token {
+        case "title-asc":    return [KeyPathComparator(\DesignMockConversation.title,    order: .forward)]
+        case "title-desc":   return [KeyPathComparator(\DesignMockConversation.title,    order: .reverse)]
+        case "model-asc":    return [KeyPathComparator(\DesignMockConversation.model,    order: .forward)]
+        case "model-desc":   return [KeyPathComparator(\DesignMockConversation.model,    order: .reverse)]
+        case "updated-asc":  return [KeyPathComparator(\DesignMockConversation.sortRank, order: .forward)]
+        case "updated-desc": return [KeyPathComparator(\DesignMockConversation.sortRank, order: .reverse)]
+        case "prompts-asc":  return [KeyPathComparator(\DesignMockConversation.prompts,  order: .forward)]
+        case "prompts-desc": return [KeyPathComparator(\DesignMockConversation.prompts,  order: .reverse)]
+        case "source-asc":   return [KeyPathComparator(\DesignMockConversation.source,   order: .forward)]
+        case "source-desc":  return [KeyPathComparator(\DesignMockConversation.source,   order: .reverse)]
+        default:
+            return [KeyPathComparator(\DesignMockConversation.sortRank, order: .forward)]
+        }
+    }
+
+    /// Inverse of `comparators(for:)`. Returns the token that represents
+    /// the first comparator in the stack; nil when none match (e.g. a
+    /// future column we haven't taught the DSL about). Secondary sort
+    /// keys are discarded because the token language has no multi-key
+    /// syntax.
+    static func sortToken(from comparators: [KeyPathComparator<DesignMockConversation>]) -> String? {
+        guard let first = comparators.first else { return nil }
+        let suffix = first.order == .forward ? "asc" : "desc"
+        switch first.keyPath {
+        case \DesignMockConversation.title:    return "title-\(suffix)"
+        case \DesignMockConversation.model:    return "model-\(suffix)"
+        case \DesignMockConversation.sortRank: return "updated-\(suffix)"
+        case \DesignMockConversation.prompts:  return "prompts-\(suffix)"
+        case \DesignMockConversation.source:   return "source-\(suffix)"
+        default:                               return nil
+        }
+    }
+
+    /// DB-level sort key that should drive the store fetch for a given
+    /// DSL token. Columns the DB doesn't know how to sort on (title,
+    /// model, source) fall through to the default so pagination stays
+    /// well-ordered server-side; the Table still re-sorts in-memory so
+    /// the visible page matches what the user asked for.
+    static func dbSortKey(from token: String?) -> ConversationSortKey {
+        switch token {
+        case "updated-asc":  return .dateAsc
+        case "prompts-desc": return .promptCountDesc
+        case "prompts-asc":  return .promptCountAsc
+        default:             return .dateDesc
+        }
+    }
 }
 
 private enum DesignMockData {
-    static let projects: [DesignMockProject] = [
-        .init(id: "alraune", title: "アルラウネ執筆", count: 42),
-        .init(id: "yuri", title: "ファンタジー百合小説", count: 31),
-        .init(id: "madini", title: "Madini Archive", count: 18),
-        .init(id: "reading", title: "読書メモ", count: 9)
-    ]
-
-    static let sources: [DesignMockSource] = [
-        .init(name: "chatgpt", count: 547),
-        .init(name: "gemini", count: 55),
-        .init(name: "claude", count: 27)
-    ]
-
-    static let conversations: [DesignMockConversation] = [
-        .init(id: "c1", title: "自作小説アルラウネの執筆支援", projectID: "alraune", projectState: .assigned(title: "アルラウネ執筆", kind: .imported), updated: "Apr 18", sortRank: 1, prompts: 42, source: "chatgpt"),
-        .init(id: "c2", title: "アルラウネ 設定まとめ", projectID: "alraune", projectState: .assigned(title: "アルラウネ執筆", kind: .imported), updated: "Apr 12", sortRank: 2, prompts: 23, source: "chatgpt"),
-        .init(id: "c3", title: "続きの話を聞く", projectID: "alraune", projectState: .assigned(title: "アルラウネ執筆", kind: .suggested), updated: "Apr 08", sortRank: 3, prompts: 15, source: "chatgpt"),
-        .init(id: "c4", title: "Opusの意味とモデル名の由来", projectID: nil, projectState: .suggested(title: "Madini Archive", score: 0.62, reason: "SwiftUI・モデル名・アプリ命名"), updated: "Apr 02", sortRank: 4, prompts: 7, source: "claude"),
-        .init(id: "c5", title: "ファンタジー百合小説の設定と脚本管理", projectID: "yuri", projectState: .assigned(title: "ファンタジー百合小説", kind: .imported), updated: "Mar 28", sortRank: 5, prompts: 31, source: "chatgpt"),
-        .init(id: "c6", title: "輪行で運動習慣", projectID: nil, projectState: .suggested(title: "読書メモ", score: 0.48, reason: "運動・習慣・記録"), updated: "Mar 22", sortRank: 6, prompts: 11, source: "gemini"),
-        .init(id: "c7", title: "README 改善提案", projectID: "madini", projectState: .assigned(title: "Madini Archive", kind: .manual), updated: "Mar 15", sortRank: 7, prompts: 6, source: "claude"),
-        .init(id: "c8", title: "複利の仕組み", projectID: nil, projectState: .none, updated: "Mar 09", sortRank: 8, prompts: 4, source: "gemini"),
-        .init(id: "c9", title: "会話統計と傾向分析", projectID: "madini", projectState: .assigned(title: "Madini Archive", kind: .imported), updated: "Mar 01", sortRank: 9, prompts: 18, source: "chatgpt"),
-        .init(id: "c10", title: "転校生の逆の表現", projectID: nil, projectState: .none, updated: "Feb 26", sortRank: 10, prompts: 5, source: "claude")
-    ]
-
-    static let promptSnippets = [
-        "自作小説アルラウネを執筆支援",
-        "キャラクター設定の深掘り",
-        "世界観の補足設定を追加",
-        "第一章の推敲",
-        "アルラウネの過去エピソード",
-        "対話シーンの調整"
+    /// Tiny hardcoded fallback — shown only when `AppServices` is backed by
+    /// the in-memory mock data source (no archive.db on disk). Real runs
+    /// overwrite this via `DesignMockDataStore.load(services:)` immediately
+    /// after first paint, so in normal use this list is never visible.
+    ///
+    /// Kept intentionally short: one row per supported provider so the
+    /// sidebar still renders a non-empty Sources section in dev, without
+    /// misleading the eye into thinking it's looking at real data.
+    static let sampleConversations: [DesignMockConversation] = [
+        .init(id: "mock-1", title: "ChatGPT sample thread", updated: "—", sortRank: 0, prompts: 0, source: "chatgpt", model: "gpt-4o"),
+        .init(id: "mock-2", title: "Claude sample thread",  updated: "—", sortRank: 1, prompts: 0, source: "claude",  model: "claude-3-5-sonnet"),
+        .init(id: "mock-3", title: "Gemini sample thread",  updated: "—", sortRank: 2, prompts: 0, source: "gemini",  model: "gemini-1.5-pro")
     ]
 }
 #endif

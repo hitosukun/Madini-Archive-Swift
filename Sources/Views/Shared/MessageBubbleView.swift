@@ -6,6 +6,38 @@ import UIKit
 #endif
 import SwiftMath
 
+/// Describes an in-thread search that bubbles should paint keyword-level
+/// highlights for. Threaded through the view tree via
+/// `EnvironmentValues.searchHighlight` so every `MessageBubbleView` can
+/// react independently — no need to plumb a Set of IDs through the
+/// `ConversationDetailView` init.
+///
+/// Semantics:
+/// - `query` empty / whitespace → no highlight (cheap no-op path).
+/// - `activeMessageID == message.id` → intense "you are here" color.
+/// - Any other match → dim "also hit" color.
+struct SearchHighlightSpec: Equatable {
+    var query: String
+    var activeMessageID: String?
+
+    var normalizedQuery: String {
+        query.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var isEmpty: Bool { normalizedQuery.isEmpty }
+}
+
+private struct SearchHighlightKey: EnvironmentKey {
+    static let defaultValue: SearchHighlightSpec? = nil
+}
+
+extension EnvironmentValues {
+    var searchHighlight: SearchHighlightSpec? {
+        get { self[SearchHighlightKey.self] }
+        set { self[SearchHighlightKey.self] = newValue }
+    }
+}
+
 struct MessageBubbleView: View, Equatable {
     enum DisplayMode {
         case rendered
@@ -75,6 +107,13 @@ struct MessageBubbleView: View, Equatable {
     let displayMode: DisplayMode
     let identityContext: MessageIdentityContext?
     @Environment(IdentityPreferencesStore.self) private var identityPreferences
+    /// Optional find-in-page spec. SwiftUI tracks this as an environment
+    /// dependency of `body`, so even though `.equatable()` short-circuits
+    /// on structural input equality (`message`, `displayMode`,
+    /// `identityContext`), environment writes still trigger a re-render —
+    /// which is exactly what we want when the user types into the find
+    /// bar.
+    @Environment(\.searchHighlight) private var searchHighlight
     #if os(macOS)
     @Environment(\.openSettings) private var openSettings
     #endif
@@ -168,7 +207,7 @@ struct MessageBubbleView: View, Equatable {
             // width (capped by the parent's max-width frame), not to
             // stretch to fill. That's what lets a short prompt produce
             // a short bubble.
-            Text(verbatim: message.content)
+            Text(highlightedVerbatim(message.content))
                 .font(.system(size: Layout.bodyFontSize))
                 .textSelection(.enabled)
                 .multilineTextAlignment(.leading)
@@ -207,7 +246,7 @@ struct MessageBubbleView: View, Equatable {
                 // as user prompts, so power-users can inspect raw
                 // content without losing formatting chars.
                 if displayMode == .plain {
-                    Text(verbatim: message.content)
+                    Text(highlightedVerbatim(message.content))
                         .font(.system(size: Layout.bodyFontSize))
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -277,7 +316,7 @@ struct MessageBubbleView: View, Equatable {
             if canRenderMarkdown(text) {
                 return renderInlineRich(text, fontSize: Layout.bodyFontSize)
             }
-            return Text(verbatim: text)
+            return Text(highlightedVerbatim(text))
         }()
 
         rendered
@@ -423,7 +462,53 @@ struct MessageBubbleView: View, Equatable {
     /// process scope because the same paragraph often repeats across messages
     /// (greetings, signatures, template replies).
     private func renderInlineMarkdown(_ text: String) -> AttributedString {
-        InlineMarkdownCache.shared.render(text)
+        // The cache stores the markdown-parsed `AttributedString` keyed
+        // on source text only — deliberately NOT on the search spec, so
+        // the cache stays valid across typing. Highlight runs are applied
+        // on the way out as a cheap post-pass; they mutate only the
+        // `.backgroundColor` attribute of character ranges that match,
+        // which is O(n) in the paragraph length.
+        applyingSearchHighlight(to: InlineMarkdownCache.shared.render(text))
+    }
+
+    /// Wrap a raw `String` in an `AttributedString`, applying any active
+    /// search highlight. Used for the three verbatim-text paths (user
+    /// prompt, assistant plain mode, oversized-paragraph fallback) that
+    /// bypass the markdown pipeline entirely.
+    private func highlightedVerbatim(_ text: String) -> AttributedString {
+        applyingSearchHighlight(to: AttributedString(text))
+    }
+
+    /// Paint `.backgroundColor` runs onto every case-insensitive substring
+    /// match of the active search query. No-ops when the env spec is nil,
+    /// empty, or when this bubble's message content doesn't contain the
+    /// query (the containment check is a cheap filter to skip the
+    /// per-range scan for the majority of bubbles that aren't hits).
+    private func applyingSearchHighlight(to attr: AttributedString) -> AttributedString {
+        guard let spec = searchHighlight, !spec.isEmpty else { return attr }
+        let needle = spec.normalizedQuery
+        // Fast path: this bubble isn't a match, don't scan its runs.
+        guard message.content.range(of: needle, options: .caseInsensitive) != nil else {
+            return attr
+        }
+        var result = attr
+        let isActive = (spec.activeMessageID == message.id)
+        // Two-tier color: the "current" match in the find bar reads as
+        // saturated orange; all other matches across the thread read as
+        // a softer yellow so the user can scan-find additional hits
+        // without the active one getting lost in the crowd.
+        let bg: Color = isActive
+            ? Color.orange.opacity(0.55)
+            : Color.yellow.opacity(0.45)
+
+        var searchStart = result.startIndex
+        while searchStart < result.endIndex,
+              let range = result[searchStart..<result.endIndex]
+                .range(of: needle, options: .caseInsensitive) {
+            result[range].backgroundColor = bg
+            searchStart = range.upperBound
+        }
+        return result
     }
 
     /// Like `renderInlineMarkdown`, but first carves out any inline math
