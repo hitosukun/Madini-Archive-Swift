@@ -1532,6 +1532,12 @@ private struct DesignMockDefaultContentPane: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            // Top strip: view-mode picker hugs the LEFT edge; thread-count
+            // (plus an optional spinner while the first page loads) hugs
+            // the RIGHT. Vertical padding matches the reader pane's
+            // pinned `ConversationHeaderView` (`.padding(.vertical, 10)`)
+            // so the two bar heights line up pixel-for-pixel across the
+            // split-view seam.
             HStack(spacing: 12) {
                 Picker("Center View", selection: $displayMode) {
                     ForEach(DesignMockCenterDisplayMode.allCases) { mode in
@@ -1545,9 +1551,13 @@ private struct DesignMockDefaultContentPane: View {
                 .controlSize(.small)
                 .frame(width: 92)
 
-                // Count / load status. Keeps "searching 1,429 threads" info
-                // visible at the top of the pane so the user knows when a
-                // keyword query is narrowing vs. when it's still loading.
+                Spacer()
+
+                // Count / load status. Keeps the "N threads" total
+                // visible at the top of the pane so the user always
+                // knows the scope of what the keyword query is
+                // searching, and shows a spinner while the first page
+                // is still loading.
                 if isLoading && conversations.isEmpty {
                     ProgressView()
                         .controlSize(.small)
@@ -1557,11 +1567,9 @@ private struct DesignMockDefaultContentPane: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
-
-                Spacer()
             }
             .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            .padding(.vertical, 10)
 
             if let lastError {
                 Text(lastError)
@@ -1578,11 +1586,15 @@ private struct DesignMockDefaultContentPane: View {
     }
 
     private var countLabel: String {
-        let loaded = conversations.count
-        if totalCount > loaded {
-            return "\(loaded) / \(totalCount)"
-        }
-        return "\(loaded)"
+        // Show only the denominator (the DB total). The previously
+        // displayed `loaded / total` fraction exposed the pagination
+        // cursor, which is internal plumbing the user doesn't need
+        // to see — what matters is the scope of the current filter.
+        // `totalCount == 0` falls back to the in-memory list so the
+        // label still renders meaningfully before the count query
+        // resolves.
+        let total = totalCount > 0 ? totalCount : conversations.count
+        return "\(total) threads"
     }
 
     @ViewBuilder
