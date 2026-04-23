@@ -115,6 +115,49 @@ final class MockViewService: ViewService, @unchecked Sendable {
         return (savedViews.count + recentEntries.count) != before
     }
 
+    func renameFilter(id: Int, targetType: ViewTargetType, newName: String) async throws -> Bool {
+        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        // Recent rows with a user-given name get promoted into the
+        // saved_view bucket. The GRDB path does the same via `UPDATE
+        // saved_filters SET kind = 'saved_view'` — keeping the mock
+        // consistent so tests & previews observe the same shape.
+        if let idx = recentEntries.firstIndex(where: { $0.id == id && $0.targetType == targetType }) {
+            let prev = recentEntries.remove(at: idx)
+            savedViews.insert(
+                SavedFilterEntry(
+                    id: prev.id,
+                    kind: "saved_view",
+                    targetType: prev.targetType,
+                    name: trimmed,
+                    filters: prev.filters,
+                    createdAt: prev.createdAt,
+                    updatedAt: prev.updatedAt,
+                    lastUsedAt: prev.lastUsedAt,
+                    pinned: prev.pinned
+                ),
+                at: 0
+            )
+            return true
+        }
+        if let idx = savedViews.firstIndex(where: { $0.id == id && $0.targetType == targetType }) {
+            let prev = savedViews[idx]
+            savedViews[idx] = SavedFilterEntry(
+                id: prev.id,
+                kind: "saved_view",
+                targetType: prev.targetType,
+                name: trimmed,
+                filters: prev.filters,
+                createdAt: prev.createdAt,
+                updatedAt: prev.updatedAt,
+                lastUsedAt: prev.lastUsedAt,
+                pinned: prev.pinned
+            )
+            return true
+        }
+        return false
+    }
+
     func buildVirtualThreadPreview(
         filters: ArchiveSearchFilter,
         targetType: ViewTargetType

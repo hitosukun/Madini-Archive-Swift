@@ -542,6 +542,13 @@ struct DesignMockRootView: View {
                     tagRepository: services.tags
                 )
             }
+            // Populate `unifiedFilters` up-front so the sidebar HISTORY
+            // section has something to render on first paint. Without
+            // this the section stays hidden until the user happens to
+            // trigger a save-recent path somewhere else in the app.
+            if let libraryViewModel {
+                await libraryViewModel.reloadSupportingState()
+            }
             // Initial load. Store no-ops for the `.mock` data source so the
             // bundled sample remains visible in dev runs without a real DB.
             store.load(services: services)
@@ -552,6 +559,21 @@ struct DesignMockRootView: View {
         // exactly what the current toolbar + sidebar configuration demands.
         .onChange(of: composedQuery) { _, newQuery in
             store.setQuery(newQuery, services: services)
+            // Also drop a recent-filter row into the shared DB so the
+            // sidebar HISTORY section reflects what the user just
+            // typed / picked. We build a minimal `ArchiveSearchFilter`
+            // from the subset of `FetchQuery` dimensions the shell
+            // exposes; richer fields (dates, roles, #tags) are
+            // dropped because the DesignMock shell doesn't offer a
+            // way to produce them. Recording happens on EVERY
+            // change — `saveRecentFilter` dedupes by filter_hash, so
+            // typing "s w i" doesn't create four separate rows; the
+            // final hash is what sticks.
+            if let libraryViewModel {
+                libraryViewModel.recordRecentSearch(
+                    archiveFilter(from: newQuery)
+                )
+            }
         }
         // Keep one canonical "currently displayed" conversation across
         // every layout mode. Without this, the selection set was free
@@ -675,7 +697,19 @@ struct DesignMockRootView: View {
             bookmarks: store.bookmarks,
             databaseInfo: store.databaseInfo,
             totalCount: store.totalCount,
-            libraryViewModel: libraryViewModel
+            libraryViewModel: libraryViewModel,
+            onSelectHistoryEntry: { entry in
+                // Push the entry's filter back onto the toolbar field.
+                // The `.onChange(of: composedQuery)` wiring then re-runs
+                // the store fetch through the exact same path as
+                // hand-typed DSL, so HISTORY and typing share a single
+                // code path downstream. Sidebar selection is cleared
+                // so a matching sidebar pick (e.g. Bookmarks) from a
+                // previous tap doesn't compound with the restored
+                // filter and over-narrow the list.
+                searchText = DesignMockQueryLanguage.searchText(from: entry.filters)
+                selectedSidebarItemID = DesignMockSidebarItem.allThreads.id
+            }
         )
         .navigationSplitViewColumnWidth(min: 240, ideal: 270, max: 320)
     }
@@ -776,6 +810,33 @@ struct DesignMockRootView: View {
         return query
     }
 
+    /// Translate a DesignMock `FetchQuery` back into the canonical
+    /// `ArchiveSearchFilter` the shared saved-filters store expects.
+    /// Inverse (best-effort) of `DesignMockQueryLanguage.searchText(from:)`
+    /// + the `composedQuery` builder: keyword, single-source, single-
+    /// model, bookmarksOnly are the only dimensions this shell can
+    /// produce, so those are the only ones round-tripped. `tagName` is
+    /// ignored on purpose — tag UI was removed, and the DSL `tag:`
+    /// token is the only remaining path to generate one (if a user
+    /// types it, it enters history under the shared `bookmarkTags`
+    /// channel).
+    private func archiveFilter(from query: DesignMockDataStore.FetchQuery) -> ArchiveSearchFilter {
+        var filter = ArchiveSearchFilter(keyword: query.keyword)
+        if let source = query.source {
+            filter.sources.insert(source)
+        }
+        if let model = query.model {
+            filter.models.insert(model)
+        }
+        if query.bookmarksOnly {
+            filter.bookmarkedOnly = true
+        }
+        if let tagName = query.tagName {
+            filter.bookmarkTags = [tagName]
+        }
+        return filter
+    }
+
     /// Toolbar search field placeholder. Flips with the layout mode so the
     /// affordance tells the user what the field currently does — library
     /// filter vs. in-thread finder.
@@ -805,10 +866,14 @@ private struct DesignMockSidebar: View {
     let databaseInfo: DesignMockDataStore.DatabaseInfo?
     let totalCount: Int
     /// Shared library VM. Kept optional because it's built lazily in
-    /// the shell; upcoming HISTORY / prompt-bookmark surfaces read from
-    /// it, so we thread it through even though the sidebar doesn't use
-    /// it yet in this transition state.
+    /// the shell; the HISTORY section below reads its `unifiedFilters`
+    /// array, and Phase-4 prompt-bookmark surfaces will too.
     let libraryViewModel: LibraryViewModel?
+    /// Callback for when the user picks a history entry. The parent
+    /// translates the entry's `ArchiveSearchFilter` back into the
+    /// toolbar search field, which then flows through `composedQuery`
+    /// → store fetch via the normal typing path.
+    let onSelectHistoryEntry: (SavedFilterEntry) -> Void
     /// Which sources are currently expanded. We seed from `sources` on
     /// first appear *and* whenever the source list changes shape (e.g. a
     /// real-data fetch finally lands), so newly-visible multi-model
@@ -816,6 +881,11 @@ private struct DesignMockSidebar: View {
     /// collapses of the ones they've already interacted with.
     @State private var expandedSources: Set<String> = []
     @State private var haveSeededExpansion: Bool = false
+    /// Drives the "name-on-pin" alert. Pinning an already-pinned row
+    /// routes around this (straight unpin) — only fresh pins or
+    /// rename-of-pinned rows materialize into the alert.
+    @State private var renamingEntry: SavedFilterEntry?
+    @State private var renameDraftText: String = ""
 
     var body: some View {
         // "All" subtitle is driven by the live source totals so the sidebar
@@ -864,10 +934,39 @@ private struct DesignMockSidebar: View {
                 }
             }
 
-            // The Tags section used to live here. It was removed in the
-            // "ditch tags, embrace search history" redesign — Phase 3
-            // of that work will mount the query-history list (backed by
-            // `LibraryViewModel.unifiedFilters`) in its place.
+            // HISTORY — the old Tags section's slot. Lists the 20 most
+            // recent + pinned filter entries from
+            // `LibraryViewModel.unifiedFilters`. Hover-⭐ opens the
+            // rename alert to promote a recent row into a named /
+            // pinned entry; ⭐ on an already-pinned row unpins without
+            // prompting. Only renders when the VM has wired up and
+            // there's at least one entry — otherwise we'd draw an
+            // empty section header with no body.
+            if let libraryViewModel, !libraryViewModel.unifiedFilters.isEmpty {
+                Section("History") {
+                    SavedFiltersSection(
+                        entries: libraryViewModel.unifiedFilters,
+                        onSelect: { entry in
+                            onSelectHistoryEntry(entry)
+                        },
+                        onTogglePin: { entry in
+                            if entry.pinned {
+                                // Unpin path: no dialog, just flip the bit.
+                                libraryViewModel.togglePinned(entry)
+                            } else {
+                                // Fresh pin: pop the rename alert with
+                                // the entry's current (auto-generated
+                                // or previously saved) name pre-filled.
+                                renameDraftText = entry.name
+                                renamingEntry = entry
+                            }
+                        },
+                        onDelete: { entry in
+                            libraryViewModel.deleteFilterEntry(entry)
+                        }
+                    )
+                }
+            }
         }
         .listStyle(.sidebar)
         .onChange(of: sources.map(\.name)) { _, _ in
@@ -875,6 +974,30 @@ private struct DesignMockSidebar: View {
         }
         .onAppear {
             seedExpansionIfNeeded()
+        }
+        // Rename alert. Using a binding-driven `.alert` (rather than a
+        // sheet) keeps this feeling like a lightweight "give this a
+        // name" gesture — the alert sits on top of the list without
+        // obscuring the row being named, matches macOS stock rename
+        // flows, and dismisses on ⏎ / ⎋ for free.
+        .alert(
+            "Name this search",
+            isPresented: Binding(
+                get: { renamingEntry != nil },
+                set: { isPresented in if !isPresented { renamingEntry = nil } }
+            ),
+            presenting: renamingEntry
+        ) { entry in
+            TextField("e.g. Q2 rollouts", text: $renameDraftText)
+            Button("Pin") {
+                libraryViewModel?.renameAndPin(entry, newName: renameDraftText)
+                renamingEntry = nil
+            }
+            Button("Cancel", role: .cancel) {
+                renamingEntry = nil
+            }
+        } message: { _ in
+            Text("Pinning this search keeps it at the top of History under a name you'll recognize later.")
         }
     }
 
@@ -2369,6 +2492,39 @@ private enum DesignMockQueryLanguage {
         case "prompts-asc":  return .promptCountAsc
         default:             return .dateDesc
         }
+    }
+
+    /// Re-serialize an `ArchiveSearchFilter` back into a searchText
+    /// string the toolbar field can display. Used by the HISTORY
+    /// sidebar section: clicking a saved entry pushes the
+    /// corresponding DSL sentence into the field, which in turn
+    /// flows through `composedQuery` → store fetch. The round-trip
+    /// is lossy by design — only dimensions the DSL natively
+    /// supports (keyword, single source, single model,
+    /// bookmarks-only) survive. Multi-value or advanced fields
+    /// (date ranges, role, source-file paths, #tags) are dropped;
+    /// the corresponding rows won't disappear from history but
+    /// they also won't fully reproduce their filter when selected.
+    /// That tradeoff is acceptable for a Phase-3 slice — the
+    /// common case (keyword + source + model) is what users save
+    /// and re-invoke; richer selection UX can come later if the
+    /// gap proves painful.
+    static func searchText(from filter: ArchiveSearchFilter) -> String {
+        var parts: [String] = []
+        let keyword = filter.normalizedKeyword
+        if !keyword.isEmpty {
+            parts.append(keyword)
+        }
+        if let source = filter.sources.sorted().first {
+            parts.append("source:\(source)")
+        }
+        if let model = filter.models.sorted().first {
+            parts.append("model:\(model)")
+        }
+        if filter.bookmarkedOnly {
+            parts.append("is:bookmarked")
+        }
+        return parts.joined(separator: " ")
     }
 }
 
