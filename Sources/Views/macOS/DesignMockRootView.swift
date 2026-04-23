@@ -669,6 +669,17 @@ struct DesignMockRootView: View {
                 window.minSize = NSSize(width: 980, height: 640)
             }
         )
+        // Hide the 1pt horizontal separator AppKit draws underneath
+        // the toolbar. A one-shot `window.titlebarSeparatorStyle =
+        // .none` inside the `WindowConfigurator` closure above is
+        // NOT enough — `NavigationSplitView` re-asserts `.automatic`
+        // every time the sidebar column is shown/hidden, so the
+        // line flickers back on whenever the user toggles the
+        // sidebar (user report: "サイドバーの開閉によって区切り線
+        // が出てしまう"). `WindowTitlebarSeparatorHider` installs a
+        // KVO observer and clamps the value back to `.none` on
+        // every reassertion for as long as this view is mounted.
+        .background(WindowTitlebarSeparatorHider())
         .environmentObject(store)
         .task {
             // Build the shared library VM lazily — `@EnvironmentObject`
@@ -772,24 +783,33 @@ struct DesignMockRootView: View {
         )
     }
 
-    /// If the selection set is missing or stale (first launch, or the
-    /// previous selection was filtered away by a sidebar / query
-    /// change), seed it with the first available conversation so all
-    /// three modes agree on what "the current thread" is. No-op when
-    /// at least one current id is still present — we never overwrite
-    /// a live multi-selection, which would fight the user's own tap.
+    /// Prune the selection set to only ids that actually exist in the
+    /// current fetch page, leaving the set empty when the user's
+    /// previous pick was filtered away entirely.
+    ///
+    /// Earlier revisions *also* seeded `[currentIDs.first]` when the
+    /// intersection came back empty, so every sidebar change and
+    /// query edit guaranteed the reader had something to show. The
+    /// user found that actively harmful: "サイドバーから選んだ瞬間に
+    /// トップのスレッドが勝手に開かれて履歴がごちゃごちゃになって
+    /// しまう" — each sidebar click re-seeded a new "current thread",
+    /// which immediately fired `recordCurrentThreadInHistory` and
+    /// polluted History with threads the user never actually opened.
+    /// Now we only prune; when nothing survives, the reader shows
+    /// empty state and the user picks explicitly.
+    ///
+    /// The stale-id tolerance is intentional: if the user navigates
+    /// away to a narrower scope and then back, keeping the prior
+    /// selection in the Set means the reader pops back to the same
+    /// thread automatically when it becomes visible again — no
+    /// destructive clear.
     private func repairSelectionIfNeeded(currentIDs: [DesignMockConversation.ID]) {
         guard !currentIDs.isEmpty else { return }
         let intersected = selectedConversationIDs.intersection(currentIDs)
-        if !intersected.isEmpty {
-            // Drop stale ids but keep the user's multi-select intent.
-            if intersected != selectedConversationIDs {
-                selectedConversationIDs = intersected
-            }
-            return
-        }
-        if let first = currentIDs.first {
-            selectedConversationIDs = [first]
+        guard !intersected.isEmpty else { return }
+        // Drop stale ids but keep the user's multi-select intent.
+        if intersected != selectedConversationIDs {
+            selectedConversationIDs = intersected
         }
     }
 
@@ -1062,11 +1082,17 @@ struct DesignMockRootView: View {
         // Reader + share button still want a single "currently displayed"
         // thread even though the middle pane is multi-selection. Pick
         // the first entry of the selection set that still exists in the
-        // current list, falling back to the very first row when the
-        // selection is stale or empty so the reader has *something* to
-        // show rather than a jarring blank.
-        let visibleMatch = store.conversations.first { selectedConversationIDs.contains($0.id) }
-        return visibleMatch ?? store.conversations.first
+        // current list.
+        //
+        // Earlier revisions fell back to `store.conversations.first`
+        // so the reader always had *something* to render, but that
+        // silently opened the top thread every time the sidebar
+        // filter changed — the user saw random threads slide into
+        // the reader without their consent and get recorded into
+        // History. Returning nil when no selected id is visible lets
+        // the reader render its empty state and keeps History clean;
+        // the user explicitly picks a thread to open it.
+        return store.conversations.first { selectedConversationIDs.contains($0.id) }
     }
 
     private var composedQuery: DesignMockDataStore.FetchQuery {
@@ -1542,21 +1568,36 @@ private struct DesignMockThreadListPane: View {
         }
         // White tray (was gray `.regularMaterial` / `.windowBackgroundColor`).
         .background(Color(nsColor: .textBackgroundColor))
-        // Selection-driven scroll-to-top. Fires on every transition of
-        // the selection set so external triggers (sidebar recent-thread
-        // click, bookmark click, filter-repair) consistently pull the
-        // opened row into the top of the visible viewport.
-        .onChange(of: selection) { _, newSelection in
-            guard let id = newSelection.first else { return }
-            withAnimation(.easeInOut(duration: 0.2)) {
-                proxy.scrollTo(id, anchor: .top)
-            }
-        }
-        // First-mount scroll: if the selection was already seeded
-        // before this view materialized (e.g. the user just flipped
-        // layout mode with a thread already selected), bring that row
-        // into view as well. Short poll lets the in-memory list
-        // populate from the DB paged query before we try to scroll.
+        // Fade the top edge so cards scrolling up dissolve into the
+        // translucent toolbar instead of showing through it at full
+        // opacity. Pairs with `titlebarAppearsTransparent = true` on
+        // the host window — without this mask, text reads right
+        // through the toolbar's vibrancy; with it, the top ~52pt
+        // acts as a soft handoff from pane content to toolbar
+        // material. User request: "スクロールで透過するのはいいけど、
+        // ツールバーに差し掛かるとフェードアウトするようにできる？".
+        .topFadeUnderToolbar()
+        // First-mount scroll only. When the user was in `.table` mode
+        // with a row selected and double-clicks it — or otherwise
+        // flips the outer layout from `.table` to `.default` — the
+        // NavigationSplitView's `.id("default")` tears down and
+        // rebuilds the card pane from scratch, so this `.task` fires
+        // on that transition and pulls the selected card into the top
+        // of the viewport. That's the only case the user asked for:
+        // "テーブルから開いてカードに切り替わった時だけ上に行く".
+        //
+        // Within the card pane itself (sidebar HISTORY click,
+        // bookmark click, tapping a different card) the selection
+        // changes but the pane doesn't remount, so this `.task`
+        // doesn't refire — and intentionally. A prior
+        // `.onChange(of: selection)` handler used to scroll-to-top on
+        // every selection transition; the user found the auto-scroll
+        // jarring when reading down the list and tapping a card
+        // partway through, so the onChange variant was dropped.
+        //
+        // Short poll lets the in-memory list populate from the DB
+        // paged query before we try to scroll — the selection may
+        // reference a conversation that isn't in `conversations` yet.
         .task {
             guard let id = selection.first else { return }
             for _ in 0..<20 {
@@ -1785,27 +1826,26 @@ private struct DesignMockThreadTablePane: View {
         // table plenty of room, so horizontal overflow isn't a
         // problem here anymore.)
         //
-        // Whenever the selected thread changes (whether by user click in
-        // the table, sidebar HISTORY re-open, bookmark click, or filter-
-        // repair in the shell), snap the table so the selected row sits
-        // at the top. User requested consistency: opening a thread from
-        // ANY surface lands it at the top of the center pane, rather
-        // than requiring the user to hunt for the highlighted row in
-        // the scroll position. `anchor: .top` + easeInOut is less
-        // disorienting than a hard jump on internal clicks.
-        .onChange(of: selection) { _, newSelection in
-            guard let id = newSelection.first else { return }
-            withAnimation(.easeInOut(duration: 0.2)) {
-                proxy.scrollTo(id, anchor: .top)
-            }
-        }
+        // NOTE: earlier revisions had an `.onChange(of: selection)`
+        // handler here that re-ran `proxy.scrollTo(id, anchor: .top)`
+        // on every selection transition. The user explicitly
+        // rejected that behavior: "テーブルでも、選択するだけでは
+        // 自動で上にスクロールせず" — clicking a row to preview it
+        // should just highlight it in place, not yank the scroll
+        // position. Auto-scroll now only fires via the `.task`
+        // below, which runs once on fresh table mount (e.g. flipping
+        // into `.table` mode with a pre-existing selection, or
+        // clicking a HISTORY row which flips layout) so cross-
+        // surface navigation still lands the target row at the top
+        // without disturbing in-table clicks.
+        //
         // On first mount, if the selection was already set by the
         // sidebar path (recent-thread click flips layout to `.default`
         // *and* writes the id into `selectedConversationIDs` in the
-        // same tick), we need to scroll to it too — the `.onChange`
-        // above only fires for transitions *after* mount. A brief
-        // poll waits for the target row to page into the in-memory
-        // list before asking `proxy.scrollTo` to land it.
+        // same tick), we need to scroll to it too — any on-transition
+        // handler wouldn't fire for the initial value. A brief poll
+        // waits for the target row to page into the in-memory list
+        // before asking `proxy.scrollTo` to land it.
         .task {
             guard let id = selection.first else { return }
             for _ in 0..<20 {
@@ -2134,6 +2174,17 @@ private struct DesignMockReaderPaneContent: View {
         // `VisualEffectBar` helper — user's "右ペインは透過しすぎてる"
         // report.
         .background(Color(nsColor: .textBackgroundColor))
+        // Match the center pane: fade the top edge so message
+        // content (and the pinned `ConversationHeaderView` that
+        // sits between the scroll view and the window toolbar)
+        // dissolve into the toolbar material on their way up. User
+        // request after the center-pane fade landed: "右ペインも
+        // 同様にして". The pinned header already has its own frosted
+        // `VisualEffectBar`; stacking this top-edge mask on top of
+        // that means the header's frosted surface itself gradients
+        // into the toolbar instead of reading as a hard seam
+        // between two separate frosted strips.
+        .topFadeUnderToolbar()
     }
 
     /// Combined task key: any of these three shifting means we need to
