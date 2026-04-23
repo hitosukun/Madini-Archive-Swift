@@ -1109,75 +1109,46 @@ private struct DesignMockThreadListPane: View {
     }
 
     private var cardList: some View {
-        // The list is now a lightly-shaded "tray" that hosts discrete
-        // white cards — previously the whole pane was `.regularMaterial`
-        // gray, and the rows sat directly on it with no chrome, which
-        // made the copy hard to read at the default body font. Two
-        // changes:
-        //   1. Hide List's own row styling (separators / inset padding)
-        //      so each row can own its card-like frame end-to-end.
-        //   2. Paint the List container with the window's content
-        //      background (light gray in Light Mode, dark in Dark)
-        //      so the white cards actually contrast against their
-        //      tray. Without this, the cards float on the default
-        //      list background and read as "unchanged".
+        // Back to the earliest simple layout: plain `List`, no per-row
+        // card chrome (no rounded rect fill, no stroke, no shadow).
+        // The previous version stacked four shape layers per row
+        // (fill + overlay fill + overlay stroke + shadow) plus a
+        // custom hit shape; on 200-row pages the compositor was
+        // re-rendering all four on every scroll frame, which is the
+        // "scrolling feels heavy" the user called out.
         //
-        // `List(selection:)` with a `Set` binding is what enables
-        // native ⌘/⇧-click multi-select. Rows still need `.tag(id)`
-        // for SwiftUI to bind selection to our id type.
+        // The sole visual tweak we keep from the redesign is the
+        // background color: the prior plain layout drew on the
+        // window's default gray `.regularMaterial` tray; this one
+        // uses `.textBackgroundColor` (white in Light Mode, the
+        // reader-pane token), per the user's "just swap gray for
+        // white" direction. Selection tint is back to
+        // `listRowBackground` — one fill per selected row instead
+        // of four layered shapes on every row.
+        //
+        // `List(selection:)` with a `Set` binding remains, so
+        // ⌘/⇧-click multi-select still works. `.tag(id)` is still
+        // required for SwiftUI's id→selection mapping.
         List(selection: $selection) {
             ForEach(conversations) { conversation in
                 DesignMockConversationListRow(conversation: conversation)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(
-                        // True card: opaque white fill in Light Mode
-                        // (`textBackgroundColor` is the same token the
-                        // reader pane uses, so a card reads as "a
-                        // miniature document"), with a thin
-                        // hairline-style stroke and a soft drop
-                        // shadow. Selection tint is layered on TOP
-                        // via `.overlay` so the white base survives.
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .fill(Color(nsColor: .textBackgroundColor))
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .fill(cardSelectionTint(for: conversation))
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .strokeBorder(
-                                selection.contains(conversation.id)
-                                    ? Color.accentColor.opacity(0.55)
-                                    : Color.primary.opacity(0.08),
-                                lineWidth: selection.contains(conversation.id) ? 1.5 : 0.5
-                            )
-                    )
-                    .shadow(color: .black.opacity(0.08), radius: 3, y: 1)
-                    .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                    // Double-click expands the prompt outline so the
-                    // native List selection gesture (single / ⌘ / ⇧
-                    // clicks) stays intact. Previously expansion was
-                    // tied to single-tap, which pre-empted multi-
-                    // select entirely.
+                    .contentShape(Rectangle())
+                    // Double-click expands the prompt outline. Single
+                    // / ⌘ / ⇧ clicks stay with List's native
+                    // selection gesture.
                     .onTapGesture(count: 2) {
                         withAnimation(.easeOut(duration: 0.16)) {
                             expandedPromptConversationID = conversation.id
                             selection = [conversation.id]
                         }
                     }
-                    // Kill the List's default row chrome — insets /
-                    // separators / row background. We're painting the
-                    // entire card ourselves now, so any residual
-                    // affordance from `List` would either double up
-                    // (separators cutting through cards) or bleed
-                    // (accent-tinted row background leaking around
-                    // the corner radius).
-                    .listRowBackground(Color.clear)
+                    .listRowBackground(
+                        selection.contains(conversation.id)
+                            ? Color.accentColor.opacity(0.14)
+                            : Color.clear
+                    )
                     .listRowSeparator(.hidden)
-                    .listRowInsets(EdgeInsets(top: 5, leading: 10, bottom: 5, trailing: 10))
                     .tag(conversation.id)
                     .onAppear {
                         // Trigger pagination when the last row scrolls into view.
@@ -1198,18 +1169,8 @@ private struct DesignMockThreadListPane: View {
         }
         .listStyle(.plain)
         .scrollContentBackground(.hidden)
-        .background(Color(nsColor: .windowBackgroundColor))
-    }
-
-    /// Translucent accent wash layered over a card's white base when
-    /// selected. Kept as a separate overlay (rather than replacing the
-    /// fill) so the white card background shows through — selection
-    /// reads as "tinted paper" instead of "solid accent panel", which
-    /// better matches how Finder / Notes flag a selected item.
-    private func cardSelectionTint(for conversation: DesignMockConversation) -> Color {
-        selection.contains(conversation.id)
-            ? Color.accentColor.opacity(0.14)
-            : Color.clear
+        // White tray (was gray `.regularMaterial` / `.windowBackgroundColor`).
+        .background(Color(nsColor: .textBackgroundColor))
     }
 
     private func pinnedPromptView(for conversation: DesignMockConversation) -> some View {
