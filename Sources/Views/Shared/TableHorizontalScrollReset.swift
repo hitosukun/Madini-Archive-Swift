@@ -1,6 +1,15 @@
 import SwiftUI
 #if os(macOS)
 import AppKit
+import os
+
+/// Runtime toggle for diagnostic logging. Flip to `true` when the
+/// reset misbehaves to see exactly which view is being resolved,
+/// what the scroll offset looks like before/after, and whether the
+/// burst retries are even firing. Output lands in Console.app under
+/// subsystem `madini.archive`, category `table-scroll-reset`.
+private let kDiagnosticLoggingEnabled = true
+private let tableScrollLog = Logger(subsystem: "madini.archive", category: "table-scroll-reset")
 
 /// Zero-size helper that snaps the enclosing `NSTableView` of a SwiftUI
 /// `Table` back to its leftmost column whenever `trigger` changes.
@@ -92,16 +101,25 @@ struct TableHorizontalScrollReset: NSViewRepresentable {
     /// is cheap and resilient: each retry re-resolves the table view
     /// (via the cached reference) and re-snaps the scroll origin.
     private static func scheduleResetBursts(probe: NSView, coordinator: Coordinator?) {
-        let delaysMs: [Int] = [0, 50, 150, 400]
+        // Longer tail (800ms) because the .table → .default mode
+        // flip triggers a cascade of NSSplitView tiling passes that
+        // can take well over 400ms to settle on slower machines.
+        // Extra early ticks at 16/32ms catch the case where the
+        // table had been laid out earlier and only needs an
+        // immediate nudge.
+        let delaysMs: [Int] = [0, 16, 32, 80, 200, 500, 900]
+        if kDiagnosticLoggingEnabled {
+            tableScrollLog.debug("scheduleResetBursts probe=\(String(describing: probe), privacy: .public) delays=\(delaysMs, privacy: .public)")
+        }
         for delay in delaysMs {
             DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delay)) { [weak probe] in
                 guard let probe, let coordinator else { return }
-                performReset(from: probe, coordinator: coordinator)
+                performReset(from: probe, coordinator: coordinator, tickMs: delay)
             }
         }
     }
 
-    private static func performReset(from probe: NSView, coordinator: Coordinator) {
+    private static func performReset(from probe: NSView, coordinator: Coordinator, tickMs: Int) {
         // Prefer the cached table view if it's still valid — the
         // underlying NSTableView instance survives across SwiftUI
         // updates, so looking it up fresh every burst is wasted
@@ -112,6 +130,7 @@ struct TableHorizontalScrollReset: NSViewRepresentable {
             tableView = cached
         } else {
             tableView = locateTableView(from: probe)
+                ?? locateTableViewViaApplicationWindows()
             coordinator.cachedTableView = tableView
         }
 
@@ -124,6 +143,21 @@ struct TableHorizontalScrollReset: NSViewRepresentable {
         } else {
             scrollView = locateScrollView(from: probe)
             coordinator.cachedScrollView = scrollView
+        }
+
+        let beforeOriginX = scrollView?.contentView.bounds.origin.x ?? .nan
+        let visibleWidth = scrollView?.contentView.bounds.width ?? .nan
+        let totalColumnsWidth: CGFloat = {
+            guard let tv = tableView else { return .nan }
+            var sum: CGFloat = 0
+            for col in tv.tableColumns {
+                sum += col.width
+            }
+            return sum
+        }()
+
+        if kDiagnosticLoggingEnabled {
+            tableScrollLog.debug("performReset tick=\(tickMs, privacy: .public)ms table=\(tableView == nil ? "nil" : "cols=\(tableView!.numberOfColumns) sumW=\(totalColumnsWidth)", privacy: .public) scroll=\(scrollView == nil ? "nil" : "origin.x=\(beforeOriginX) visW=\(visibleWidth)", privacy: .public)")
         }
 
         // Primary: ask NSTableView to ensure column 0 is visible.
@@ -143,7 +177,86 @@ struct TableHorizontalScrollReset: NSViewRepresentable {
             let y = scrollView.contentView.bounds.origin.y
             scrollView.contentView.setBoundsOrigin(NSPoint(x: 0, y: y))
             scrollView.reflectScrolledClipView(scrollView.contentView)
+            // Some SwiftUI Table builds wrap the NSTableView inside
+            // an inner ScrollView AND re-apply a cached offset after
+            // the clip view resets. Kicking `scroll(_:)` on the
+            // documentView directly is a second path that tends to
+            // stick even when the clip-view approach gets clobbered.
+            if let docView = scrollView.documentView {
+                docView.scroll(NSPoint(x: 0, y: docView.visibleRect.origin.y))
+            }
         }
+
+        // Tertiary: force column widths to fit the visible viewport.
+        // If the column widths sum to MORE than the scroll view's
+        // visible width, there is by definition horizontal overflow
+        // — and the leftmost column can end up scrolled out of
+        // view whenever the tiler decides to leave the previous
+        // scroll offset alone. Shrinking the Title column (the
+        // slack-absorbing column) by exactly the overflow amount
+        // eliminates the overflow entirely, so there's no offset
+        // to fight over. This is the only reliable defense against
+        // SwiftUI Table internally re-applying its cached scroll
+        // offset after our scroll reset.
+        if let tableView, let scrollView {
+            compressColumnsToFit(tableView: tableView, scrollView: scrollView)
+        }
+
+        if kDiagnosticLoggingEnabled, let scrollView {
+            let afterOriginX = scrollView.contentView.bounds.origin.x
+            tableScrollLog.debug("performReset tick=\(tickMs, privacy: .public)ms AFTER origin.x=\(afterOriginX, privacy: .public)")
+        }
+    }
+
+    /// Shrinks the first (slack-absorbing) column by the exact amount
+    /// of horizontal overflow, so the column-widths sum equals the
+    /// visible viewport width. With zero overflow, there's no
+    /// horizontal scroll to get stuck at the wrong offset and the
+    /// Title column is guaranteed to be on-screen.
+    private static func compressColumnsToFit(tableView: NSTableView, scrollView: NSScrollView) {
+        guard tableView.numberOfColumns > 0 else { return }
+        let visibleWidth = scrollView.contentView.bounds.width
+        guard visibleWidth > 0 else { return }
+
+        var totalWidth: CGFloat = 0
+        for col in tableView.tableColumns {
+            totalWidth += col.width
+        }
+        let overflow = totalWidth - visibleWidth
+        guard overflow > 0.5 else { return }
+
+        // First column in the SwiftUI Table is Title — declared with
+        // `.width(min: 160)` and no ideal/max, which means it's the
+        // one that's *meant* to absorb slack. Shrink it down by the
+        // overflow amount, floored at its `minWidth` so we don't
+        // collapse it below usability.
+        let titleCol = tableView.tableColumns[0]
+        let targetWidth = max(titleCol.minWidth, titleCol.width - overflow)
+        if abs(targetWidth - titleCol.width) > 0.5 {
+            titleCol.width = targetWidth
+            if kDiagnosticLoggingEnabled {
+                tableScrollLog.debug("compressColumnsToFit shrunk col0 from \(titleCol.width + (titleCol.width - targetWidth), privacy: .public) to \(targetWidth, privacy: .public) (overflow=\(overflow, privacy: .public) visW=\(visibleWidth, privacy: .public))")
+            }
+        }
+    }
+
+    /// Last-ditch fallback: walk every NSWindow in the running app
+    /// and return the first multi-column NSTableView we find. Used
+    /// when the probe's view-tree walk comes up empty — which can
+    /// happen when SwiftUI places the overlay's NSHostingView in a
+    /// sibling tree that doesn't share any ancestor with the
+    /// Table's NSHostingView.
+    private static func locateTableViewViaApplicationWindows() -> NSTableView? {
+        for window in NSApp.windows {
+            guard let contentView = window.contentView else { continue }
+            if let found = firstMultiColumnTableView(in: contentView) {
+                if kDiagnosticLoggingEnabled {
+                    tableScrollLog.debug("locateTableViewViaApplicationWindows found in window=\(window, privacy: .public)")
+                }
+                return found
+            }
+        }
+        return nil
     }
 
     // MARK: - View-tree lookup
