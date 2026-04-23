@@ -759,9 +759,15 @@ struct DesignMockRootView: View {
         }
         .onAppear {
             repairSelectionIfNeeded(currentIDs: store.conversations.map(\.id))
-            // Seed with whatever is already displayed on first paint
-            // so the very first thread the user lands on shows up in
-            // History without needing to pick a second one first.
+            // If a selection survived from a previous session (or a
+            // state restoration) and it happens to intersect the
+            // current fetch page, record it into History immediately
+            // so the user sees their last-viewed thread at the top
+            // of the list without having to click it again. When
+            // nothing is selected on launch — the common first-run
+            // case since we stopped auto-seeding the top thread —
+            // this is a no-op; `recordCurrentThreadInHistory`
+            // guards on `selectedConversation != nil`.
             recordCurrentThreadInHistory()
         }
     }
