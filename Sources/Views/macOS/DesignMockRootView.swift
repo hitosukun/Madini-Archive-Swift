@@ -1901,6 +1901,24 @@ private struct DesignMockThreadTablePane: View {
                     .padding(.bottom, 6)
             }
         }
+        // Horizontal-scroll reset. The `.default` outer layout brings
+        // the reader back on-screen and shrinks the middle column
+        // from ~800pt down toward its 320pt floor — `NSTableView`
+        // keeps its prior column widths, so the leftmost `Title`
+        // column ends up scrolled off-screen and the user opens a
+        // thread onto a row where the title itself is hidden. The
+        // helper reaches down to the enclosing `NSScrollView` and
+        // snaps `contentView.bounds.origin.x` back to 0 on every
+        // selection change (= every "a thread was opened" moment).
+        // Size is zero so the overlay is invisible and doesn't
+        // intercept hits.
+        .overlay(alignment: .topLeading) {
+            TableHorizontalScrollReset(
+                trigger: AnyHashable(selection.first ?? "__none__")
+            )
+            .frame(width: 0, height: 0)
+            .allowsHitTesting(false)
+        }
         // Whenever the selected thread changes (whether by user click in
         // the table, sidebar HISTORY re-open, bookmark click, or filter-
         // repair in the shell), snap the table so the selected row sits
