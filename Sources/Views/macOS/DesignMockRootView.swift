@@ -1267,53 +1267,48 @@ private struct DesignMockSidebar: View {
                 }
             }
 
-            // HISTORY — the old Tags section's slot. Two parallel
-            // streams live here:
+            // HISTORY — a single chronological stream. Filter entries
+            // (from `LibraryViewModel.unifiedFilters`) and opened-thread
+            // entries (from `RecentThreadsStore`) are interleaved and
+            // ordered strictly by their most-recent-use timestamp, so
+            // "what I searched" and "what I opened" appear in the same
+            // order the user actually performed the actions. The prior
+            // split (filters grouped first, threads grouped after) was
+            // dropped per user request: "Historyはクエリとスレッドを
+            // 分けずに、シンプルに履歴を順番に表示して".
             //
-            //   1. Filter history (`SavedFiltersSection`) — pinned +
-            //      recent searches from `LibraryViewModel.unifiedFilters`.
-            //   2. Thread history (`RecentThreadRow` x N) — the
-            //      rolling list of threads the user recently opened.
-            //
-            // Both render under the same "History" header so "what I
-            // searched" and "what I opened" live in one glance. The
-            // section hides entirely when both streams are empty so
-            // the sidebar doesn't draw a headed-but-empty collapsible
-            // on a fresh DB.
-            //
-            // ⭐ behavior on the filter rows: a plain pin/unpin toggle.
-            // Clicking the star pins the row silently, clicking again
-            // unpins it. Renaming is intentionally gone — the auto-
-            // generated label already reflects the filter contents, and
-            // a rename modal on every second-click was more friction
-            // than value.
-            if historySectionHasContent {
+            // Pinned filters keep their star affordance and their
+            // pin/unpin action, but no longer jump to the top — the
+            // unified order is purely time-based. Users who want a
+            // pinned filter near the top can re-run it to bump its
+            // timestamp.
+            if !historyItems.isEmpty {
                 Section("History") {
-                    if let libraryViewModel, !libraryViewModel.unifiedFilters.isEmpty {
-                        SavedFiltersSection(
-                            entries: libraryViewModel.unifiedFilters,
-                            onSelect: { entry in
-                                onSelectHistoryEntry(entry)
-                            },
-                            onTogglePin: { entry in
-                                libraryViewModel.togglePinned(entry)
-                            },
-                            onDelete: { entry in
-                                libraryViewModel.deleteFilterEntry(entry)
-                            }
-                        )
-                    }
-                    ForEach(recentThreads) { entry in
-                        RecentThreadRow(entry: entry)
-                            .contentShape(Rectangle())
-                            .onTapGesture {
-                                onSelectRecentThread(entry)
-                            }
-                            .contextMenu {
-                                Button("Remove from History", role: .destructive) {
-                                    onRemoveRecentThread(entry)
+                    ForEach(historyItems) { item in
+                        switch item {
+                        case .filter(let entry):
+                            SavedFilterRow(
+                                entry: entry,
+                                onSelect: { onSelectHistoryEntry(entry) },
+                                onTogglePin: {
+                                    libraryViewModel?.togglePinned(entry)
+                                },
+                                onDelete: {
+                                    libraryViewModel?.deleteFilterEntry(entry)
                                 }
-                            }
+                            )
+                        case .thread(let entry):
+                            RecentThreadRow(entry: entry)
+                                .contentShape(Rectangle())
+                                .onTapGesture {
+                                    onSelectRecentThread(entry)
+                                }
+                                .contextMenu {
+                                    Button("Remove from History", role: .destructive) {
+                                        onRemoveRecentThread(entry)
+                                    }
+                                }
+                        }
                     }
                 }
             }
@@ -1327,14 +1322,24 @@ private struct DesignMockSidebar: View {
         }
     }
 
-    /// True when either the filter-history list or the recent-threads
-    /// list has something to show. Used to gate the whole "History"
-    /// section so an empty archive doesn't render a collapsible
-    /// header floating above nothing.
-    private var historySectionHasContent: Bool {
-        let hasFilters = libraryViewModel?.unifiedFilters.isEmpty == false
-        let hasThreads = !recentThreads.isEmpty
-        return hasFilters || hasThreads
+    /// Merged, chronologically-sorted history stream. Both filter
+    /// entries and recent-thread entries live here under a single
+    /// list — the sidebar renders them in this order, newest first,
+    /// without grouping by kind. Empty when both sources are empty,
+    /// which lets the "History" section header hide entirely so the
+    /// sidebar doesn't draw a collapsible above nothing on a fresh
+    /// DB.
+    private var historyItems: [HistoryItem] {
+        var items: [HistoryItem] = []
+        if let libraryViewModel {
+            items.append(contentsOf: libraryViewModel.unifiedFilters.map(HistoryItem.filter))
+        }
+        items.append(contentsOf: recentThreads.map(HistoryItem.thread))
+        // Most-recent first. `HistoryItem.timestamp` parses
+        // `SavedFilterEntry.lastUsedAt` ("YYYY-MM-DD HH:MM:SS") and
+        // returns `RecentThreadsStore.Entry.openedAt` as-is, so
+        // filter rows and thread rows compare on the same axis.
+        return items.sorted { $0.timestamp > $1.timestamp }
     }
 
     private var databaseSubtitle: String? {
@@ -2459,6 +2464,48 @@ private struct FindInPageNavStrip: View {
 /// service's brand color (same as `ConversationRowView`) so the
 /// user can tell chatgpt vs claude vs gemini threads apart without
 /// reading the model string.
+/// Unified sidebar-history item: wraps either a saved-filter entry
+/// (click re-runs the filter) or a recent-thread entry (click re-opens
+/// the thread). A single enum lets the sidebar interleave the two
+/// kinds in one chronologically-sorted list while keeping each row's
+/// per-kind rendering distinct.
+private enum HistoryItem: Identifiable {
+    case filter(SavedFilterEntry)
+    case thread(RecentThreadsStore.Entry)
+
+    /// Stable id that's unique across the two namespaces — the raw
+    /// integer id of a `SavedFilterEntry` could collide with a
+    /// conversation id (also a string) in edge cases, so we prefix
+    /// both with the kind.
+    var id: String {
+        switch self {
+        case .filter(let entry): return "filter-\(entry.id)"
+        case .thread(let entry): return "thread-\(entry.id)"
+        }
+    }
+
+    /// Comparable timestamp for sort. `SavedFilterEntry.lastUsedAt` is
+    /// stored as `"YYYY-MM-DD HH:MM:SS"` (see `TimestampFormatter`), so
+    /// we parse with the same format. A missing / malformed timestamp
+    /// falls back to `.distantPast` so the row sinks to the bottom
+    /// rather than silently vanishing.
+    var timestamp: Date {
+        switch self {
+        case .filter(let entry):
+            return HistoryItem.timestampFormatter.date(from: entry.lastUsedAt) ?? .distantPast
+        case .thread(let entry):
+            return entry.openedAt
+        }
+    }
+
+    private static let timestampFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return formatter
+    }()
+}
+
 private struct RecentThreadRow: View {
     let entry: RecentThreadsStore.Entry
 

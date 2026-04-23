@@ -37,7 +37,11 @@ struct SavedFiltersSection: View {
     var hasEntries: Bool { !entries.isEmpty }
 }
 
-private struct SavedFilterRow: View {
+/// Single history-filter row. Exposed (non-private) so callers that
+/// want to interleave filter rows with non-filter history items in a
+/// single chronological list can render each row individually, instead
+/// of handing a whole batch to `SavedFiltersSection` as one group.
+struct SavedFilterRow: View {
     let entry: SavedFilterEntry
     let onSelect: () -> Void
     let onTogglePin: () -> Void
