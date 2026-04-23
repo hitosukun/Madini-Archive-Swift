@@ -27,11 +27,25 @@ final class AppServices: ObservableObject {
     }
 
     #if os(macOS)
+    /// Path the watcher polls. Always resolvable, even in mock mode, so the
+    /// UI can still render "this is where it would go" when intake is off.
+    /// Published so the Drop folder pane re-renders when the user picks a
+    /// different directory via `setIntakeDirectory(_:)`.
+    ///
+    /// Seeded from `IntakeLocationStore.load()` on launch — if the user had
+    /// previously overridden the location, we honor that before any lazy
+    /// intake wiring runs. Absent override ⇒ `IntakePaths.intakeDir`
+    /// (`~/Documents/Madini Archive Intake`).
+    @Published private(set) var intakeDirURL: URL = IntakeLocationStore.load() ?? IntakePaths.intakeDir
+
     /// Lazy because `IntakeService` needs `self` to drive `ImportCoordinator`.
     /// Constructed on first access, started explicitly via `startIntake()` —
     /// we don't auto-start in `init` because the mock `DataSource` would wire
     /// the intake folder to a `NoOpRawExportVault` that rejects every ingest.
-    private(set) lazy var intake: IntakeService = IntakeService(services: self)
+    private(set) lazy var intake: IntakeService = IntakeService(
+        services: self,
+        intakeDir: intakeDirURL
+    )
 
     /// Kick off auto-intake. No-op when the app is running off mock data
     /// (there's no Vault to ingest into, so polling would just spam the
@@ -53,15 +67,17 @@ final class AppServices: ObservableObject {
         return intake.activityLog
     }
 
-    /// Path the watcher polls. Always resolvable, even in mock mode, so the
-    /// UI can still render "this is where it would go" when intake is off.
-    var intakeDirURL: URL {
-        // In mock mode `intake` is never instantiated — resolving through
-        // `IntakePaths` avoids lazy-init side effects for a read-only query.
+    /// Re-point the auto-intake watcher at a new directory (or, with `nil`,
+    /// reset to the default under `~/Documents`). Persists the choice so it
+    /// survives relaunches, and — in database mode — restarts the watcher
+    /// against the new path if it was already running.
+    func setIntakeDirectory(_ url: URL?) {
+        let resolved = url ?? IntakePaths.intakeDir
+        intakeDirURL = resolved
+        IntakeLocationStore.save(url)
         if case .database = dataSource {
-            return intake.intakeDir
+            intake.switchDirectory(to: resolved)
         }
-        return IntakePaths.intakeDir
     }
     #endif
 

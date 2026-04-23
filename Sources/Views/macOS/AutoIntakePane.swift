@@ -28,6 +28,7 @@ struct AutoIntakePane: View {
 
     private var header: some View {
         let url = services.intakeDirURL
+        let isDefault = url.standardizedFileURL == IntakePaths.intakeDir.standardizedFileURL
         return VStack(alignment: .leading, spacing: 8) {
             Label("Drop folder", systemImage: "tray.and.arrow.down.fill")
                 .font(.headline)
@@ -39,24 +40,56 @@ struct AutoIntakePane: View {
                 .truncationMode(.middle)
             HStack(spacing: 8) {
                 Button {
-                    NSWorkspace.shared.activateFileViewerSelecting([url])
-                } label: {
-                    Label("Reveal in Finder", systemImage: "folder")
-                }
-                .controlSize(.small)
-                Button {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(url.path, forType: .string)
                 } label: {
                     Label("Copy path", systemImage: "doc.on.doc")
                 }
                 .controlSize(.small)
+                Button {
+                    chooseIntakeDirectory()
+                } label: {
+                    Label("Change folder…", systemImage: "folder.badge.gearshape")
+                }
+                .controlSize(.small)
+                Button {
+                    services.setIntakeDirectory(nil)
+                } label: {
+                    Label("Reset to default", systemImage: "arrow.uturn.backward")
+                }
+                .controlSize(.small)
+                .disabled(isDefault)
             }
             Text("Exports dropped here (zip or folder) are ingested automatically. Re-dropping an already-vaulted export is detected and skipped.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
+            if !isDefault {
+                // Heads-up so the user knows the override is sticky — hands the
+                // "why is intake pointing at a weird folder" mystery back to
+                // the person who caused it instead of us.
+                Text("Using a custom drop folder. This choice persists until you reset it.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
         .padding(16)
+    }
+
+    /// Open a directory picker and, on selection, hand the chosen URL to
+    /// `AppServices.setIntakeDirectory(_:)`. `NSOpenPanel` is fine here
+    /// because the app is not sandboxed — we can persist a plain path and
+    /// re-read it next launch without a security-scoped bookmark dance.
+    private func chooseIntakeDirectory() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose intake folder"
+        panel.prompt = "Use this folder"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = services.intakeDirURL
+        guard panel.runModal() == .OK, let picked = panel.url else { return }
+        services.setIntakeDirectory(picked)
     }
 
     private var disabledBody: some View {

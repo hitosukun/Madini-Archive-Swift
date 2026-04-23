@@ -11,7 +11,10 @@ import Foundation
 @MainActor
 final class IntakeService {
     let activityLog: IntakeActivityLog
-    let intakeDir: URL
+    /// Directory currently being watched. Mutable because the user can
+    /// re-point intake at a different folder from the Drop folder pane;
+    /// `switchDirectory(to:)` is the only writer.
+    private(set) var intakeDir: URL
 
     private let services: AppServices
     private var watcher: IntakeWatcher?
@@ -38,8 +41,13 @@ final class IntakeService {
         guard watcher == nil else { return }
         // Ensure the directory exists so Finder can reveal it immediately and
         // so the first scan doesn't silently no-op if the user hasn't dropped
-        // anything yet.
-        IntakePaths.ensureIntakeDir()
+        // anything yet. We target `intakeDir` rather than the default path
+        // because the user may have redirected intake via
+        // `switchDirectory(to:)`.
+        try? FileManager.default.createDirectory(
+            at: intakeDir,
+            withIntermediateDirectories: true
+        )
 
         let processor = IntakeProcessor(services: services, activityLog: activityLog)
         let watcher = IntakeWatcher(
@@ -57,6 +65,18 @@ final class IntakeService {
     func stop() {
         watcher?.stop()
         watcher = nil
+    }
+
+    /// Re-point intake at a different folder. If the watcher was already
+    /// running we restart it against the new location; otherwise we just
+    /// update the stored URL so the next `start()` picks it up.
+    func switchDirectory(to url: URL) {
+        let wasRunning = watcher != nil
+        stop()
+        intakeDir = url
+        if wasRunning {
+            start()
+        }
     }
 }
 #endif
