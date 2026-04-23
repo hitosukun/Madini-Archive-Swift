@@ -87,6 +87,12 @@ final class MockViewService: ViewService, @unchecked Sendable {
     }
 
     func listUnifiedFilters(targetType: ViewTargetType, limit: Int) async throws -> [SavedFilterEntry] {
+        // Mirror the GRDB path's legacy eviction so previews & tests
+        // observe the same shape. Both recent AND saved_view rows are
+        // checked — the GRDB cleanup was widened once the user reported
+        // pinned tag entries (`#アルラウネ`) sticking around.
+        recentEntries.removeAll { $0.filters.isUnproducibleByCurrentShell }
+        savedViews.removeAll { $0.filters.isUnproducibleByCurrentShell }
         let all = (savedViews + recentEntries).filter { $0.targetType == targetType }
         let sorted = all.sorted { lhs, rhs in
             if lhs.pinned != rhs.pinned { return lhs.pinned && !rhs.pinned }

@@ -290,13 +290,19 @@ final class GRDBConversationRepository: ConversationRepository, @unchecked Senda
     )
     """
 
+    /// Phase 4: "bookmarked" is now derived from prompt-level pins.
+    /// A conversation is considered bookmarked iff at least one of its
+    /// user-authored messages has been pinned. Message ids follow
+    /// `{conversationID}:{messageRowID}`, so we match by the prefix
+    /// `c.id || ':'` to avoid `c.id LIKE c.id || '%'` collisions between
+    /// conversation ids that share a prefix.
     private static let bookmarkStatusSQL = """
     ,
     EXISTS(
         SELECT 1
         FROM bookmarks b
-        WHERE b.target_type = 'thread'
-          AND b.target_id = c.id
+        WHERE b.target_type = 'prompt'
+          AND b.target_id LIKE c.id || ':%'
     )
     """
 
@@ -341,12 +347,15 @@ final class GRDBConversationRepository: ConversationRepository, @unchecked Senda
         }
 
         if filter.bookmarkedOnly {
+            // Phase 4: "bookmarked threads" = "threads with at least one
+            // pinned prompt". Mirrors `bookmarkStatusSQL` above so the
+            // filter and the `is_bookmarked` flag agree on semantics.
             filters.append("""
                 EXISTS(
                     SELECT 1
                     FROM bookmarks b
-                    WHERE b.target_type = 'thread'
-                      AND b.target_id = c.id
+                    WHERE b.target_type = 'prompt'
+                      AND b.target_id LIKE c.id || ':%'
                 )
                 """)
         }

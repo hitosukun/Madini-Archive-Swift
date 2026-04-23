@@ -122,10 +122,23 @@ final class GRDBBookmarkRepository: BookmarkRepository, @unchecked Sendable {
                         ) AS primary_time
                     FROM bookmarks b
                     LEFT JOIN conversations c
-                        ON b.target_type = 'thread'
-                       AND c.id = b.target_id
+                        ON c.id = CASE b.target_type
+                                    WHEN 'thread' THEN b.target_id
+                                    -- Phase 4: prompt ids are formatted
+                                    -- `{conversationID}:{messageRowID}`,
+                                    -- so the owning thread is the prefix
+                                    -- up to the first ':'. Conversation
+                                    -- ids produced by our importers are
+                                    -- UUID-like and don't contain ':',
+                                    -- so first-colon is safe; if the
+                                    -- import ever does, the JOIN just
+                                    -- misses and the sidebar row drops.
+                                    WHEN 'prompt' THEN
+                                        substr(b.target_id, 1, instr(b.target_id, ':') - 1)
+                                    ELSE b.target_id
+                                  END
                     -- markdown import 会話は render 未対応のため一覧から除外。
-                    -- thread 以外のブックマーク (c が NULL) は影響させない。
+                    -- thread / prompt 以外 (c が NULL) は影響させない。
                     WHERE c.source IS NULL OR c.source != 'markdown'
                     ORDER BY b.updated_at DESC, b.created_at DESC, b.id DESC
                 """

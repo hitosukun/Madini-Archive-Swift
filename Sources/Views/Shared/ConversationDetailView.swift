@@ -613,7 +613,22 @@ private struct LoadedConversationDetailView: View {
             candidate = offsets.min(by: { $0.value < $1.value })?.key
         }
 
-        guard let candidate, candidate != selectedPromptID else { return }
+        guard let candidate else { return }
+        // Compare against `scrollDrivenSelection` (real @State) rather
+        // than `selectedPromptID` (the outgoing `@Binding`). Call sites
+        // that don't care about the scroll-driven selection pass
+        // `selectedPromptID: nil` into `ConversationDetailView`, which
+        // resolves to `.constant(nil)` internally — a sink that swallows
+        // writes. Against a .constant sink the old guard became
+        // `candidate != nil`, which is ALWAYS true for a non-empty
+        // viewport, so every preference emission wrote state and kicked
+        // off a re-evaluation pass. During scroll that produced visible
+        // chatter (user report: "右ペインを上にスクロールしたときの挙動が変。
+        // チャタリングしてるように見える"), worst on upward scroll where
+        // `LazyVStack` pays extra instantiating rows returning to the
+        // viewport. Keying the dedup off our own @State means the guard
+        // stays honest regardless of what the caller supplied.
+        guard candidate != scrollDrivenSelection else { return }
 
         scrollDrivenSelection = candidate
         selectedPromptID = candidate

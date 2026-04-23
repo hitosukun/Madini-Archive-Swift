@@ -931,39 +931,6 @@ final class LibraryViewModel {
         }
     }
 
-    /// Rename a saved-filter row and pin it in one user-visible gesture.
-    /// Used by the sidebar HISTORY section: clicking ⭐ on an unpinned
-    /// recent row prompts for a name; this method writes the name and
-    /// flips the pinned bit so the row promotes out of the eviction
-    /// window and reads as "saved-with-a-title" in the list.
-    ///
-    /// Unpin is deliberately NOT routed through here — it stays on
-    /// `togglePinned` (no prompt, just flip). Re-naming an already
-    /// pinned row also flows through here so the user can edit a
-    /// previously-given title without having to unpin / re-pin.
-    func renameAndPin(_ entry: SavedFilterEntry, newName: String) {
-        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        Task {
-            do {
-                _ = try await viewService.renameFilter(
-                    id: entry.id,
-                    targetType: entry.targetType,
-                    newName: trimmed
-                )
-                if !entry.pinned {
-                    _ = try await viewService.togglePinnedFilter(
-                        id: entry.id,
-                        targetType: entry.targetType
-                    )
-                }
-                await refreshSavedEntries()
-            } catch {
-                errorText = error.localizedDescription
-            }
-        }
-    }
-
     /// Delete any saved_filters row — replaces the old `deleteSavedView` path
     /// for the unified list so pinned AND recent rows can be removed.
     func deleteFilterEntry(_ entry: SavedFilterEntry) {

@@ -19,7 +19,19 @@ import SwiftUI
 fileprivate final class DesignMockDataStore: ObservableObject {
     @Published private(set) var conversations: [DesignMockConversation] = []
     @Published private(set) var sources: [DesignMockSource] = []
-    @Published private(set) var bookmarks: [DesignMockBookmark] = []
+    /// Prompt-level bookmarks. Phase 4 retargeted bookmarks from threads
+    /// ("is this conversation interesting?") to individual user prompts
+    /// ("is this specific question worth re-finding?"), so the sidebar
+    /// Bookmarks section now surfaces per-prompt rows instead of one row
+    /// per thread. Kept in display order (most-recently-updated first)
+    /// so the sidebar list matches the iteration order.
+    @Published private(set) var promptBookmarks: [DesignMockPromptBookmark] = []
+    /// O(1) lookup companion to `promptBookmarks`. Views (the expanded
+    /// card's prompt list, `MessageBubbleView`) ask "is THIS prompt
+    /// pinned?" once per row — doing a linear scan over `promptBookmarks`
+    /// on every bubble would be O(n·m). Recomputed alongside
+    /// `promptBookmarks` in `refreshBookmarks`.
+    @Published private(set) var pinnedPromptIDs: Set<String> = []
     @Published private(set) var isLoading: Bool = false
     @Published private(set) var isLoadingMore: Bool = false
     @Published private(set) var lastError: String?
@@ -254,24 +266,117 @@ fileprivate final class DesignMockDataStore: ObservableObject {
     func refreshBookmarks(services: AppServices) async {
         do {
             let entries = try await services.bookmarks.listBookmarks()
-            // Only surface thread-level bookmarks in the sidebar — prompt /
-            // virtual-fragment / saved-view bookmarks each have their own
-            // semantics and can't be clicked through to a conversation as a
-            // single row.
-            bookmarks = entries.compactMap { entry in
-                guard entry.targetType == .thread else { return nil }
-                return DesignMockBookmark(
+            // Phase 4: only prompt-level bookmarks surface in the sidebar.
+            // Thread / virtual-fragment / saved-view bookmarks are
+            // legacy — a thread bookmark is now implied ("thread has at
+            // least one pinned prompt") rather than a standalone row.
+            let prompts = entries.compactMap { entry -> DesignMockPromptBookmark? in
+                guard entry.targetType == .prompt else { return nil }
+                // Message IDs follow `{conversationID}:{messageRowID}`.
+                // Prefer the payload hint (set by the toggle path) but
+                // fall back to parsing the id so rows written by an
+                // older build without the payload still resolve.
+                let convID = entry.payload["conversation_id"]
+                    ?? Self.conversationID(fromPromptID: entry.targetID)
+                guard let convID, !convID.isEmpty else { return nil }
+                let snippet = entry.payload["snippet"]?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                return DesignMockPromptBookmark(
                     bookmarkID: entry.bookmarkID,
-                    conversationID: entry.targetID,
-                    title: entry.title ?? entry.label,
+                    promptID: entry.targetID,
+                    conversationID: convID,
+                    threadTitle: entry.title
+                        ?? entry.payload["thread_title"]
+                        ?? entry.label,
+                    snippet: (snippet?.isEmpty == false ? snippet! : "—"),
                     source: (entry.source ?? "unknown").lowercased(),
                     model: entry.model ?? "—",
-                    updated: Self.formatUpdated(entry.primaryTime)
+                    updated: Self.formatUpdated(entry.primaryTime ?? entry.updatedAt)
                 )
             }
+            self.promptBookmarks = prompts
+            self.pinnedPromptIDs = Set(prompts.map(\.promptID))
         } catch {
             lastError = String(describing: error)
         }
+    }
+
+    /// Toggle a prompt bookmark. `conversationID` is threaded in (not
+    /// derived) so a caller that already knows the owning thread doesn't
+    /// pay the cost of re-parsing the id — and `snippet`/`threadTitle`
+    /// get stored in `payload` so the sidebar can render a meaningful
+    /// row without a separate lookup.
+    func togglePromptBookmark(
+        promptID: String,
+        conversationID: String,
+        snippet: String,
+        threadTitle: String?,
+        services: AppServices
+    ) async {
+        let shouldBookmark = !pinnedPromptIDs.contains(promptID)
+        var payload: [String: String] = [
+            "conversation_id": conversationID
+        ]
+        let trimmed = snippet.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            // Cap the snippet so `payload_json` stays small — the sidebar
+            // only shows a single line anyway.
+            payload["snippet"] = String(trimmed.prefix(280))
+        }
+        if let threadTitle,
+           !threadTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            payload["thread_title"] = threadTitle
+        }
+
+        // Optimistic update so the pin UI flips immediately — the
+        // authoritative refresh below corrects any drift.
+        if shouldBookmark {
+            pinnedPromptIDs.insert(promptID)
+        } else {
+            pinnedPromptIDs.remove(promptID)
+        }
+
+        do {
+            _ = try await services.bookmarks.setBookmark(
+                target: BookmarkTarget(
+                    targetType: .prompt,
+                    targetID: promptID,
+                    payload: payload
+                ),
+                bookmarked: shouldBookmark
+            )
+            await refreshBookmarks(services: services)
+            // If the center pane is scoped to bookmarked threads, the
+            // set of matching threads may have just changed (first pin
+            // on a thread promotes it in; last unpin kicks it out).
+            if currentQuery.bookmarksOnly {
+                await refresh(services: services)
+            }
+        } catch {
+            // Revert the optimistic flip so the UI reflects the DB again.
+            if shouldBookmark {
+                pinnedPromptIDs.remove(promptID)
+            } else {
+                pinnedPromptIDs.insert(promptID)
+            }
+            lastError = String(describing: error)
+        }
+    }
+
+    /// O(1) lookup used by the expanded-card prompt list and the
+    /// reader's message bubbles to paint their pin state.
+    func isPromptBookmarked(_ promptID: String) -> Bool {
+        pinnedPromptIDs.contains(promptID)
+    }
+
+    /// Recover the owning conversation id from a message id. Message
+    /// ids are `{conversationID}:{messageRowID}` — we lastIndex(of:) so
+    /// conversation ids that themselves contain colons (rare but
+    /// legal in imports from some sources) still round-trip.
+    private static func conversationID(fromPromptID promptID: String) -> String? {
+        guard let sep = promptID.lastIndex(of: ":") else { return nil }
+        let head = String(promptID[..<sep])
+        return head.isEmpty ? nil : head
     }
 
     // MARK: - Fetch helpers
@@ -431,16 +536,31 @@ fileprivate final class DesignMockDataStore: ObservableObject {
     }
 }
 
-/// Thread-level bookmark row shown in the sidebar Bookmarks section.
-fileprivate struct DesignMockBookmark: Identifiable, Hashable {
+/// Prompt-level bookmark row shown as a child of the sidebar Bookmarks
+/// disclosure. Each row represents one pinned user prompt — clicking the
+/// row opens its owning conversation and scrolls to the message. Phase 4
+/// replaced the previous thread-level `DesignMockBookmark` shape; a thread
+/// is now "bookmarked" transitively when any of its prompts are pinned.
+fileprivate struct DesignMockPromptBookmark: Identifiable, Hashable {
     let bookmarkID: Int
+    /// Stable message id (`{conversationID}:{messageRowID}`). Used both
+    /// as the sidebar row id and as the scroll anchor passed through
+    /// `pendingPromptID` when the user clicks the row.
+    let promptID: String
     let conversationID: String
-    let title: String
+    /// Title of the owning conversation. Shown as the secondary line
+    /// so the user can tell two same-snippet pins apart (e.g. two
+    /// different threads both opening with "fix this bug").
+    let threadTitle: String
+    /// Cached prompt snippet — the primary visual of the row. Stored
+    /// in the bookmark's `payload_json` so the sidebar doesn't have to
+    /// re-fetch message bodies to render.
+    let snippet: String
     let source: String
     let model: String
     let updated: String
 
-    var id: Int { bookmarkID }
+    var id: String { promptID }
 }
 
 /// User-authored message displayed in the expanded-card prompt list.
@@ -484,6 +604,25 @@ struct DesignMockRootView: View {
     /// look at" is one surface, not two. Persisted to UserDefaults —
     /// see `RecentThreadsStore` for cap / eviction rules.
     @StateObject private var recentThreadsStore = RecentThreadsStore()
+    /// Pending debounced `recordRecentSearch` call. Cancel-and-reschedule
+    /// on every `composedQuery` change so typing "swift" doesn't write +
+    /// re-read the saved-filters table five times in a row — the final
+    /// settled query is the only one that gets recorded. Pairs with the
+    /// store's own "last write wins" fetch: whatever the user actually
+    /// landed on is what enters History.
+    @State private var recordRecentSearchTask: Task<Void, Never>?
+    /// Persisted center-pane width for the `.default` layout, one slot
+    /// per center display mode. The user's desired trade-off differs by
+    /// mode: table view wants the center wide (thread list + metadata
+    /// columns), card view wants it narrow (cards are self-contained
+    /// and the reader gets the slack). Two `@AppStorage` slots keep the
+    /// preferences independent across launches.
+    @AppStorage("designmock.centerPaneIdealWidth.cards") private var centerWidthCards: Double = 460
+    @AppStorage("designmock.centerPaneIdealWidth.table") private var centerWidthTable: Double = 560
+    /// Debounces the GeometryReader-driven save so a drag-resize doesn't
+    /// write to UserDefaults once per frame. Fires ~200ms after the user
+    /// stops dragging.
+    @State private var persistCenterWidthTask: Task<Void, Never>?
 
     var body: some View {
         rootSplitView
@@ -564,19 +703,23 @@ struct DesignMockRootView: View {
         // exactly what the current toolbar + sidebar configuration demands.
         .onChange(of: composedQuery) { _, newQuery in
             store.setQuery(newQuery, services: services)
-            // Also drop a recent-filter row into the shared DB so the
-            // sidebar HISTORY section reflects what the user just
-            // typed / picked. We build a minimal `ArchiveSearchFilter`
-            // from the subset of `FetchQuery` dimensions the shell
-            // exposes; richer fields (dates, roles, #tags) are
-            // dropped because the DesignMock shell doesn't offer a
-            // way to produce them. Recording happens on EVERY
-            // change — `saveRecentFilter` dedupes by filter_hash, so
-            // typing "s w i" doesn't create four separate rows; the
-            // final hash is what sticks.
-            if let libraryViewModel {
-                libraryViewModel.recordRecentSearch(
-                    archiveFilter(from: newQuery)
+            // Debounce the HISTORY recording. Prior version fired on
+            // every keystroke, and each call triggered a DB UPSERT +
+            // three reads (`listRecentFilters` + `listSavedViews` +
+            // `listUnifiedFilters`) + a `@Published` update that re-
+            // laid-out the sidebar. Typing a 5-char query stacked up
+            // ~5 of those bursts on the MainActor, visibly stalling
+            // the card list. Now only the *settled* query (user
+            // paused ≥400ms) is recorded. `saveRecentFilter` still
+            // dedupes by filter_hash on top of this, so pinning the
+            // same query twice never double-writes.
+            recordRecentSearchTask?.cancel()
+            let capturedQuery = newQuery
+            recordRecentSearchTask = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 400_000_000)
+                guard !Task.isCancelled else { return }
+                libraryViewModel?.recordRecentSearch(
+                    archiveFilter(from: capturedQuery)
                 )
             }
         }
@@ -666,12 +809,22 @@ struct DesignMockRootView: View {
                 }
             }
         case .default:
+            // The `.id(...)` on the NavigationSplitView forces a rebuild
+            // when the center display mode flips. `navigationSplitViewColumnWidth`
+            // only influences the *initial* layout of a given split-view
+            // instance — without the identity change, switching from cards
+            // (narrow center) to table (wider center) would leave the pane
+            // stuck at whichever width was active first. Rebuilding makes
+            // SwiftUI adopt the new ideal. The per-mode ideal comes from
+            // `currentCenterIdeal`, which reads whichever `@AppStorage` slot
+            // matches the active mode, so user drag-resizes survive across
+            // launches.
             NavigationSplitView {
                 sidebar
             } content: {
                 if showingAutoIntake {
                     AutoIntakePane()
-                        .navigationSplitViewColumnWidth(min: 360, ideal: 460, max: 760)
+                        .navigationSplitViewColumnWidth(min: 320, ideal: currentCenterIdeal, max: 760)
                 } else {
                     DesignMockDefaultContentPane(
                         displayMode: $selectedCenterDisplayMode,
@@ -688,7 +841,8 @@ struct DesignMockRootView: View {
                             store.loadMoreIfNeeded(services: services)
                         }
                     )
-                    .navigationSplitViewColumnWidth(min: 360, ideal: 460, max: 760)
+                    .background(centerWidthProbe)
+                    .navigationSplitViewColumnWidth(min: 320, ideal: currentCenterIdeal, max: 760)
                 }
             } detail: {
                 if showingAutoIntake {
@@ -697,6 +851,7 @@ struct DesignMockRootView: View {
                     readerPane(inThreadSearch: nil)
                 }
             }
+            .id("default-\(selectedCenterDisplayMode.rawValue)")
         case .viewer:
             NavigationSplitView {
                 sidebar
@@ -705,6 +860,70 @@ struct DesignMockRootView: View {
                     AutoIntakePane()
                 } else {
                     readerPane(inThreadSearch: $searchText)
+                }
+            }
+        }
+    }
+
+    /// Ideal center-pane width for the currently-active display mode in
+    /// `.default` layout. Reads the matching `@AppStorage` slot so the
+    /// width the user settled on last session is the one the split view
+    /// opens with next launch. Table mode gets its own slot from cards
+    /// because the columns-vs-cards trade-off genuinely asks for a
+    /// different ratio: the table wants room for `Model / Updated /
+    /// Prompts / Source` to breathe, cards hand slack to the reader.
+    private var currentCenterIdeal: CGFloat {
+        let raw = selectedCenterDisplayMode == .table ? centerWidthTable : centerWidthCards
+        // Clamp defensively so a stale / hand-edited preferences value
+        // can't lock the user out of the split (below-min disappears
+        // the pane, above-max is equally unusable).
+        return CGFloat(min(max(raw, 320), 760))
+    }
+
+    /// Transparent width probe mounted as the content pane's background.
+    /// SwiftUI's `NavigationSplitView` has no binding API for the
+    /// *current* column width, so the only way to capture what the user
+    /// dragged to is to observe it from inside the pane. `GeometryReader`
+    /// reports layout changes, we debounce, then write to the matching
+    /// `@AppStorage` slot.
+    private var centerWidthProbe: some View {
+        GeometryReader { proxy in
+            Color.clear
+                .onChange(of: proxy.size.width) { _, newValue in
+                    persistCenterWidth(newValue)
+                }
+                .onAppear {
+                    persistCenterWidth(proxy.size.width)
+                }
+        }
+    }
+
+    /// Debounced write to the per-mode `@AppStorage` slot. `GeometryReader`
+    /// fires on every frame of a drag-resize; persisting raw would churn
+    /// UserDefaults ~60× per second. A 200ms trailing window collapses the
+    /// burst into a single write landing after the user lets go. Values
+    /// outside the slider clamp are dropped so the split view's own min/max
+    /// stays authoritative — we're just recording what the user chose
+    /// *within* the allowed range.
+    private func persistCenterWidth(_ width: CGFloat) {
+        let clamped = min(max(Double(width), 320), 760)
+        // GeometryReader transiently reports 0 during teardown / mode
+        // switch. Treating that as a real preference would wipe the saved
+        // width the moment the user flips mode.
+        guard width > 1 else { return }
+        let mode = selectedCenterDisplayMode
+        persistCenterWidthTask?.cancel()
+        persistCenterWidthTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            guard !Task.isCancelled else { return }
+            switch mode {
+            case .table:
+                if abs(centerWidthTable - clamped) > 0.5 {
+                    centerWidthTable = clamped
+                }
+            case .cards:
+                if abs(centerWidthCards - clamped) > 0.5 {
+                    centerWidthCards = clamped
                 }
             }
         }
@@ -732,7 +951,7 @@ struct DesignMockRootView: View {
         DesignMockSidebar(
             selection: $selectedSidebarItemID,
             sources: store.sources,
-            bookmarks: store.bookmarks,
+            promptBookmarks: store.promptBookmarks,
             databaseInfo: store.databaseInfo,
             totalCount: store.totalCount,
             libraryViewModel: libraryViewModel,
@@ -873,11 +1092,15 @@ struct DesignMockRootView: View {
     /// Inverse (best-effort) of `DesignMockQueryLanguage.searchText(from:)`
     /// + the `composedQuery` builder: keyword, single-source, single-
     /// model, bookmarksOnly are the only dimensions this shell can
-    /// produce, so those are the only ones round-tripped. `tagName` is
-    /// ignored on purpose — tag UI was removed, and the DSL `tag:`
-    /// token is the only remaining path to generate one (if a user
-    /// types it, it enters history under the shared `bookmarkTags`
-    /// channel).
+    /// produce, so those are the only ones round-tripped.
+    ///
+    /// `query.tagName` is intentionally dropped. The tag-picker UI was
+    /// removed in the "ditch tags" redesign, and although the `tag:`
+    /// DSL token still filters live results, we do NOT want it seeding
+    /// `bookmarkTags`-bearing rows in `saved_filters` — those are the
+    /// rows `isUnproducibleByCurrentShell` treats as legacy and evicts
+    /// from HISTORY. Keeping them out at the write side means the
+    /// eviction pass has nothing new to clean up.
     private func archiveFilter(from query: DesignMockDataStore.FetchQuery) -> ArchiveSearchFilter {
         var filter = ArchiveSearchFilter(keyword: query.keyword)
         if let source = query.source {
@@ -888,9 +1111,6 @@ struct DesignMockRootView: View {
         }
         if query.bookmarksOnly {
             filter.bookmarkedOnly = true
-        }
-        if let tagName = query.tagName {
-            filter.bookmarkTags = [tagName]
         }
         return filter
     }
@@ -920,7 +1140,10 @@ private struct DesignMockSidebar: View {
     /// Live source list — supplied by `DesignMockDataStore` so switching
     /// between mock and real data refreshes the sidebar tree automatically.
     let sources: [DesignMockSource]
-    let bookmarks: [DesignMockBookmark]
+    /// Phase 4: per-user-prompt bookmarks. Rendered as children of the
+    /// Bookmarks row when the list is non-empty — clicking a child opens
+    /// the bookmark's owning thread and scrolls to the pinned prompt.
+    let promptBookmarks: [DesignMockPromptBookmark]
     let databaseInfo: DesignMockDataStore.DatabaseInfo?
     let totalCount: Int
     /// Shared library VM. Kept optional because it's built lazily in
@@ -951,11 +1174,6 @@ private struct DesignMockSidebar: View {
     /// collapses of the ones they've already interacted with.
     @State private var expandedSources: Set<String> = []
     @State private var haveSeededExpansion: Bool = false
-    /// Drives the rename alert. Only materializes when the user clicks
-    /// ⭐ on an already-pinned row (second-tap-to-rename). Fresh
-    /// pins bypass this entirely — pinning is silent now.
-    @State private var renamingEntry: SavedFilterEntry?
-    @State private var renameDraftText: String = ""
 
     var body: some View {
         // "All" subtitle is driven by the live source totals so the sidebar
@@ -980,7 +1198,7 @@ private struct DesignMockSidebar: View {
         let bookmarksRow = DesignMockSidebarItem(
             id: DesignMockSidebarItem.bookmarks.id,
             title: DesignMockSidebarItem.bookmarks.title,
-            subtitle: bookmarks.isEmpty ? nil : "\(bookmarks.count) saved",
+            subtitle: promptBookmarks.isEmpty ? nil : "\(promptBookmarks.count) pinned",
             systemImage: DesignMockSidebarItem.bookmarks.systemImage,
             kind: .bookmarks
         )
@@ -1018,12 +1236,12 @@ private struct DesignMockSidebar: View {
             // the sidebar doesn't draw a headed-but-empty collapsible
             // on a fresh DB.
             //
-            // ⭐ behavior on the filter rows:
-            //   - unpinned row → pin silently (no modal). Keeps the
-            //     auto-generated label.
-            //   - pinned row → open the rename alert pre-filled with
-            //     the current name. "Unpin" lives on the context
-            //     menu.
+            // ⭐ behavior on the filter rows: a plain pin/unpin toggle.
+            // Clicking the star pins the row silently, clicking again
+            // unpins it. Renaming is intentionally gone — the auto-
+            // generated label already reflects the filter contents, and
+            // a rename modal on every second-click was more friction
+            // than value.
             if historySectionHasContent {
                 Section("History") {
                     if let libraryViewModel, !libraryViewModel.unifiedFilters.isEmpty {
@@ -1033,14 +1251,7 @@ private struct DesignMockSidebar: View {
                                 onSelectHistoryEntry(entry)
                             },
                             onTogglePin: { entry in
-                                if entry.pinned {
-                                    // Second tap on a pinned ⭐ = rename.
-                                    renameDraftText = entry.name
-                                    renamingEntry = entry
-                                } else {
-                                    // First tap = pin silently.
-                                    libraryViewModel.togglePinned(entry)
-                                }
+                                libraryViewModel.togglePinned(entry)
                             },
                             onDelete: { entry in
                                 libraryViewModel.deleteFilterEntry(entry)
@@ -1068,32 +1279,6 @@ private struct DesignMockSidebar: View {
         }
         .onAppear {
             seedExpansionIfNeeded()
-        }
-        // Rename alert. Only materializes for pinned rows on a second
-        // ⭐ tap; first-time pinning skips this entirely. Using a
-        // binding-driven `.alert` keeps it feeling like a lightweight
-        // rename gesture — ⏎ saves, ⎋ cancels, and the tray behind
-        // stays visible so the user sees which row they're renaming.
-        .alert(
-            "Rename",
-            isPresented: Binding(
-                get: { renamingEntry != nil },
-                set: { isPresented in if !isPresented { renamingEntry = nil } }
-            ),
-            presenting: renamingEntry
-        ) { entry in
-            TextField("Name", text: $renameDraftText)
-            Button("Save") {
-                // `renameAndPin` is safe to call on an already-pinned
-                // row — it skips the re-pin step and just writes the
-                // new label. Kept as the one entry point so we don't
-                // split the rename path across two VM methods.
-                libraryViewModel?.renameAndPin(entry, newName: renameDraftText)
-                renamingEntry = nil
-            }
-            Button("Cancel", role: .cancel) {
-                renamingEntry = nil
-            }
         }
     }
 
@@ -1215,68 +1400,81 @@ private struct DesignMockThreadListPane: View {
     }
 
     private var cardList: some View {
-        // Back to the earliest simple layout: plain `List`, no per-row
-        // card chrome (no rounded rect fill, no stroke, no shadow).
-        // The previous version stacked four shape layers per row
-        // (fill + overlay fill + overlay stroke + shadow) plus a
-        // custom hit shape; on 200-row pages the compositor was
-        // re-rendering all four on every scroll frame, which is the
-        // "scrolling feels heavy" the user called out.
+        // `ScrollView` + `LazyVStack` instead of `List`. Rationale:
         //
-        // The sole visual tweak we keep from the redesign is the
-        // background color: the prior plain layout drew on the
-        // window's default gray `.regularMaterial` tray; this one
-        // uses `.textBackgroundColor` (white in Light Mode, the
-        // reader-pane token), per the user's "just swap gray for
-        // white" direction. Selection tint is back to
-        // `listRowBackground` — one fill per selected row instead
-        // of four layered shapes on every row.
+        // 1. Hit area. SwiftUI's `List` adds non-zero horizontal and
+        //    inter-row insets that `.contentShape(Rectangle())` can't
+        //    reach — clicks landing in the inset strips were visibly
+        //    dead. A `LazyVStack(spacing: 0)` row has zero gap above/
+        //    below, so the whole card rectangle is clickable with no
+        //    seams. User report: "当たり判定に隙間がある".
         //
-        // `List(selection:)` with a `Set` binding remains, so
-        // ⌘/⇧-click multi-select still works. `.tag(id)` is still
-        // required for SwiftUI's id→selection mapping.
-        List(selection: $selection) {
-            ForEach(conversations) { conversation in
-                DesignMockConversationListRow(conversation: conversation)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .contentShape(Rectangle())
-                    // Double-click expands the prompt outline. Single
-                    // / ⌘ / ⇧ clicks stay with List's native
-                    // selection gesture.
-                    .onTapGesture(count: 2) {
-                        withAnimation(.easeOut(duration: 0.16)) {
-                            expandedPromptConversationID = conversation.id
-                            selection = [conversation.id]
+        // 2. Scroll cost. `List` on macOS wraps NSTableView and layers
+        //    on SwiftUI bridging, per-row `.listRowBackground` +
+        //    `.listRowSeparator(.hidden)` + `.scrollContentBackground(
+        //    .hidden)`. For plain custom rows (no system-standard cell
+        //    chrome) the bridging cost outweighs the recycling win.
+        //    LazyVStack renders rows directly, skips the NSTableView
+        //    round-trip, and the result is noticeably smoother on
+        //    200-row pages. User report: "スクロールがまだ重い".
+        //
+        // Interaction model is the pre-tag-era `selectOrToggle` pattern
+        // (commit 315caf2): first tap selects, second tap on the same
+        // card expands the prompt outline.
+        ScrollView {
+            LazyVStack(spacing: 0) {
+                ForEach(conversations) { conversation in
+                    DesignMockConversationListRow(conversation: conversation)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 12)
+                        // Padding is INSIDE the hit shape — tapping in
+                        // the edge margin still registers as the row.
+                        .contentShape(Rectangle())
+                        .background(
+                            selection.contains(conversation.id)
+                                ? Color.accentColor.opacity(0.14)
+                                : Color.clear
+                        )
+                        .onTapGesture {
+                            withAnimation(.easeOut(duration: 0.16)) {
+                                selectOrToggle(conversation)
+                            }
                         }
-                    }
-                    .listRowBackground(
-                        selection.contains(conversation.id)
-                            ? Color.accentColor.opacity(0.14)
-                            : Color.clear
-                    )
-                    .listRowSeparator(.hidden)
-                    .tag(conversation.id)
-                    .onAppear {
-                        // Trigger pagination when the last row scrolls into view.
-                        // `id == last?.id` keeps us from paging on every row and
-                        // also means mid-list scrolls don't thrash the fetcher.
-                        if conversation.id == conversations.last?.id {
-                            onReachEnd()
+                        .onAppear {
+                            // Trigger pagination when the last row scrolls into
+                            // view. Guard on id-equality so mid-list appearances
+                            // don't thrash the fetcher.
+                            if conversation.id == conversations.last?.id {
+                                onReachEnd()
+                            }
                         }
-                    }
-            }
-            if isLoadingMore {
-                ProgressView()
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 8)
-                    .listRowBackground(Color.clear)
-                    .listRowSeparator(.hidden)
+                }
+                if isLoadingMore {
+                    ProgressView()
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 8)
+                }
             }
         }
-        .listStyle(.plain)
-        .scrollContentBackground(.hidden)
         // White tray (was gray `.regularMaterial` / `.windowBackgroundColor`).
         .background(Color(nsColor: .textBackgroundColor))
+    }
+
+    /// First tap on a card ⇒ select it (replacing any prior selection).
+    /// Second tap on the same, already-selected card ⇒ expand/collapse
+    /// the prompt outline. Mirrors the pre-tag `selectOrToggle` in
+    /// commit 315caf2. The `Set<ID>` binding is treated as single-slot
+    /// (`[id]` or `[]`) because the table view and selection-repair
+    /// code still want a Set; card interactions never populate more
+    /// than one id.
+    private func selectOrToggle(_ conversation: DesignMockConversation) {
+        if selection == [conversation.id] {
+            expandedPromptConversationID =
+                expandedPromptConversationID == conversation.id ? nil : conversation.id
+        } else {
+            selection = [conversation.id]
+            expandedPromptConversationID = nil
+        }
     }
 
     private func pinnedPromptView(for conversation: DesignMockConversation) -> some View {
@@ -1456,14 +1654,32 @@ private struct DesignMockThreadTablePane: View {
                     }
                 }
             }
-            .width(min: 200, ideal: 320)
+            // Title absorbs slack — no `ideal` / `max`, so when the other
+            // columns hug their content the remainder lands here. Floor
+            // at 160pt so narrow windows still show a usable prefix.
+            .width(min: 160)
 
             TableColumn("Model", value: \DesignMockConversation.model) { conversation in
                 Text(conversation.model)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+                    .truncationMode(.tail)
+                    // Reserve enough horizontal space to render the
+                    // full slug without truncating. Table columns don't
+                    // intrinsically grow to fit their cells — they
+                    // respect the declared `ideal`/`max` — so if the
+                    // widest model string ("claude-3-5-sonnet-20241022",
+                    // etc.) needs ~180pt and the column's max is 96pt,
+                    // it clips. `fixedSize` forces the cell to claim
+                    // its natural width so the column's auto-layout
+                    // opens up for it instead.
+                    .fixedSize(horizontal: true, vertical: false)
             }
-            .width(min: 80, ideal: 140, max: 240)
+            // No `max` — let the column expand to whatever the widest
+            // visible model slug needs. `ideal: 120` is the opening
+            // width on first paint; the user can drag narrower down to
+            // the floor.
+            .width(min: 56, ideal: 120)
 
             // Date column sorts by `sortRank` rather than the display
             // string — the latter is pre-formatted, so lexicographic
@@ -1471,21 +1687,40 @@ private struct DesignMockThreadTablePane: View {
             TableColumn("Updated", value: \DesignMockConversation.sortRank) { conversation in
                 Text(conversation.updated)
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
             }
-            .width(82)
+            // Date string is fixed-shape ("MMM dd" or similar). Keep a
+            // soft ceiling so wide windows don't stretch 6 characters
+            // across a banner of whitespace, but raise it above the
+            // previous 72pt so locales that format longer (e.g.
+            // "Jan 1, 2026") don't end up clipped.
+            .width(min: 56, ideal: 72, max: 104)
 
             TableColumn("Prompts", value: \DesignMockConversation.prompts) { conversation in
                 Text("\(conversation.prompts)")
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
             }
-            .width(70)
+            // Header text "Prompts" itself is ~52pt at the default
+            // font — we need the column at least that wide or the
+            // header truncates to "Prom…". Cap accommodates 4-digit
+            // counts + header width without leaving huge dead space.
+            .width(min: 56, ideal: 64, max: 84)
 
             TableColumn("Source", value: \DesignMockConversation.source) { conversation in
                 Text(conversation.source)
                     .foregroundStyle(conversation.sourceColor)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
             }
-            .width(82)
+            // No `max` — "chatgpt"/"claude"/"gemini" all fit in ~52pt,
+            // but imports can surface longer labels (filesystem-path
+            // sources, custom importers). Dropping the 100pt cap lets
+            // those render in full instead of truncating mid-word.
+            .width(min: 56, ideal: 88)
         }
         // `primaryAction` fires on double-click or Return — the native
         // "open this row" affordance that Finder / Mail / every
@@ -1574,44 +1809,83 @@ private struct DesignMockExpandedPromptList: View {
 
     @ViewBuilder
     private func promptRow(_ prompt: DesignMockPrompt) -> some View {
-        Button {
-            // Fire the id — the reader observes this binding and scrolls to
-            // the matching message. `ConversationDetailView` clears the
-            // binding back to nil after applying, so reassigning the same
-            // id later still triggers a fresh scroll.
-            pendingPromptID = prompt.id
-            selectedPromptID = prompt.id
-        } label: {
-            HStack(alignment: .firstTextBaseline, spacing: 10) {
-                Image(systemName: "text.bubble")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .frame(width: 18)
+        let isPinned = store.isPromptBookmarked(prompt.id)
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Image(systemName: "text.bubble")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .frame(width: 18)
 
-                Text(prompt.snippet)
-                    .font(.subheadline)
-                    .lineLimit(1)
-                    .foregroundStyle(.primary)
+            // Main click target — scroll-to-prompt. Kept as an explicit
+            // Button so the row responds to keyboard focus and taps,
+            // while the pin toggle below stays independently hit-testable
+            // (a .simultaneousGesture-style approach would swallow the
+            // pin tap into the row scroll action).
+            Button {
+                // Fire the id — the reader observes this binding and scrolls to
+                // the matching message. `ConversationDetailView` clears the
+                // binding back to nil after applying, so reassigning the same
+                // id later still triggers a fresh scroll.
+                pendingPromptID = prompt.id
+                selectedPromptID = prompt.id
+            } label: {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(prompt.snippet)
+                        .font(.subheadline)
+                        .lineLimit(1)
+                        .foregroundStyle(.primary)
 
-                Spacer(minLength: 8)
+                    Spacer(minLength: 8)
 
-                Text("\(prompt.index + 1)")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                    Text("\(prompt.index + 1)")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
             }
-            .padding(.vertical, 6)
-            .padding(.horizontal, 10)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(Rectangle())
-            .background(
-                rowBackground(for: prompt),
-                in: RoundedRectangle(cornerRadius: 6, style: .continuous)
-            )
+            .buttonStyle(.plain)
+
+            // Pin toggle. Only visible on hover or when already pinned —
+            // unpinned + unhovered rows stay visually quiet so the
+            // prompt list doesn't turn into a wall of bookmark icons.
+            pinButton(for: prompt, isPinned: isPinned)
+                .opacity(isPinned || hoveredPromptID == prompt.id ? 1 : 0)
         }
-        .buttonStyle(.plain)
+        .padding(.vertical, 6)
+        .padding(.horizontal, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            rowBackground(for: prompt),
+            in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+        )
+        .contentShape(Rectangle())
         .onHover { hovering in
             hoveredPromptID = hovering ? prompt.id : (hoveredPromptID == prompt.id ? nil : hoveredPromptID)
         }
+    }
+
+    @ViewBuilder
+    private func pinButton(for prompt: DesignMockPrompt, isPinned: Bool) -> some View {
+        Button {
+            Task {
+                await store.togglePromptBookmark(
+                    promptID: prompt.id,
+                    conversationID: conversation.id,
+                    snippet: prompt.snippet,
+                    threadTitle: conversation.title,
+                    services: services
+                )
+            }
+        } label: {
+            Image(systemName: isPinned ? "bookmark.fill" : "bookmark")
+                .font(.subheadline)
+                .foregroundStyle(isPinned ? Color.yellow : Color.secondary)
+                .frame(width: 18)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(isPinned ? "Unpin prompt" : "Pin prompt")
     }
 
     private func rowBackground(for prompt: DesignMockPrompt) -> Color {
@@ -1661,6 +1935,15 @@ private struct DesignMockReaderPaneContent: View {
     let conversation: DesignMockConversation?
     let services: AppServices
     let libraryViewModel: LibraryViewModel
+    /// Shared data store. Read here for two purposes: (1) the
+    /// `PromptBookmarkBridge` the reader injects so user-message
+    /// bubbles can toggle their pin, and (2) observing
+    /// `pinnedPromptIDs` so the bubble re-renders the moment the pin
+    /// flips (the bridge's `isPinned` closure captures the store, but
+    /// SwiftUI only re-evaluates the environment-reading bubbles when
+    /// the enclosing view re-evaluates — which happens because we
+    /// listen via `@EnvironmentObject`).
+    @EnvironmentObject private var store: DesignMockDataStore
     @Binding var pendingPromptID: String?
     /// Two-way binding into the shell's search text — non-nil only in
     /// focus mode. When present the reader renders a find-in-page bar
@@ -1668,13 +1951,25 @@ private struct DesignMockReaderPaneContent: View {
     /// side stays in sync) and drives scroll-to-match on `pendingPromptID`.
     private let inThreadSearch: Binding<String>?
 
-    /// Message IDs (in transcript order) that contain the current
-    /// in-thread query. Refreshed whenever the conversation or the query
-    /// changes. Empty when there's no query or no matches.
-    @State private var matchIDs: [String] = []
+    /// Every individual keyword occurrence across the thread, in
+    /// transcript order. Each entry is "message M, occurrence N" — so a
+    /// message with the query appearing 3 times contributes 3 entries.
+    /// This drives per-keyword Prev/Next: stepping cycles through
+    /// individual hits rather than jumping whole messages at a time.
+    @State private var matchLocations: [MatchLocation] = []
     /// Which match is currently centered in the reader. Clamped to
-    /// `matchIDs.indices` — reset to 0 when the list changes.
+    /// `matchLocations.indices` — reset to 0 when the list changes.
     @State private var currentMatchIndex: Int = 0
+
+    /// A single keyword hit. `occurrenceInMessage` is the 0-indexed
+    /// rank of this hit inside its own message under a case-insensitive
+    /// left-to-right scan, and matches the indexing
+    /// `MessageBubbleView.applyingSearchHighlight` uses when picking
+    /// which range to paint hot.
+    fileprivate struct MatchLocation: Equatable {
+        let messageID: String
+        let occurrenceInMessage: Int
+    }
     /// Monotonic token used to cancel in-flight search recomputations
     /// when the user keeps typing.
     @State private var searchToken: UUID = UUID()
@@ -1725,6 +2020,7 @@ private struct DesignMockReaderPaneContent: View {
                 )
                 .id(conversation.id)
                 .environment(libraryViewModel)
+                .environment(\.promptBookmarkBridge, promptBookmarkBridge(for: conversation))
                 .overlay(alignment: .top) {
                     // Only surface the nav strip when the user has
                     // actually typed something — otherwise it'd float at
@@ -1735,7 +2031,7 @@ private struct DesignMockReaderPaneContent: View {
                     if let binding = inThreadSearch, !effectiveQuery.isEmpty {
                         FindInPageNavStrip(
                             text: binding,
-                            matchCount: matchIDs.count,
+                            matchCount: matchLocations.count,
                             currentIndex: currentMatchIndex,
                             onPrev: { stepMatch(by: -1) },
                             onNext: { stepMatch(by: 1) }
@@ -1783,29 +2079,63 @@ private struct DesignMockReaderPaneContent: View {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// Construct a `PromptBookmarkBridge` bound to the currently-open
+    /// conversation. The closures capture the store + services by
+    /// reference; SwiftUI re-reads this every body pass when
+    /// `pinnedPromptIDs` changes so `isPinned` reflects the freshest
+    /// set, and `toggle` always sees the current services handle.
+    private func promptBookmarkBridge(for conversation: DesignMockConversation) -> PromptBookmarkBridge {
+        let store = self.store
+        let services = self.services
+        let convID = conversation.id
+        let threadTitle = conversation.title
+        return PromptBookmarkBridge(
+            isPinned: { [weak store] promptID in
+                store?.isPromptBookmarked(promptID) ?? false
+            },
+            toggle: { [weak store] promptID, snippet in
+                guard let store else { return }
+                Task {
+                    await store.togglePromptBookmark(
+                        promptID: promptID,
+                        conversationID: convID,
+                        snippet: snippet,
+                        threadTitle: threadTitle,
+                        services: services
+                    )
+                }
+            }
+        )
+    }
+
     /// The spec handed to `ConversationDetailView` for keyword-level
     /// highlighting. `nil` when there's nothing to paint, so the reader
-    /// stays in its no-op path. The active message id comes from the
-    /// find bar's "N / M" cursor so the currently-centered match is
-    /// drawn in a hotter color than the rest.
+    /// stays in its no-op path. The active message id + occurrence
+    /// index come from the find bar's "N / M" cursor so the single
+    /// currently-centered keyword — not the whole message — is drawn
+    /// in the hotter color.
     private var currentSearchHighlight: SearchHighlightSpec? {
         let q = effectiveQuery
         guard !q.isEmpty else { return nil }
-        let active: String? = matchIDs.indices.contains(currentMatchIndex)
-            ? matchIDs[currentMatchIndex]
+        let location: MatchLocation? = matchLocations.indices.contains(currentMatchIndex)
+            ? matchLocations[currentMatchIndex]
             : nil
-        return SearchHighlightSpec(query: q, activeMessageID: active)
+        return SearchHighlightSpec(
+            query: q,
+            activeMessageID: location?.messageID,
+            activeOccurrenceInMessage: location?.occurrenceInMessage
+        )
     }
 
     /// Fetch the conversation detail, scan every message for a
     /// case-insensitive substring match on the query, and publish the
-    /// resulting ids. Also fires the first jump so the reader snaps to
-    /// match #1 without the user having to tap Next.
+    /// resulting per-occurrence locations. Also fires the first jump so
+    /// the reader snaps to match #1 without the user having to tap Next.
     private func recomputeMatches() async {
         let query = effectiveQuery
         guard !query.isEmpty, let convo = conversation else {
             await MainActor.run {
-                matchIDs = []
+                matchLocations = []
                 currentMatchIndex = 0
             }
             return
@@ -1813,47 +2143,78 @@ private struct DesignMockReaderPaneContent: View {
         do {
             guard let detail = try await services.conversations.fetchDetail(id: convo.id) else {
                 await MainActor.run {
-                    matchIDs = []
+                    matchLocations = []
                     currentMatchIndex = 0
                 }
                 return
             }
-            // Case-insensitive, diacritic-insensitive substring scan. We
-            // intentionally don't tokenize — the user's mental model for
-            // an in-thread finder is "literal substring", matching ⌘F in
-            // every text editor.
-            let needle = query.lowercased()
-            let ids: [String] = detail.messages.compactMap { message in
-                message.content.lowercased().contains(needle) ? message.id : nil
+            // Case-insensitive substring scan. We intentionally don't
+            // tokenize — the user's mental model for an in-thread
+            // finder is "literal substring", matching ⌘F in every text
+            // editor. Per message we walk left-to-right and record
+            // each hit; the resulting flat list is what the find bar's
+            // N/M cursor steps through.
+            let needle = query
+            var locations: [MatchLocation] = []
+            for message in detail.messages {
+                let content = message.content
+                var searchFrom = content.startIndex
+                var occurrence = 0
+                while searchFrom < content.endIndex,
+                      let range = content.range(
+                        of: needle,
+                        options: .caseInsensitive,
+                        range: searchFrom..<content.endIndex
+                      ) {
+                    locations.append(MatchLocation(
+                        messageID: message.id,
+                        occurrenceInMessage: occurrence
+                    ))
+                    occurrence += 1
+                    // Advance past the match. Use `range.upperBound`
+                    // directly — overlapping matches aren't meaningful
+                    // for user-facing find, and this matches the
+                    // non-overlapping scan in `applyingSearchHighlight`
+                    // so per-occurrence indices line up exactly.
+                    searchFrom = range.upperBound
+                }
             }
             await MainActor.run {
-                matchIDs = ids
+                matchLocations = locations
                 currentMatchIndex = 0
-                // Auto-jump to the first match so the user sees feedback
-                // immediately on typing.
-                if let first = ids.first {
-                    pendingPromptID = first
+                // Auto-jump to the first match's message so the user
+                // sees feedback immediately on typing. Subsequent hits
+                // inside the same message don't need a re-scroll.
+                if let first = locations.first {
+                    pendingPromptID = first.messageID
                 }
             }
         } catch {
             // Silent — this is a mock shell, and a failed fetch just
             // means "no navigator shown" rather than a hard error.
             await MainActor.run {
-                matchIDs = []
+                matchLocations = []
                 currentMatchIndex = 0
             }
         }
     }
 
     /// Move the active match index by `delta`, wrapping around the ends
-    /// of the list, then fire `pendingPromptID` so the underlying
-    /// `ConversationDetailView` scrolls to it.
+    /// of the list. Only fires `pendingPromptID` when the step crosses a
+    /// message boundary — stepping between two occurrences inside the
+    /// same bubble just advances the hot-color cursor via the updated
+    /// `SearchHighlightSpec`, without re-triggering a scroll that would
+    /// jerk the viewport back to the top of the message.
     private func stepMatch(by delta: Int) {
-        guard !matchIDs.isEmpty else { return }
-        let count = matchIDs.count
+        guard !matchLocations.isEmpty else { return }
+        let count = matchLocations.count
         let next = ((currentMatchIndex + delta) % count + count) % count
+        let previousMessageID = matchLocations[currentMatchIndex].messageID
         currentMatchIndex = next
-        pendingPromptID = matchIDs[next]
+        let nextMessageID = matchLocations[next].messageID
+        if nextMessageID != previousMessageID {
+            pendingPromptID = nextMessageID
+        }
     }
 
     private var emptyState: some View {

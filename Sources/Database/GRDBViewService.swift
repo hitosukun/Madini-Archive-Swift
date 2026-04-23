@@ -187,7 +187,20 @@ final class GRDBViewService: ViewService, @unchecked Sendable {
 
     func listUnifiedFilters(targetType: ViewTargetType, limit: Int) async throws -> [SavedFilterEntry] {
         let effectiveLimit = limit > 0 ? limit : unifiedLimit
-        return try await GRDBAsync.read(from: dbQueue) { db in
+        return try await GRDBAsync.write(to: dbQueue) { db in
+            // One-shot cleanup: older builds let saved_filters rows
+            // capture dimensions the current shell has no way to
+            // reproduce (bookmarkTags, sourceFiles, roles, date
+            // ranges, multi-source / multi-model). Those rows sit in
+            // HISTORY forever — clicking one can never round-trip
+            // back through the search field because the shell has no
+            // UI for the missing dimension. Purge both `kind = 'recent'`
+            // AND `kind = 'saved_view'` rows that match: the user's
+            // bug report was specifically about pinned tag entries
+            // (`#アルラウネ`, `#ゴミ箱`) lingering in the sidebar, so
+            // sparing saved_view no longer matches intent.
+            try Self.purgeLegacyRows(db: db, targetType: targetType)
+
             let rows = try Row.fetchAll(
                 db,
                 sql: """
@@ -203,6 +216,54 @@ final class GRDBViewService: ViewService, @unchecked Sendable {
             return rows.compactMap { row in
                 do { return try Self.makeEntry(row) } catch { return nil }
             }
+        }
+    }
+
+    /// Delete saved_filters rows (both `recent` and `saved_view`) whose
+    /// stored filter includes a dimension the DesignMock shell's query
+    /// DSL cannot reproduce. See
+    /// `ArchiveSearchFilter.isUnproducibleByCurrentShell` — any change
+    /// to the set of producible dimensions there is authoritative.
+    ///
+    /// Runs inside an existing write transaction. Swallows decode
+    /// errors: a row with unreadable filter_json is also considered
+    /// dead weight and gets the same eviction treatment.
+    private static func purgeLegacyRows(
+        db: Database,
+        targetType: ViewTargetType
+    ) throws {
+        let rows = try Row.fetchAll(
+            db,
+            sql: """
+                SELECT id, filter_json
+                FROM saved_filters
+                WHERE target_type = ?
+            """,
+            arguments: [targetType.rawValue]
+        )
+        var victimIDs: [Int64] = []
+        let decoder = JSONDecoder()
+        for row in rows {
+            guard let id = row["id"] as Int64? else { continue }
+            guard let json = row["filter_json"] as String?,
+                  let data = json.data(using: .utf8) else {
+                victimIDs.append(id)
+                continue
+            }
+            do {
+                let filter = try decoder.decode(ArchiveSearchFilter.self, from: data)
+                if filter.isUnproducibleByCurrentShell {
+                    victimIDs.append(id)
+                }
+            } catch {
+                victimIDs.append(id)
+            }
+        }
+        for id in victimIDs {
+            try db.execute(
+                sql: "DELETE FROM saved_filters WHERE id = ?",
+                arguments: [id]
+            )
         }
     }
 

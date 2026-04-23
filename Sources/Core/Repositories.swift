@@ -312,6 +312,38 @@ struct ArchiveSearchFilter: Codable, Hashable, Sendable {
         get { models.count == 1 ? models.first : nil }
         set { models = Set(newValue.map { [$0] } ?? []) }
     }
+
+    /// True when this filter carries at least one dimension the current
+    /// DesignMock shell (keyword + single source + single model +
+    /// bookmarksOnly) has no UI path to produce. Used to evict legacy
+    /// saved_filters rows from the HISTORY list — such rows would
+    /// otherwise linger forever because their `filter_hash` can never
+    /// match any new query the user can actually issue, so
+    /// `saveRecentFilter`'s dedup path never touches them.
+    ///
+    /// Applied to BOTH `kind = 'recent'` AND `kind = 'saved_view'` rows:
+    /// an earlier iteration spared saved_view "in case the user pinned
+    /// one intentionally," but the whole point of the tag-removal
+    /// refactor is that these dimensions can no longer be filtered
+    /// against, so a pinned row whose filter is unreachable is just
+    /// sidebar noise (user report: "History にしつこく残ってる").
+    /// `bookmarkTags` is checked as "any entry" — the tag-picker UI
+    /// was removed and the `tag:` DSL token no longer round-trips
+    /// into history recording, so any row with a tag is legacy.
+    ///
+    /// Keep in sync with `archiveFilter(from:)` in `DesignMockRootView`
+    /// — that function defines, in one place, which dimensions the
+    /// shell round-trips into a saved_filters row.
+    var isUnproducibleByCurrentShell: Bool {
+        if !sourceFiles.isEmpty { return true }
+        if !roles.isEmpty { return true }
+        if normalized(dateFrom) != nil { return true }
+        if normalized(dateTo) != nil { return true }
+        if sources.count > 1 { return true }
+        if models.count > 1 { return true }
+        if !bookmarkTags.isEmpty { return true }
+        return false
+    }
 }
 
 struct ConversationListQuery: Hashable, Sendable {

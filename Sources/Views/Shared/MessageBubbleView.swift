@@ -14,11 +14,23 @@ import SwiftMath
 ///
 /// Semantics:
 /// - `query` empty / whitespace → no highlight (cheap no-op path).
-/// - `activeMessageID == message.id` → intense "you are here" color.
-/// - Any other match → dim "also hit" color.
+/// - `activeMessageID == message.id` + `activeOccurrenceInMessage == N` →
+///   the Nth (0-indexed) occurrence inside that message is the single
+///   "you are here" hit and gets the hot color; every other occurrence
+///   (in this message and across the thread) stays in the dim "also
+///   hit" color.
+/// - `activeMessageID == message.id` with `activeOccurrenceInMessage ==
+///   nil` → every occurrence in this message gets the hot color
+///   (legacy message-level cursor). Retained so non-per-occurrence
+///   callers keep working.
 struct SearchHighlightSpec: Equatable {
     var query: String
     var activeMessageID: String?
+    /// Which specific occurrence inside `activeMessageID` is the current
+    /// jump target. 0-indexed against a case-insensitive left-to-right
+    /// scan of the message text. `nil` falls back to the message-level
+    /// highlight so older call sites keep working without opting in.
+    var activeOccurrenceInMessage: Int?
 
     var normalizedQuery: String {
         query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -35,6 +47,34 @@ extension EnvironmentValues {
     var searchHighlight: SearchHighlightSpec? {
         get { self[SearchHighlightKey.self] }
         set { self[SearchHighlightKey.self] = newValue }
+    }
+}
+
+/// Phase 4 env-delivered hook so user-authored message bubbles can
+/// expose a pin toggle without `MessageBubbleView` needing to know
+/// which conversation owns them or which repository/store backs the
+/// bookmark state. The host (`ConversationDetailView`'s caller, or
+/// the DesignMock shell) captures the conversation id inside the
+/// closures and seeds `isPinned` from an observable set so the
+/// bubble re-renders the moment the pin flips.
+struct PromptBookmarkBridge {
+    /// `true` when the given message id is currently pinned. Cheap —
+    /// implementations back this with a `Set<String>` lookup.
+    var isPinned: (_ promptID: String) -> Bool
+    /// Toggle the pin for the given message id. `snippet` is a short
+    /// excerpt the sidebar list uses to render the row without
+    /// re-fetching the message body.
+    var toggle: (_ promptID: String, _ snippet: String) -> Void
+}
+
+private struct PromptBookmarkBridgeKey: EnvironmentKey {
+    static let defaultValue: PromptBookmarkBridge? = nil
+}
+
+extension EnvironmentValues {
+    var promptBookmarkBridge: PromptBookmarkBridge? {
+        get { self[PromptBookmarkBridgeKey.self] }
+        set { self[PromptBookmarkBridgeKey.self] = newValue }
     }
 }
 
@@ -114,6 +154,11 @@ struct MessageBubbleView: View, Equatable {
     /// which is exactly what we want when the user types into the find
     /// bar.
     @Environment(\.searchHighlight) private var searchHighlight
+    /// Optional Phase 4 pin bridge. When present, user-message bubbles
+    /// render a small bookmark toggle next to their byline; when nil
+    /// (legacy callers / previews that don't wire a bridge), the
+    /// affordance is omitted entirely.
+    @Environment(\.promptBookmarkBridge) private var promptBookmarkBridge
     #if os(macOS)
     @Environment(\.openSettings) private var openSettings
     #endif
@@ -155,6 +200,41 @@ struct MessageBubbleView: View, Equatable {
         }
     }
 
+    /// Pin toggle rendered inside the user-message byline when a
+    /// `PromptBookmarkBridge` is available in the environment. Clicking
+    /// flips the bookmark for this specific message; the shell observes
+    /// the resulting set and updates the sidebar Bookmarks disclosure.
+    /// Kept snug (14pt glyph) so it reads as a secondary affordance
+    /// rather than a competing primary action to the avatar.
+    @ViewBuilder
+    private func pinToggle(bridge: PromptBookmarkBridge) -> some View {
+        let pinned = bridge.isPinned(message.id)
+        Button {
+            bridge.toggle(message.id, pinSnippet)
+        } label: {
+            Image(systemName: pinned ? "bookmark.fill" : "bookmark")
+                .font(.caption)
+                .foregroundStyle(pinned ? Color.yellow : Color.secondary)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(pinned ? "Unpin this prompt" : "Pin this prompt")
+    }
+
+    /// Short excerpt stored in the bookmark payload so the sidebar row
+    /// can render without re-loading the full message. Collapse
+    /// whitespace runs first — otherwise `prefix(140)` on a prompt that
+    /// starts with "\n\n" would emit a row that looks blank.
+    private var pinSnippet: String {
+        let collapsed = message.content
+            .replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\t", with: " ")
+        let trimmed = collapsed.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.count <= 140 { return trimmed }
+        return String(trimmed.prefix(140)) + "…"
+    }
+
     /// The avatar is a gateway into the Settings window where the user
     /// edits the user / assistant identity (name + avatar). Wrapped in a
     /// plain button so it stays visually identical while gaining a
@@ -189,10 +269,19 @@ struct MessageBubbleView: View, Equatable {
     /// both sides.
     private var userMessageColumn: some View {
         VStack(alignment: .trailing, spacing: 4) {
-            Text(identityPresentation.displayName)
-                .font(.caption)
-                .fontWeight(.semibold)
-                .foregroundStyle(identityPresentation.accentColor)
+            // Byline row: pin toggle (when the env bridge is wired) to
+            // the left of the name. The pin sits outside the bubble so
+            // it stays visually at the "header" level — the prompt
+            // bubble itself is the payload, the header is the metadata.
+            HStack(spacing: 6) {
+                if let bridge = promptBookmarkBridge {
+                    pinToggle(bridge: bridge)
+                }
+                Text(identityPresentation.displayName)
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                    .foregroundStyle(identityPresentation.accentColor)
+            }
 
             // User prompts render verbatim regardless of display mode.
             // The raw input often contains markdown-significant prefixes
@@ -492,21 +581,36 @@ struct MessageBubbleView: View, Equatable {
             return attr
         }
         var result = attr
-        let isActive = (spec.activeMessageID == message.id)
-        // Two-tier color: the "current" match in the find bar reads as
-        // saturated orange; all other matches across the thread read as
-        // a softer yellow so the user can scan-find additional hits
-        // without the active one getting lost in the crowd.
-        let bg: Color = isActive
-            ? Color.orange.opacity(0.55)
-            : Color.yellow.opacity(0.45)
+        let isActiveMessage = (spec.activeMessageID == message.id)
+        // Per-occurrence active index: when the find bar's cursor
+        // points at a specific occurrence inside this message, only
+        // that single occurrence gets the hot color. If the caller
+        // didn't opt into per-occurrence semantics (legacy callers
+        // pass `nil`), fall back to painting every occurrence in the
+        // active message hot — this preserves the old message-level
+        // cursor behavior.
+        let activeOccurrence = spec.activeOccurrenceInMessage
+        let hot = Color.orange.opacity(0.55)
+        let dim = Color.yellow.opacity(0.45)
 
         var searchStart = result.startIndex
+        var occurrenceIndex = 0
         while searchStart < result.endIndex,
               let range = result[searchStart..<result.endIndex]
                 .range(of: needle, options: .caseInsensitive) {
-            result[range].backgroundColor = bg
+            let isHot: Bool
+            if isActiveMessage {
+                if let target = activeOccurrence {
+                    isHot = occurrenceIndex == target
+                } else {
+                    isHot = true
+                }
+            } else {
+                isHot = false
+            }
+            result[range].backgroundColor = isHot ? hot : dim
             searchStart = range.upperBound
+            occurrenceIndex += 1
         }
         return result
     }

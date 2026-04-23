@@ -182,12 +182,15 @@ final class GRDBSearchRepository: SearchRepository, @unchecked Sendable {
         }
 
         if query.filter.bookmarkedOnly {
+            // Phase 4: "bookmarked threads" = "threads with at least one
+            // pinned prompt". Kept in lockstep with
+            // `GRDBConversationRepository.bookmarkStatusSQL`.
             filters.append("""
                 EXISTS(
                     SELECT 1
                     FROM bookmarks b
-                    WHERE b.target_type = 'thread'
-                      AND b.target_id = c.id
+                    WHERE b.target_type = 'prompt'
+                      AND b.target_id LIKE c.id || ':%'
                 )
                 """)
         }

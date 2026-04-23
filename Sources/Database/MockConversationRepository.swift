@@ -90,6 +90,10 @@ final class MockConversationRepository: ConversationRepository, @unchecked Senda
         items.filter { item in
             let sourceMatches = filter.sources.isEmpty || filter.sources.contains(item.source ?? "")
             let modelMatches = filter.models.isEmpty || filter.models.contains(item.model ?? "")
+            // Phase 4 changed the canonical definition of "bookmarked" to
+            // "at least one user prompt in the thread is pinned". The
+            // preview/test-only mock keeps the simpler per-item boolean
+            // since `PreviewData` fixtures don't model per-message state.
             let bookmarkMatches = !filter.bookmarkedOnly || item.isBookmarked
             let fromMatches = filter.dateFrom?.isEmpty != false || (item.primaryTime ?? "") >= (filter.dateFrom ?? "")
             let toMatches = filter.dateTo?.isEmpty != false || (item.primaryTime ?? "") <= (filter.dateTo ?? "")
