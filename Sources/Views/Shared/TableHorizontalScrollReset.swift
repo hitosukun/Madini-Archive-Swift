@@ -151,6 +151,7 @@ struct TableHorizontalScrollReset: NSViewRepresentable {
 
         let beforeOriginX = scrollView?.contentView.bounds.origin.x ?? .nan
         let visibleWidth = scrollView?.contentView.bounds.width ?? .nan
+        let tableFrameWidth: CGFloat = tableView?.frame.width ?? .nan
         let totalColumnsWidth: CGFloat = {
             guard let tv = tableView else { return .nan }
             var sum: CGFloat = 0
@@ -159,9 +160,10 @@ struct TableHorizontalScrollReset: NSViewRepresentable {
             }
             return sum
         }()
+        let docViewFrameWidth: CGFloat = scrollView?.documentView?.frame.width ?? .nan
 
         if kDiagnosticLoggingEnabled {
-            tableScrollLog.debug("performReset tick=\(tickMs, privacy: .public)ms table=\(tableView == nil ? "nil" : "cols=\(tableView!.numberOfColumns) sumW=\(totalColumnsWidth)", privacy: .public) scroll=\(scrollView == nil ? "nil" : "origin.x=\(beforeOriginX) visW=\(visibleWidth)", privacy: .public)")
+            tableScrollLog.debug("performReset tick=\(tickMs, privacy: .public)ms table=\(tableView == nil ? "nil" : "cols=\(tableView!.numberOfColumns) sumW=\(totalColumnsWidth) tblFrameW=\(tableFrameWidth)", privacy: .public) scroll=\(scrollView == nil ? "nil" : "origin.x=\(beforeOriginX) visW=\(visibleWidth) docW=\(docViewFrameWidth)", privacy: .public)")
         }
 
         // One-time ancestor dump — tells us exactly which view
@@ -289,33 +291,45 @@ struct TableHorizontalScrollReset: NSViewRepresentable {
     }
 
     /// Shrinks the first (slack-absorbing) column by the exact amount
-    /// of horizontal overflow, so the column-widths sum equals the
-    /// visible viewport width. With zero overflow, there's no
+    /// of horizontal overflow, so the table's **frame width** fits
+    /// inside the clip view. With zero frame overflow, there's no
     /// horizontal scroll to get stuck at the wrong offset and the
     /// Title column is guaranteed to be on-screen.
+    ///
+    /// Comparing `tableView.frame.width` (not just the sum of
+    /// `tableColumns[i].width`) because SwiftUI Table on macOS 14+
+    /// wraps an `NSOutlineView` which carries a hidden outline
+    /// column (~14pt for the disclosure triangle) plus intercell
+    /// spacing that isn't counted in `tableColumns.width`. Earlier
+    /// logs showed sumW=504 but frame.width=604 — a 100pt gap
+    /// that makes the difference between "technically fits" and
+    /// "actually overflows."
     private static func compressColumnsToFit(tableView: NSTableView, scrollView: NSScrollView) {
         guard tableView.numberOfColumns > 0 else { return }
         let visibleWidth = scrollView.contentView.bounds.width
         guard visibleWidth > 0 else { return }
 
-        var totalWidth: CGFloat = 0
-        for col in tableView.tableColumns {
-            totalWidth += col.width
-        }
-        let overflow = totalWidth - visibleWidth
+        let tableFrameWidth = tableView.frame.width
+        let overflow = tableFrameWidth - visibleWidth
         guard overflow > 0.5 else { return }
 
         // First column in the SwiftUI Table is Title — declared with
         // `.width(min: 160)` and no ideal/max, which means it's the
         // one that's *meant* to absorb slack. Shrink it down by the
         // overflow amount, floored at its `minWidth` so we don't
-        // collapse it below usability.
+        // collapse it below usability. `minWidth` on SwiftUI's
+        // `.width(min: 160)` is 160pt; clamp target at 80pt as a
+        // hard floor below that in case the declaration didn't
+        // propagate (SwiftUI sometimes reports minWidth=0 for
+        // columns declared with just `min:`).
         let titleCol = tableView.tableColumns[0]
-        let targetWidth = max(titleCol.minWidth, titleCol.width - overflow)
-        if abs(targetWidth - titleCol.width) > 0.5 {
+        let hardFloor: CGFloat = max(titleCol.minWidth, 80)
+        let targetWidth = max(hardFloor, titleCol.width - overflow)
+        let prevWidth = titleCol.width
+        if abs(targetWidth - prevWidth) > 0.5 {
             titleCol.width = targetWidth
             if kDiagnosticLoggingEnabled {
-                tableScrollLog.debug("compressColumnsToFit shrunk col0 from \(titleCol.width + (titleCol.width - targetWidth), privacy: .public) to \(targetWidth, privacy: .public) (overflow=\(overflow, privacy: .public) visW=\(visibleWidth, privacy: .public))")
+                tableScrollLog.debug("compressColumnsToFit shrunk col0 from \(prevWidth, privacy: .public) to \(targetWidth, privacy: .public) (overflow=\(overflow, privacy: .public) visW=\(visibleWidth, privacy: .public) frameW=\(tableFrameWidth, privacy: .public))")
             }
         }
     }
@@ -399,13 +413,24 @@ struct TableHorizontalScrollReset: NSViewRepresentable {
     }
 
     /// Recursively finds the first `NSTableView` with at least
-    /// `minMultiColumnCount` columns, rejecting any class in the
-    /// `NSOutlineView` hierarchy (= sidebar List). Depth-first;
-    /// returns as soon as a qualifying view is seen.
+    /// `minMultiColumnCount` columns. Depth-first; returns as soon
+    /// as a qualifying view is seen.
+    ///
+    /// **Important:** we do NOT reject `NSOutlineView` subclasses
+    /// here, even though that would skip the sidebar List. The
+    /// reason is that on macOS 14+ SwiftUI's `Table` is ALSO
+    /// backed by an `NSOutlineView` subclass (`SwiftUIOutlineTableView`)
+    /// — the same class name as the sidebar List. Rejecting
+    /// outline views would exclude both, leaving nothing to reset.
+    ///
+    /// Discrimination between sidebar and center Table happens
+    /// instead by proximity: the probe lives inside the center
+    /// Table's own NSHostingView subtree via `.overlay(...)`, so
+    /// walking up from the probe the depth-first search always
+    /// hits the center Table's outline view before any ancestor
+    /// is reached that shares a subtree with the sidebar.
     private static func firstMultiColumnTableView(in view: NSView) -> NSTableView? {
-        if let t = view as? NSTableView,
-           !(t is NSOutlineView),
-           t.numberOfColumns >= minMultiColumnCount {
+        if let t = view as? NSTableView, t.numberOfColumns >= minMultiColumnCount {
             return t
         }
         for sub in view.subviews {
