@@ -704,20 +704,16 @@ private struct ConversationHeaderView: View {
         HStack(spacing: 8) {
             Spacer(minLength: 8)
 
-            // Source-origin pill + tag editor sit on the trailing
-            // side of the header row, immediately to the LEFT of the
-            // date timestamp. The user's spec: "右側にある日付の隣に
-            // 並べて" — group them with the date so the eye doesn't
-            // have to traverse the full pane width to find them.
+            // Source-origin pill sits immediately to the LEFT of the
+            // date timestamp so the eye doesn't have to traverse the
+            // full pane width to find it. The tag editor that used
+            // to sit alongside was retired when tags were dropped
+            // from the UI.
             SourceOriginPill(
                 conversationID: summary.id,
                 source: summary.source,
                 model: summary.model
             )
-
-            #if os(macOS)
-            ConversationTagsEditor(conversationID: summary.id)
-            #endif
 
             if let time = summary.primaryTime {
                 Text(time)

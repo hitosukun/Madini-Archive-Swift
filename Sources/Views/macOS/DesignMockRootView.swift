@@ -20,7 +20,6 @@ fileprivate final class DesignMockDataStore: ObservableObject {
     @Published private(set) var conversations: [DesignMockConversation] = []
     @Published private(set) var sources: [DesignMockSource] = []
     @Published private(set) var bookmarks: [DesignMockBookmark] = []
-    @Published private(set) var tags: [TagEntry] = []
     @Published private(set) var isLoading: Bool = false
     @Published private(set) var isLoadingMore: Bool = false
     @Published private(set) var lastError: String?
@@ -88,15 +87,14 @@ fileprivate final class DesignMockDataStore: ObservableObject {
         }
     }
 
-    /// Run in parallel: conversations + facets + bookmarks + tags. Each of
+    /// Run in parallel: conversations + facets + bookmarks. Each of
     /// these is independent, so bundling them into a task group keeps launch
     /// latency to the slowest single query instead of their sum.
     func refreshAll(services: AppServices) async {
         async let convos: Void = refresh(services: services)
         async let facets: Void = refreshSourceFacets(services: services)
         async let bmarks: Void = refreshBookmarks(services: services)
-        async let tagList: Void = refreshTags(services: services)
-        _ = await (convos, facets, bmarks, tagList)
+        _ = await (convos, facets, bmarks)
     }
 
     /// Apply a new user query (sidebar / search / sort). Cancelling any
@@ -271,14 +269,6 @@ fileprivate final class DesignMockDataStore: ObservableObject {
                     updated: Self.formatUpdated(entry.primaryTime)
                 )
             }
-        } catch {
-            lastError = String(describing: error)
-        }
-    }
-
-    func refreshTags(services: AppServices) async {
-        do {
-            tags = try await services.tags.listTags()
         } catch {
             lastError = String(describing: error)
         }
@@ -483,11 +473,11 @@ struct DesignMockRootView: View {
     /// prompt twice.
     @State private var pendingPromptID: String?
     /// Shared library view-model. Hoisted to the shell (rather than
-    /// scoped to the reader) so the sidebar Tags section, the card /
-    /// table drop handlers, and the right-pane `ConversationTagsEditor`
-    /// all observe the same `conversationTags` map. Without a shared
-    /// VM, a DnD attach on a card wouldn't reflect in the popover
-    /// until the user forced a refresh.
+    /// scoped to the reader) so the reader pane and the saved-filter
+    /// history list observe the same state. Tag UI was removed in the
+    /// "ditch tags, embrace search history" redesign — the VM is kept
+    /// because it still drives viewer-mode data, saved filters, and
+    /// the (upcoming) prompt-level bookmark surface.
     @State private var libraryViewModel: LibraryViewModel?
 
     var body: some View {
@@ -575,21 +565,9 @@ struct DesignMockRootView: View {
         // single source of truth.
         .onChange(of: store.conversations.map(\.id)) { _, newIDs in
             repairSelectionIfNeeded(currentIDs: newIDs)
-            // Keep the VM's tag map in sync with the visible list —
-            // drop-toggle decisions (attach vs detach) read from
-            // `conversationTags`, and sidebar rows show usage / filter
-            // counts derived from the same data.
-            Task { await libraryViewModel?.refreshConversationTags(for: newIDs, replace: true) }
         }
         .onAppear {
             repairSelectionIfNeeded(currentIDs: store.conversations.map(\.id))
-        }
-        // First-run refresh: once the VM exists, pull in whatever the
-        // store already has loaded (the `.onChange` above only fires on
-        // subsequent shape changes, not the initial `store.load`).
-        .task(id: libraryViewModel != nil) {
-            guard let vm = libraryViewModel else { return }
-            await vm.refreshConversationTags(for: store.conversations.map(\.id), replace: true)
         }
     }
 
@@ -648,8 +626,7 @@ struct DesignMockRootView: View {
                         lastError: store.lastError,
                         onReachEnd: {
                             store.loadMoreIfNeeded(services: services)
-                        },
-                        onDropTagsOnConversation: handleTagsDroppedOnConversation
+                        }
                     )
                     .navigationSplitViewColumnWidth(min: 360, ideal: 460, max: 760)
                 }
@@ -696,11 +673,9 @@ struct DesignMockRootView: View {
             selection: $selectedSidebarItemID,
             sources: store.sources,
             bookmarks: store.bookmarks,
-            tags: store.tags,
             databaseInfo: store.databaseInfo,
             totalCount: store.totalCount,
-            libraryViewModel: libraryViewModel,
-            onDropConversationsOnTag: handleConversationsDroppedOnTag
+            libraryViewModel: libraryViewModel
         )
         .navigationSplitViewColumnWidth(min: 240, ideal: 270, max: 320)
     }
@@ -721,53 +696,8 @@ struct DesignMockRootView: View {
             // up when default mode mounts.
             onOpen: { _ in
                 selectedLayoutMode = .default
-            },
-            onDropTagsOnConversation: handleTagsDroppedOnConversation
+            }
         )
-    }
-
-    /// Toggle-style tag attach for a drop targeted at a single
-    /// conversation (card row or table row). For each dropped tag: if
-    /// it's already on the conversation, detach; else attach. Called
-    /// from both the card list and the table's cell drop handlers.
-    /// Bumps `archiveEvents.bookmarkRevision` via the VM so the reader
-    /// popover + sidebar counts reflect the change without a manual
-    /// refresh.
-    private func handleTagsDroppedOnConversation(_ tagNames: [String], _ conversationID: String) {
-        guard let vm = libraryViewModel else { return }
-        let attached = Set((vm.conversationTags[conversationID] ?? []).map(\.name))
-        Task {
-            for name in tagNames {
-                if attached.contains(name) {
-                    await vm.detachTag(named: name, fromConversation: conversationID)
-                } else {
-                    await vm.attachTag(named: name, toConversation: conversationID)
-                }
-            }
-            await vm.refreshConversationTags(for: [conversationID], replace: false)
-            await store.refreshTags(services: services)
-        }
-    }
-
-    /// Toggle-style tag attach for a drop targeted at a sidebar tag
-    /// row. For each dropped conversation: if it already carries this
-    /// tag, detach; else attach. Mirrors
-    /// `handleTagsDroppedOnConversation` but batches per-conversation
-    /// rather than per-tag.
-    private func handleConversationsDroppedOnTag(_ conversationIDs: [String], _ tagName: String) {
-        guard let vm = libraryViewModel else { return }
-        Task {
-            for convID in conversationIDs {
-                let attached = Set((vm.conversationTags[convID] ?? []).map(\.name))
-                if attached.contains(tagName) {
-                    await vm.detachTag(named: tagName, fromConversation: convID)
-                } else {
-                    await vm.attachTag(named: tagName, toConversation: convID)
-                }
-            }
-            await vm.refreshConversationTags(for: conversationIDs, replace: false)
-            await store.refreshTags(services: services)
-        }
     }
 
     /// Two-way bridge between the toolbar search field and the `Table`'s
@@ -872,19 +802,13 @@ private struct DesignMockSidebar: View {
     /// between mock and real data refreshes the sidebar tree automatically.
     let sources: [DesignMockSource]
     let bookmarks: [DesignMockBookmark]
-    let tags: [TagEntry]
     let databaseInfo: DesignMockDataStore.DatabaseInfo?
     let totalCount: Int
-    /// Shared library VM used to look up "is this tag already attached
-    /// to this conversation?" when deciding attach vs detach on a drop.
-    /// Optional because the VM is built lazily in the shell — while it's
-    /// still nil we skip the drop wiring and render plain rows.
+    /// Shared library VM. Kept optional because it's built lazily in
+    /// the shell; upcoming HISTORY / prompt-bookmark surfaces read from
+    /// it, so we thread it through even though the sidebar doesn't use
+    /// it yet in this transition state.
     let libraryViewModel: LibraryViewModel?
-    /// Invoked when one or more conversation cards are dropped onto a
-    /// tag row. Receives the dropped conversation ids + the tag row's
-    /// name; the shell decides per-conversation whether to attach or
-    /// detach based on current tag membership.
-    var onDropConversationsOnTag: ([String], String) -> Void = { _, _ in }
     /// Which sources are currently expanded. We seed from `sources` on
     /// first appear *and* whenever the source list changes shape (e.g. a
     /// real-data fetch finally lands), so newly-visible multi-model
@@ -892,15 +816,6 @@ private struct DesignMockSidebar: View {
     /// collapses of the ones they've already interacted with.
     @State private var expandedSources: Set<String> = []
     @State private var haveSeededExpansion: Bool = false
-    @State private var isTagsSectionExpanded: Bool = false
-    /// Companion multi-selection state for the Tags section. The main
-    /// sidebar `List` uses single-select (its id drives filtering), so
-    /// we track multi-select tag membership in a private set — cmd /
-    /// shift-click toggles a tag in/out, and dragging any row in the
-    /// set emits all selected tag names as separate payloads. A plain
-    /// click clears the set so the filter-driving primary selection
-    /// stays unambiguous.
-    @State private var multiSelectedTagNames: Set<String> = []
 
     var body: some View {
         // "All" subtitle is driven by the live source totals so the sidebar
@@ -949,38 +864,10 @@ private struct DesignMockSidebar: View {
                 }
             }
 
-            // Hide the Trash system tag — the user explicitly asked for
-            // it removed, and any one-off restore workflows can happen
-            // inside the table / card pane via the attach/detach popover.
-            let visibleTags = tags.filter { $0.systemKey != "trash" }
-            if !visibleTags.isEmpty {
-                // Custom header wrapping the native `Section(_:isExpanded:)`
-                // chevron behavior in a full-width Button. The default
-                // section header only treats the chevron itself as a tap
-                // target, which is a ~12pt sliver — the user flagged the
-                // hit testing as too tight ("当たり判定を緩くして"). A
-                // full-row Button with `.contentShape(Rectangle())` means
-                // any click anywhere in the header strip toggles the
-                // section, matching Finder's sidebar behavior.
-                Section(isExpanded: $isTagsSectionExpanded) {
-                    ForEach(visibleTags) { tag in
-                        tagSidebarRow(tag)
-                    }
-                } header: {
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.16)) {
-                            isTagsSectionExpanded.toggle()
-                        }
-                    } label: {
-                        HStack(spacing: 4) {
-                            Text("Tags")
-                            Spacer(minLength: 0)
-                        }
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
+            // The Tags section used to live here. It was removed in the
+            // "ditch tags, embrace search history" redesign — Phase 3
+            // of that work will mount the query-history list (backed by
+            // `LibraryViewModel.unifiedFilters`) in its place.
         }
         .listStyle(.sidebar)
         .onChange(of: sources.map(\.name)) { _, _ in
@@ -1071,94 +958,6 @@ private struct DesignMockSidebar: View {
         .tag(item.id)
     }
 
-    /// Tag row with drag + drop wiring. Built on top of `sidebarRow`
-    /// but additionally:
-    ///  - Drags a `TagDragPayload` so the tag can be dropped onto a
-    ///    conversation card for toggle-attach.
-    ///  - Accepts dropped `ConversationDragPayload`s and hands the
-    ///    batch to `onDropConversationsOnTag`, which the shell routes
-    ///    through toggle-attach semantics.
-    ///  - Shows an accent stroke + optional multi-select check badge
-    ///    so the user can see which tags are part of a multi-tag drag
-    ///    staging set. Plain click clears the staging set so the
-    ///    filter-driving primary selection stays unambiguous.
-    @ViewBuilder
-    private func tagSidebarRow(_ tag: TagEntry) -> some View {
-        let item = DesignMockSidebarItem(
-            id: "tag-\(tag.name)",
-            title: tag.name,
-            subtitle: "\(tag.usageCount) threads",
-            systemImage: tag.isSystem ? "tag.fill" : "tag",
-            kind: .tag(tag.name)
-        )
-        let isMultiSelected = multiSelectedTagNames.contains(tag.name)
-        sidebarRow(item)
-            .overlay(alignment: .trailing) {
-                // Subtle check badge to confirm the tag is in the
-                // multi-drag staging set. Invisible (and non-hit-
-                // testing) otherwise so regular rows read the same as
-                // before.
-                if isMultiSelected {
-                    Image(systemName: "checkmark.circle.fill")
-                        .font(.caption)
-                        .foregroundStyle(Color.accentColor)
-                        .padding(.trailing, 4)
-                        .allowsHitTesting(false)
-                }
-            }
-            .contextMenu {
-                Button(isMultiSelected ? "Deselect for drag" : "Select for drag") {
-                    if isMultiSelected {
-                        multiSelectedTagNames.remove(tag.name)
-                    } else {
-                        multiSelectedTagNames.insert(tag.name)
-                    }
-                }
-                if !multiSelectedTagNames.isEmpty {
-                    Button("Clear drag selection") {
-                        multiSelectedTagNames.removeAll()
-                    }
-                }
-            }
-            // Reverse direction: a conversation card was dragged onto
-            // this tag row. Forward the batch to the shell; it looks
-            // up per-conversation membership and toggles accordingly.
-            .dropDestination(for: ConversationDragPayload.self) { payloads, _ in
-                guard !payloads.isEmpty else { return false }
-                onDropConversationsOnTag(payloads.map(\.id), tag.name)
-                return true
-            }
-            // Tag → conversation direction. SwiftUI's `.draggable` can
-            // only carry a single payload per drag, so we emit the
-            // whole staging set by concatenating names into one
-            // payload semantically via the drop side's `[payload]`
-            // delivery. When the row isn't part of the staging set
-            // we drag just this one tag.
-            .draggable(TagDragPayload(name: tag.name)) {
-                dragPreview(for: tag, multiCount: isMultiSelected ? multiSelectedTagNames.count : 1)
-            }
-    }
-
-    /// Pill-shaped preview shown under the pointer during a drag.
-    /// Collapses to a count when multiple tags are in the staging set,
-    /// matching the way Finder previews multi-item drags.
-    private func dragPreview(for tag: TagEntry, multiCount: Int) -> some View {
-        HStack(spacing: 4) {
-            Image(systemName: "tag")
-                .font(.caption.weight(.semibold))
-            if multiCount > 1 {
-                Text("\(multiCount) tags")
-                    .font(.caption.weight(.semibold))
-            } else {
-                Text("#\(tag.name)")
-                    .font(.caption.weight(.semibold))
-            }
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(Capsule().fill(.thinMaterial))
-        .overlay(Capsule().strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5))
-    }
 }
 
 private struct DesignMockThreadListPane: View {
@@ -1177,10 +976,6 @@ private struct DesignMockThreadListPane: View {
     @Binding var expandedPromptConversationID: DesignMockConversation.ID?
     let isLoadingMore: Bool
     let onReachEnd: () -> Void
-    /// Tag drop handler — invoked when one or more tag rows from the
-    /// sidebar are dragged onto a card. The shell routes each payload
-    /// through toggle-attach semantics against the destination id.
-    var onDropTagsOnConversation: ([String], String) -> Void = { _, _ in }
 
     var body: some View {
         if let expandedConversation {
@@ -1250,21 +1045,6 @@ private struct DesignMockThreadListPane: View {
                             selection = [conversation.id]
                         }
                     }
-                    // Card → sidebar direction. SwiftUI auto-batches
-                    // the payload across every row in the current
-                    // multi-select, so dropping anywhere that accepts
-                    // `[ConversationDragPayload]` sees the full batch.
-                    .draggable(ConversationDragPayload(id: conversation.id)) {
-                        conversationDragPreview(conversation: conversation)
-                    }
-                    // Sidebar → card direction. Accepts a tag (or
-                    // multiple tags, if SwiftUI delivers more than
-                    // one) and toggles each against this conversation.
-                    .dropDestination(for: TagDragPayload.self) { payloads, _ in
-                        guard !payloads.isEmpty else { return false }
-                        onDropTagsOnConversation(payloads.map(\.name), conversation.id)
-                        return true
-                    }
                     // Kill the List's default row chrome — insets /
                     // separators / row background. We're painting the
                     // entire card ourselves now, so any residual
@@ -1307,30 +1087,6 @@ private struct DesignMockThreadListPane: View {
         selection.contains(conversation.id)
             ? Color.accentColor.opacity(0.14)
             : Color.clear
-    }
-
-    /// Drag preview pill. When many rows are selected at once, show
-    /// the count so the user doesn't get a stack of identical previews
-    /// under the pointer.
-    @ViewBuilder
-    private func conversationDragPreview(conversation: DesignMockConversation) -> some View {
-        let multi = selection.count > 1 && selection.contains(conversation.id)
-        HStack(spacing: 4) {
-            Image(systemName: "doc.text")
-                .font(.caption.weight(.semibold))
-            if multi {
-                Text("\(selection.count) threads")
-                    .font(.caption.weight(.semibold))
-            } else {
-                Text(conversation.title)
-                    .lineLimit(1)
-                    .font(.caption.weight(.semibold))
-            }
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(Capsule().fill(.thinMaterial))
-        .overlay(Capsule().strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5))
     }
 
     private func pinnedPromptView(for conversation: DesignMockConversation) -> some View {
@@ -1385,9 +1141,6 @@ private struct DesignMockDefaultContentPane: View {
     let isLoadingMore: Bool
     let lastError: String?
     let onReachEnd: () -> Void
-    /// Tag drop handler — forwarded through to both the table and
-    /// card variants so tags can be dropped onto rows in either.
-    var onDropTagsOnConversation: ([String], String) -> Void = { _, _ in }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1453,8 +1206,7 @@ private struct DesignMockDefaultContentPane: View {
                 selection: $conversationSelection,
                 sortOrder: $tableSortOrder,
                 isLoadingMore: isLoadingMore,
-                onReachEnd: onReachEnd,
-                onDropTagsOnConversation: onDropTagsOnConversation
+                onReachEnd: onReachEnd
             )
         case .cards:
             DesignMockThreadListPane(
@@ -1463,8 +1215,7 @@ private struct DesignMockDefaultContentPane: View {
                 pendingPromptID: $pendingPromptID,
                 expandedPromptConversationID: $expandedPromptConversationID,
                 isLoadingMore: isLoadingMore,
-                onReachEnd: onReachEnd,
-                onDropTagsOnConversation: onDropTagsOnConversation
+                onReachEnd: onReachEnd
             )
         }
     }
@@ -1489,9 +1240,6 @@ private struct DesignMockThreadTablePane: View {
     /// table is also embedded inside `.default` mode, where the reader
     /// is already visible and opening is a no-op.
     var onOpen: ((DesignMockConversation.ID) -> Void)? = nil
-    /// Tag drop handler — bound to the title cell's `.dropDestination`
-    /// so the user can drop sidebar tags onto a specific row.
-    var onDropTagsOnConversation: ([String], String) -> Void = { _, _ in }
 
     var body: some View {
         // Re-sort locally so header clicks reflect immediately on the page
@@ -1512,20 +1260,6 @@ private struct DesignMockThreadTablePane: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
-                // Table row DnD is attached to the title cell — it's the
-                // widest content column so it reads as "the row" to the
-                // user, and SwiftUI's Table doesn't expose a per-row
-                // drop modifier above the cell level. Multi-row drag
-                // emits one payload per selected row when the dragged
-                // cell is part of the selection.
-                .draggable(ConversationDragPayload(id: conversation.id)) {
-                    tableDragPreview(conversation: conversation)
-                }
-                .dropDestination(for: TagDragPayload.self) { payloads, _ in
-                    guard !payloads.isEmpty else { return false }
-                    onDropTagsOnConversation(payloads.map(\.name), conversation.id)
-                    return true
-                }
                 .onAppear {
                     if conversation.id == rows.last?.id {
                         onReachEnd()
@@ -1595,26 +1329,6 @@ private struct DesignMockThreadTablePane: View {
         }
     }
 
-    @ViewBuilder
-    private func tableDragPreview(conversation: DesignMockConversation) -> some View {
-        let multi = selection.count > 1 && selection.contains(conversation.id)
-        HStack(spacing: 4) {
-            Image(systemName: "doc.text")
-                .font(.caption.weight(.semibold))
-            if multi {
-                Text("\(selection.count) threads")
-                    .font(.caption.weight(.semibold))
-            } else {
-                Text(conversation.title)
-                    .lineLimit(1)
-                    .font(.caption.weight(.semibold))
-            }
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(Capsule().fill(.thinMaterial))
-        .overlay(Capsule().strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5))
-    }
 }
 
 /// Expanded card → inline prompt list. Each row is a user-authored message
@@ -1724,9 +1438,9 @@ private struct DesignMockExpandedPromptList: View {
 private struct DesignMockReaderPane: View {
     let conversation: DesignMockConversation?
     @Binding var pendingPromptID: String?
-    /// Shared library VM — hoisted to `DesignMockRootView` so sidebar
-    /// drops, card drops, and the right-pane `ConversationTagsEditor`
-    /// all see the same `conversationTags` map.
+    /// Shared library VM — hoisted to `DesignMockRootView` so the
+    /// reader and the (future) prompt-bookmark surface share the same
+    /// state without re-fetching.
     let libraryViewModel: LibraryViewModel
     /// Two-way binding into the shell's search text — non-nil only in
     /// focus/viewer mode. When present, the reader renders a Safari-
@@ -1736,10 +1450,9 @@ private struct DesignMockReaderPane: View {
     @EnvironmentObject private var services: AppServices
 
     var body: some View {
-        // Route through `DesignMockReaderPaneContent` so the
-        // `LibraryViewModel` dependency injected into the environment
-        // (required by `ConversationTagsEditor`, which sits inside
-        // `ConversationDetailView`'s header) can be forwarded cleanly.
+        // Route through `DesignMockReaderPaneContent` so the shared
+        // `LibraryViewModel` can be forwarded via the environment to
+        // downstream reader surfaces.
         DesignMockReaderPaneContent(
             conversation: conversation,
             services: services,
@@ -1752,9 +1465,8 @@ private struct DesignMockReaderPane: View {
 
 /// Concrete body for the reader pane. Consumes the shared
 /// `LibraryViewModel` hoisted to `DesignMockRootView` so the
-/// canonical tag-editor / detail view has the
-/// `@Environment(LibraryViewModel.self)` it demands AND so sidebar /
-/// card DnD mutations reflect here without a manual refresh.
+/// reader's downstream surfaces have the
+/// `@Environment(LibraryViewModel.self)` they demand.
 private struct DesignMockReaderPaneContent: View {
     let conversation: DesignMockConversation?
     let services: AppServices
@@ -1849,19 +1561,12 @@ private struct DesignMockReaderPaneContent: View {
                 .task(id: searchTaskKey) {
                     await recomputeMatches()
                 }
-                // Wire the shared VM to this reader's open thread so
-                // `ConversationTagsEditor` (which reads
-                // `libraryViewModel.conversationTags[conversationID]`)
-                // sees a populated attachment set the moment its
-                // popover mounts — without this the right-pane
-                // "タグを追加" pulldown renders every tag unchecked
-                // regardless of what's really attached.
+                // Keep the shared VM pointed at the currently-open
+                // thread so downstream surfaces (saved filters,
+                // upcoming prompt bookmarks) know which conversation
+                // is active without threading an extra binding.
                 .task(id: conversation.id) {
                     libraryViewModel.selectedConversationId = conversation.id
-                    await libraryViewModel.refreshConversationTags(
-                        for: [conversation.id],
-                        replace: false
-                    )
                 }
             } else {
                 emptyState

@@ -521,10 +521,7 @@ struct MacOSRootView: View {
                 // chips no longer render here — they live inside the
                 // sidebar's expanded search container.
                 UnifiedConversationListView(
-                    viewModel: libraryViewModel,
-                    onTapTag: { tag in
-                        libraryViewModel.toggleBookmarkTag(tag.name)
-                    }
+                    viewModel: libraryViewModel
                 )
             }
         }
@@ -760,15 +757,10 @@ private struct UnifiedLibrarySidebar: View {
                 // filter is retired; the date range was relocated into the
                 // middle-pane header popover for proximity to the sort bar.
 
-                // Tags + Filters wrapped in `section(title:)` so they get
-                // the same collapse/expand behavior as Library and
-                // Sources. Each section's view intentionally no longer
-                // draws its own "TAGS" / "FILTERS" header — the wrapper
-                // owns the title now so the stack reads as one family of
-                // collapsibles down the sidebar.
-                section(title: "Tags") {
-                    SidebarTagsSection(libraryViewModel: viewModel)
-                }
+                // Tags section removed — replaced by the query-history
+                // surface below. Filters still use the shared
+                // `section(title:)` wrapper so collapse/expand behavior
+                // matches Library and Sources.
 
                 // "Saved View" name input removed. Pinning is now the way to
                 // promote a recent filter into a persistent view.
@@ -1096,7 +1088,6 @@ private struct RoleGrid: View {
 
 private struct UnifiedConversationListView: View {
     @Bindable var viewModel: LibraryViewModel
-    let onTapTag: (TagEntry) -> Void
 
     var body: some View {
         Group {
@@ -1134,19 +1125,7 @@ private struct UnifiedConversationListView: View {
                 // on the `.tag(conversation.id)` assigned per row.
                 ScrollViewReader { proxy in
                 List(viewModel.conversations, selection: $viewModel.selectedConversationIDs) { conversation in
-                    ConversationRowView(
-                        conversation: conversation,
-                        tags: viewModel.conversationTags[conversation.id] ?? [],
-                        onTapTag: onTapTag,
-                        onAttachTag: { tagName in
-                            Task {
-                                await viewModel.attachTag(
-                                    named: tagName,
-                                    toConversation: conversation.id
-                                )
-                            }
-                        }
-                    )
+                    ConversationRowView(conversation: conversation)
                     // NOTE: `.equatable()` was tried here for tag-drop perf,
                     // but it caused intermittent "card click doesn't open"
                     // — `List` with a `selection:` binding does not play
