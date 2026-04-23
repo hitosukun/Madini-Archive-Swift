@@ -68,6 +68,10 @@ struct TableHorizontalScrollReset: NSViewRepresentable {
         /// SwiftUI `Table`.
         weak var cachedTableView: NSTableView?
         weak var cachedScrollView: NSScrollView?
+        /// Whether we've already dumped the ancestor chain for
+        /// diagnostic purposes — expensive to log, and after the
+        /// first burst the structure doesn't change meaningfully.
+        var didDumpAncestry: Bool = false
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -160,6 +164,18 @@ struct TableHorizontalScrollReset: NSViewRepresentable {
             tableScrollLog.debug("performReset tick=\(tickMs, privacy: .public)ms table=\(tableView == nil ? "nil" : "cols=\(tableView!.numberOfColumns) sumW=\(totalColumnsWidth)", privacy: .public) scroll=\(scrollView == nil ? "nil" : "origin.x=\(beforeOriginX) visW=\(visibleWidth)", privacy: .public)")
         }
 
+        // One-time ancestor dump — tells us exactly which view
+        // classes sit between the NSTableView and the window.
+        // Previous logs showed that setBoundsOrigin on the
+        // `enclosingScrollView` didn't move the visible content,
+        // which means the *actual* clipping view is somewhere
+        // else in the ancestor chain. The dump lets us see every
+        // candidate scroll/clip container at once.
+        if kDiagnosticLoggingEnabled, !coordinator.didDumpAncestry, let tv = tableView {
+            coordinator.didDumpAncestry = true
+            dumpAncestry(from: tv)
+        }
+
         // Primary: ask NSTableView to ensure column 0 is visible.
         // This is the official API for "scroll horizontally so the
         // leftmost column is on-screen," and respects NSTableView's
@@ -187,6 +203,17 @@ struct TableHorizontalScrollReset: NSViewRepresentable {
             }
         }
 
+        // Quaternary: SwiftUI Table on macOS 14+ nests the
+        // NSTableView inside its own scroll container that is NOT
+        // necessarily `tableView.enclosingScrollView`. Walk the
+        // ENTIRE ancestor chain and reset every NSClipView /
+        // NSScrollView we find. This is blunt but robust — most
+        // of those clip views are no-ops (their content doesn't
+        // overflow), and the one that matters does get reset.
+        if let tv = tableView {
+            resetAllAncestorScrollContainers(from: tv)
+        }
+
         // Tertiary: force column widths to fit the visible viewport.
         // If the column widths sum to MORE than the scroll view's
         // visible width, there is by definition horizontal overflow
@@ -205,6 +232,59 @@ struct TableHorizontalScrollReset: NSViewRepresentable {
         if kDiagnosticLoggingEnabled, let scrollView {
             let afterOriginX = scrollView.contentView.bounds.origin.x
             tableScrollLog.debug("performReset tick=\(tickMs, privacy: .public)ms AFTER origin.x=\(afterOriginX, privacy: .public)")
+        }
+    }
+
+    /// Dump every ancestor of the NSTableView, logging class name
+    /// + frame + bounds. Run once per coordinator. Lets us identify
+    /// SwiftUI's private scroll container (usually something like
+    /// `_TtC7SwiftUIP33_...ScrollView`) so we know what to target.
+    private static func dumpAncestry(from tableView: NSTableView) {
+        var depth = 0
+        var current: NSView? = tableView
+        while let v = current {
+            let frame = v.frame
+            let bounds = v.bounds
+            let cls = String(describing: type(of: v))
+            tableScrollLog.debug("ancestry[\(depth, privacy: .public)] \(cls, privacy: .public) frame=(\(frame.origin.x, privacy: .public),\(frame.origin.y, privacy: .public),\(frame.size.width, privacy: .public)x\(frame.size.height, privacy: .public)) bounds.origin=(\(bounds.origin.x, privacy: .public),\(bounds.origin.y, privacy: .public))")
+            current = v.superview
+            depth += 1
+        }
+    }
+
+    /// Walk up from the NSTableView and reset every NSClipView's
+    /// bounds origin AND every NSScrollView's content offset. One
+    /// of them is the "real" scroll container. The rest should
+    /// no-op on this call because their content doesn't overflow
+    /// or their clip bounds are already at 0.
+    private static func resetAllAncestorScrollContainers(from tableView: NSTableView) {
+        var current: NSView? = tableView
+        var depth = 0
+        while let v = current {
+            if let clip = v as? NSClipView {
+                let beforeX = clip.bounds.origin.x
+                if beforeX != 0 {
+                    let y = clip.bounds.origin.y
+                    clip.setBoundsOrigin(NSPoint(x: 0, y: y))
+                    if let sv = clip.enclosingScrollView ?? (clip.superview as? NSScrollView) {
+                        sv.reflectScrolledClipView(clip)
+                    }
+                    if kDiagnosticLoggingEnabled {
+                        tableScrollLog.debug("resetAllAncestors depth=\(depth, privacy: .public) NSClipView origin.x \(beforeX, privacy: .public) -> \(clip.bounds.origin.x, privacy: .public)")
+                    }
+                }
+            }
+            if let sv = v as? NSScrollView {
+                let beforeX = sv.contentView.bounds.origin.x
+                if beforeX != 0, let docView = sv.documentView {
+                    docView.scroll(NSPoint(x: 0, y: docView.visibleRect.origin.y))
+                    if kDiagnosticLoggingEnabled {
+                        tableScrollLog.debug("resetAllAncestors depth=\(depth, privacy: .public) NSScrollView origin.x \(beforeX, privacy: .public) -> \(sv.contentView.bounds.origin.x, privacy: .public)")
+                    }
+                }
+            }
+            current = v.superview
+            depth += 1
         }
     }
 
