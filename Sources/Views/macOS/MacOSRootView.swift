@@ -34,6 +34,20 @@ struct MacOSRootView: View {
     /// walk. Deliberately volatile (no persistence) — focus-mode is
     /// not a preference.
     @State private var viewMode: MiddlePaneMode = .default
+    /// Right-pane reader mode. `.canonical` shows the Python-imported
+    /// transcript (the existing reader). `.source` reads the original JSON
+    /// out of the Raw Export Vault and renders rich content — inline images,
+    /// code blocks, tool calls — that the canonical text-only projection
+    /// drops. Toggle lives at the top of the right pane so swapping modes
+    /// doesn't disturb the rest of the window.
+    @State private var readerMode: ReaderPaneMode = .canonical
+
+    enum ReaderPaneMode: String, CaseIterable, Identifiable {
+        case canonical = "Canonical"
+        case source = "Source"
+
+        var id: String { rawValue }
+    }
     // `selectedPromptID` used to live here as `@State`, but writing to it
     // from the reader's scroll-position observer forced `MacOSRootView` to
     // re-render every scroll tick, which cascaded into content-margin
@@ -527,10 +541,65 @@ struct MacOSRootView: View {
     }
 
     private var rightPane: some View {
-        ReaderWorkspaceView(
-            tabManager: tabManager,
-            repository: services.conversations
-        )
+        VStack(spacing: 0) {
+            if services.rawConversationLoader != nil {
+                readerModeBar
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                Divider()
+            }
+            Group {
+                switch readerMode {
+                case .canonical:
+                    ReaderWorkspaceView(
+                        tabManager: tabManager,
+                        repository: services.conversations
+                    )
+                case .source:
+                    sourceReaderPane
+                }
+            }
+        }
+    }
+
+    private var readerModeBar: some View {
+        HStack {
+            Picker("Reader", selection: $readerMode) {
+                ForEach(ReaderPaneMode.allCases) { mode in
+                    Text(mode.rawValue).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .fixedSize()
+            Spacer()
+            if readerMode == .source {
+                Text("Reading original provider JSON from the Raw Export Vault.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var sourceReaderPane: some View {
+        if let loader = services.rawConversationLoader,
+           let conversationID = tabManager.activeTab?.conversationID {
+            RawTranscriptReaderView(
+                conversationID: conversationID,
+                loader: loader,
+                vault: services.rawExportVault,
+                resolver: services.rawAssetResolver
+            )
+            .id(conversationID)
+        } else {
+            ContentUnavailableView(
+                "Open a conversation",
+                systemImage: "rectangle.on.rectangle",
+                description: Text("Select a conversation from the list to see its vaulted source JSON.")
+            )
+        }
     }
 
     private var librarySidebar: some View {

@@ -11,6 +11,11 @@ final class AppServices: ObservableObject {
     let projectSuggester: any ProjectSuggester
     let rawExportVault: any RawExportVault
     let rawAssetResolver: any RawAssetResolver
+    /// Optional: populated only when the app is running against a real
+    /// archive database. Mock mode leaves this `nil` — there's no vault to
+    /// load raw JSON from. The rich-content reader gates its "switch to
+    /// Source view" UI on this being non-nil.
+    let rawConversationLoader: (any RawConversationLoader)?
     let bookmarks: any BookmarkRepository
     let tags: any TagRepository
     let views: any ViewService
@@ -69,6 +74,7 @@ final class AppServices: ObservableObject {
         projectSuggester: any ProjectSuggester,
         rawExportVault: any RawExportVault,
         rawAssetResolver: any RawAssetResolver,
+        rawConversationLoader: (any RawConversationLoader)? = nil,
         bookmarks: any BookmarkRepository,
         tags: any TagRepository,
         views: any ViewService,
@@ -82,6 +88,7 @@ final class AppServices: ObservableObject {
         self.projectSuggester = projectSuggester
         self.rawExportVault = rawExportVault
         self.rawAssetResolver = rawAssetResolver
+        self.rawConversationLoader = rawConversationLoader
         self.bookmarks = bookmarks
         self.tags = tags
         self.views = views
@@ -100,6 +107,7 @@ final class AppServices: ObservableObject {
                 let projects = GRDBProjectRepository(dbQueue: dbQueue)
                 let projectMemberships = GRDBProjectMembershipRepository(dbQueue: dbQueue)
                 let projectSuggestions = GRDBProjectSuggestionRepository(dbQueue: dbQueue)
+                let vault = GRDBRawExportVault(dbQueue: dbQueue)
                 self.init(
                     conversations: conversations,
                     search: GRDBSearchRepository(dbQueue: dbQueue),
@@ -112,8 +120,9 @@ final class AppServices: ObservableObject {
                         memberships: projectMemberships,
                         suggestions: projectSuggestions
                     ),
-                    rawExportVault: GRDBRawExportVault(dbQueue: dbQueue),
+                    rawExportVault: vault,
                     rawAssetResolver: GRDBRawAssetResolver(dbQueue: dbQueue),
+                    rawConversationLoader: GRDBRawConversationLoader(dbQueue: dbQueue, vault: vault),
                     bookmarks: GRDBBookmarkRepository(dbQueue: dbQueue),
                     tags: GRDBTagRepository(dbQueue: dbQueue),
                     views: GRDBViewService(dbQueue: dbQueue),
