@@ -1037,7 +1037,8 @@ final class LibraryViewModel {
             query: SearchQuery(
                 filter: filter,
                 offset: offset,
-                limit: pageSize
+                limit: pageSize,
+                sortKey: sortKey
             )
         )
 
@@ -1060,7 +1061,8 @@ final class LibraryViewModel {
             query: SearchQuery(
                 filter: filter,
                 offset: 0,
-                limit: 1
+                limit: 1,
+                sortKey: sortKey
             )
         )
     }

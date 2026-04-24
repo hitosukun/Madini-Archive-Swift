@@ -435,7 +435,17 @@ fileprivate final class DesignMockDataStore: ObservableObject {
         knownTotal: Int? = nil
     ) async throws -> Page {
         if !filter.normalizedKeyword.isEmpty {
-            let searchQuery = SearchQuery(filter: filter, offset: offset, limit: pageSize)
+            // Pass the sort key through so toolbar directives like
+            // `sort:updated-asc` reach the FTS layer. Without this the
+            // search repository silently ordered by relevance and the
+            // typed directive had no effect — the column header showed
+            // an ascending caret but the rows came back in rank order.
+            let searchQuery = SearchQuery(
+                filter: filter,
+                offset: offset,
+                limit: pageSize,
+                sortKey: sortKey
+            )
             let results = try await services.search.search(query: searchQuery)
             let total: Int
             if let knownTotal {

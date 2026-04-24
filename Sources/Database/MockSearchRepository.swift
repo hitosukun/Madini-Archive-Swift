@@ -87,9 +87,24 @@ final class MockSearchRepository: SearchRepository, @unchecked Sendable {
             )
         }
         .sorted { lhs, rhs in
-            let left = lhs.primaryTime ?? ""
-            let right = rhs.primaryTime ?? ""
-            return left == right ? lhs.conversationID < rhs.conversationID : left > right
+            switch query.sortKey {
+            case .dateAsc:
+                let left = lhs.primaryTime ?? ""
+                let right = rhs.primaryTime ?? ""
+                return left == right ? lhs.conversationID < rhs.conversationID : left < right
+            case .promptCountDesc:
+                return lhs.messageCount == rhs.messageCount
+                    ? lhs.conversationID < rhs.conversationID
+                    : lhs.messageCount > rhs.messageCount
+            case .promptCountAsc:
+                return lhs.messageCount == rhs.messageCount
+                    ? lhs.conversationID < rhs.conversationID
+                    : lhs.messageCount < rhs.messageCount
+            case .dateDesc, .none:
+                let left = lhs.primaryTime ?? ""
+                let right = rhs.primaryTime ?? ""
+                return left == right ? lhs.conversationID < rhs.conversationID : left > right
+            }
         }
     }
 

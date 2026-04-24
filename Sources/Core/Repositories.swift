@@ -375,15 +375,25 @@ struct SearchQuery: Hashable, Sendable {
     let filter: ArchiveSearchFilter
     let offset: Int
     let limit: Int
+    /// Optional explicit ordering. `nil` keeps the repository's default
+    /// relevance-first ordering (FTS bm25 rank, then primary_time DESC);
+    /// a non-nil value asks the repository to dominate-sort by that key
+    /// and use relevance only as a tie-breaker. Set from the toolbar
+    /// `sort:` DSL so typed directives like `sort:updated-asc` actually
+    /// reach the SQL layer instead of being silently dropped on the
+    /// FTS path.
+    let sortKey: ConversationSortKey?
 
     init(
         filter: ArchiveSearchFilter,
         offset: Int,
-        limit: Int
+        limit: Int,
+        sortKey: ConversationSortKey? = nil
     ) {
         self.filter = filter
         self.offset = offset
         self.limit = limit
+        self.sortKey = sortKey
     }
 
     var normalizedText: String {

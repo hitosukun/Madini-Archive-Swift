@@ -15,6 +15,7 @@ final class GRDBSearchRepository: SearchRepository, @unchecked Sendable {
 
         return try await GRDBAsync.read(from: dbQueue) { db in
             let (filterSQL, arguments) = Self.makeSearchWhereClause(query: query)
+            let orderSQL = Self.orderByClause(for: query.sortKey)
             let rows = try Row.fetchAll(
                 db,
                 sql: """
@@ -33,7 +34,7 @@ final class GRDBSearchRepository: SearchRepository, @unchecked Sendable {
                     FROM search_idx
                     JOIN conversations c ON c.id = search_idx.conv_id
                     \(filterSQL)
-                    ORDER BY rank ASC, primary_time DESC, c.id ASC
+                    \(orderSQL)
                     LIMIT ? OFFSET ?
                 """,
                 arguments: arguments + [query.limit, query.offset]
@@ -76,6 +77,30 @@ final class GRDBSearchRepository: SearchRepository, @unchecked Sendable {
                 """,
                 arguments: arguments
             ) ?? 0
+        }
+    }
+
+    /// Build the `ORDER BY` clause for a search fetch. Nil = keep the
+    /// legacy relevance-first ordering (bm25 rank, then date). A non-nil
+    /// `sortKey` dominates the ordering with relevance kept as the
+    /// stable tie-breaker so results with equal sort values still come
+    /// back in a deterministic order (and favour the best match within
+    /// each bucket). This is how `sort:updated-asc` typed into the
+    /// toolbar reaches the SQL layer — without it, the FTS path was
+    /// silently ignoring the directive.
+    private static func orderByClause(for sortKey: ConversationSortKey?) -> String {
+        guard let sortKey else {
+            return "ORDER BY rank ASC, primary_time DESC, c.id ASC"
+        }
+        switch sortKey {
+        case .dateDesc:
+            return "ORDER BY primary_time DESC, rank ASC, c.id ASC"
+        case .dateAsc:
+            return "ORDER BY primary_time ASC, rank ASC, c.id ASC"
+        case .promptCountDesc:
+            return "ORDER BY c.prompt_count DESC, rank ASC, c.id ASC"
+        case .promptCountAsc:
+            return "ORDER BY c.prompt_count ASC, rank ASC, c.id ASC"
         }
     }
 
