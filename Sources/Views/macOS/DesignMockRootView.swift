@@ -664,6 +664,25 @@ struct DesignMockRootView: View {
         // reuses this very field as the in-thread finder; only the
         // prev/next + N/M nav strip lives inside the reader.
         .searchable(text: $searchText, prompt: searchPrompt)
+        // Query history lives inside the search field's own dropdown —
+        // `.searchSuggestions` renders a list beneath the field whenever
+        // it has focus. Previously the sidebar HISTORY section carried
+        // both recent filters and recent threads side-by-side, which
+        // tangled two different "recent" streams (text queries the user
+        // typed vs. threads they opened) and made the sidebar feel noisy.
+        // Moving query reuse into the search field keeps each surface
+        // focused on one job: sidebar = navigate, search box = re-run.
+        .searchSuggestions {
+            ForEach(searchQuerySuggestions, id: \.self) { suggestion in
+                // `.searchCompletion(_)` makes the row selectable — click
+                // (or ↑/↓ + Return) writes the string into the bound
+                // `searchText`, which then flows through the normal
+                // `composedQuery` → `recordRecentSearch` pipeline and
+                // re-ranks the entry to the top of the history on reuse.
+                Label(suggestion, systemImage: "clock.arrow.circlepath")
+                    .searchCompletion(suggestion)
+            }
+        }
         // Enter in the search field → step to the next in-thread
         // match. Mirrors the `⌘G` / Enter convention every macOS
         // find-in-page surface uses. We only fire when a query is
@@ -1232,6 +1251,31 @@ struct DesignMockRootView: View {
         return store.conversations.first { selectedConversationIDs.contains($0.id) }
     }
 
+    /// Query strings to surface in the search field's suggestion
+    /// dropdown. Pulled from `libraryViewModel.unifiedFilters` (which
+    /// `LibraryViewModel` keeps in last-used-first order), then
+    /// deduped and trimmed — a user who re-runs the same query ten
+    /// times shouldn't see ten rows. Empty keywords (filters that are
+    /// pure source / model / date chips without a text query) are
+    /// skipped; `.searchSuggestions` only makes sense as a text-reuse
+    /// affordance.
+    private var searchQuerySuggestions: [String] {
+        guard let libraryViewModel else { return [] }
+        var seen = Set<String>()
+        var ordered: [String] = []
+        for entry in libraryViewModel.unifiedFilters {
+            let keyword = entry.filters.keyword.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !keyword.isEmpty else { continue }
+            if seen.insert(keyword).inserted {
+                ordered.append(keyword)
+            }
+        }
+        // Cap so the dropdown doesn't become a scrollable wall on a
+        // heavy user. 12 is the same order of magnitude Safari /
+        // Spotlight show and fits on-screen without resizing.
+        return Array(ordered.prefix(12))
+    }
+
     private var composedQuery: DesignMockDataStore.FetchQuery {
         // Fold every user-driven input (sidebar selection, toolbar search,
         // sort picker) into a single value the store can diff against.
@@ -1507,24 +1551,19 @@ private struct DesignMockSidebar: View {
         return .clear
     }
 
-    /// Merged, chronologically-sorted history stream. Both filter
-    /// entries and recent-thread entries live here under a single
-    /// list — the sidebar renders them in this order, newest first,
-    /// without grouping by kind. Empty when both sources are empty,
-    /// which lets the "History" section header hide entirely so the
-    /// sidebar doesn't draw a collapsible above nothing on a fresh
-    /// DB.
+    /// Chronologically-sorted history stream of threads the user has
+    /// opened. Empty when the store is empty, which lets the "History"
+    /// section header hide entirely so the sidebar doesn't draw a
+    /// collapsible above nothing on a fresh DB.
+    ///
+    /// Previously this stream also interleaved saved-filter entries
+    /// (recent text queries), but those moved into the search field's
+    /// `.searchSuggestions` dropdown so the sidebar stays focused on
+    /// "threads I've visited" as a single surface.
     private var historyItems: [HistoryItem] {
-        var items: [HistoryItem] = []
-        if let libraryViewModel {
-            items.append(contentsOf: libraryViewModel.unifiedFilters.map(HistoryItem.filter))
-        }
-        items.append(contentsOf: recentThreads.map(HistoryItem.thread))
-        // Most-recent first. `HistoryItem.timestamp` parses
-        // `SavedFilterEntry.lastUsedAt` ("YYYY-MM-DD HH:MM:SS") and
-        // returns `RecentThreadsStore.Entry.openedAt` as-is, so
-        // filter rows and thread rows compare on the same axis.
-        return items.sorted { $0.timestamp > $1.timestamp }
+        recentThreads
+            .map(HistoryItem.thread)
+            .sorted { $0.timestamp > $1.timestamp }
     }
 
     private var databaseSubtitle: String? {
