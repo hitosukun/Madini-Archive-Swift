@@ -632,6 +632,15 @@ struct DesignMockRootView: View {
     /// Debouncing lives per-column so a drag on one side doesn't
     /// cancel a pending write for the other.
     @State private var persistSidebarWidthTask: Task<Void, Never>?
+    /// One-shot signal fired when the user hits Enter in the toolbar
+    /// search field. Downstream the reader observes this token and,
+    /// if a query is active, advances to the next in-thread search
+    /// match — matching the "Enter cycles hits" convention in every
+    /// other macOS find-in-page surface (Safari, Preview, TextEdit).
+    /// Rotating a fresh UUID on each keystroke means pressing Enter
+    /// repeatedly keeps stepping, and the observer dedupe guards
+    /// against stale fires from unrelated state changes.
+    @State private var findNextToken: UUID?
 
     var body: some View {
         rootSplitView
@@ -644,6 +653,17 @@ struct DesignMockRootView: View {
         // reuses this very field as the in-thread finder; only the
         // prev/next + N/M nav strip lives inside the reader.
         .searchable(text: $searchText, prompt: searchPrompt)
+        // Enter in the search field → step to the next in-thread
+        // match. Mirrors the `⌘G` / Enter convention every macOS
+        // find-in-page surface uses. We only fire when a query is
+        // actually typed — pressing Enter on an empty field would
+        // otherwise be a no-op that the observer still has to wake
+        // for. The reader side decides whether there's a reader
+        // mounted (`stepMatch` bails if `matchLocations` is empty).
+        .onSubmit(of: .search) {
+            guard !searchText.isEmpty else { return }
+            findNextToken = UUID()
+        }
         .navigationTitle("")
         .toolbar {
             // Toolbar sort picker removed — sort direction is now chosen
@@ -1016,7 +1036,13 @@ struct DesignMockRootView: View {
                 conversation: selectedConversation,
                 pendingPromptID: $pendingPromptID,
                 libraryViewModel: libraryViewModel,
-                inThreadSearch: inThreadSearch
+                inThreadSearch: inThreadSearch,
+                // Only the focus/viewer-mode reader acts on the Enter
+                // token — in default mode the search field drives the
+                // center-pane filter instead, so Enter there should
+                // NOT also be hijacked into a reader-side step. Pass
+                // nil to mute the signal in that mode.
+                findNextToken: inThreadSearch == nil ? nil : $findNextToken
             )
         } else {
             ProgressView()
@@ -2254,6 +2280,11 @@ private struct DesignMockReaderPane: View {
     /// style find-in-page bar that writes back to the same text (so the
     /// user can also edit it directly) and drives scroll-to-match.
     var inThreadSearch: Binding<String>? = nil
+    /// One-shot Enter-key signal from the toolbar search field. Muted
+    /// (`nil`) in modes where Enter should drive a non-reader action.
+    /// Reader observes this and advances to the next in-thread match
+    /// when it fires.
+    var findNextToken: Binding<UUID?>? = nil
     @EnvironmentObject private var services: AppServices
 
     var body: some View {
@@ -2265,7 +2296,8 @@ private struct DesignMockReaderPane: View {
             services: services,
             libraryViewModel: libraryViewModel,
             pendingPromptID: $pendingPromptID,
-            inThreadSearch: inThreadSearch
+            inThreadSearch: inThreadSearch,
+            findNextToken: findNextToken
         )
     }
 }
@@ -2293,6 +2325,9 @@ private struct DesignMockReaderPaneContent: View {
     /// that both reads and writes this binding (so clearing from either
     /// side stays in sync) and drives scroll-to-match on `pendingPromptID`.
     private let inThreadSearch: Binding<String>?
+    /// One-shot Enter-key signal from the toolbar search field. When
+    /// it rotates to a fresh UUID we step to the next match.
+    private let findNextToken: Binding<UUID?>?
 
     /// Every individual keyword occurrence across the thread, in
     /// transcript order. Each entry is "message M, occurrence N" — so a
@@ -2322,13 +2357,15 @@ private struct DesignMockReaderPaneContent: View {
         services: AppServices,
         libraryViewModel: LibraryViewModel,
         pendingPromptID: Binding<String?>,
-        inThreadSearch: Binding<String>? = nil
+        inThreadSearch: Binding<String>? = nil,
+        findNextToken: Binding<UUID?>? = nil
     ) {
         self.conversation = conversation
         self.services = services
         self.libraryViewModel = libraryViewModel
         _pendingPromptID = pendingPromptID
         self.inThreadSearch = inThreadSearch
+        self.findNextToken = findNextToken
     }
 
     var body: some View {
@@ -2396,6 +2433,16 @@ private struct DesignMockReaderPaneContent: View {
                 // is active without threading an extra binding.
                 .task(id: conversation.id) {
                     libraryViewModel.selectedConversationId = conversation.id
+                }
+                // Enter-in-toolbar-search → step to the next in-thread
+                // match. `findNextToken` rotates a fresh UUID on every
+                // Enter press, so even Enter-Enter-Enter repeats fire
+                // a distinct `.onChange` — no dedup collision against
+                // the previous press. A nil value means "cleared"
+                // (never observed here, but guarded against).
+                .onChange(of: findNextToken?.wrappedValue) { _, newToken in
+                    guard newToken != nil else { return }
+                    stepMatch(by: 1)
                 }
             } else {
                 emptyState

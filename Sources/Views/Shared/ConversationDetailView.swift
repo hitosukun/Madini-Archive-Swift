@@ -590,23 +590,32 @@ private struct LoadedConversationDetailView: View {
     }
 
     /// Instant programmatic jump to the requested id. Holds
-    /// `programmaticScrollLock` for ~150ms to swallow the burst of
+    /// `programmaticScrollLock` for ~300ms to swallow the burst of
     /// `PromptTopYPreferenceKey` emissions the layout cascade fires
-    /// right after the content reflows — without the lock the scroll-
-    /// position observer would see transient offsets mid-reflow and
-    /// overwrite `selectedPromptID`, which cascades into the middle-
-    /// pane highlight chattering.
+    /// right after the content reflows.
+    ///
+    /// **Why three scrollTo calls?** The reader's body is a
+    /// `LazyVStack`, so messages below the current viewport don't
+    /// exist yet. `proxy.scrollTo(id, anchor: .top)` then has to
+    /// estimate the target's position from the heights of the rows
+    /// that *have* been materialised — usually wrong for long
+    /// conversations, so the first jump lands close to the target
+    /// but not on it. User report: "何回か押さないと指定した場所に
+    /// 綺麗に飛ばなかったり". We fire a second scrollTo one frame
+    /// later (after the target materialised and SwiftUI knows its
+    /// true height) and a third ~120ms later to absorb the final
+    /// layout settle. Each subsequent call converges toward the
+    /// correct offset. The lock stays in force through all three so
+    /// the scroll-position observer can't sneak in a stale
+    /// `selectedPromptID` between them.
     ///
     /// Previously this used `withAnimation(.easeInOut(duration: 0.2))`
     /// so the reader smoothly scrolled to the new position, but the
     /// user asked for a lighter, snappier response: "スクロールより、
-    /// ジャンプして欲しい。動作が軽い方がいいので" — the animation added
-    /// no useful spatial cue for a prompt-list click (where the user
-    /// just picked a specific target) and made the UI feel heavy on
-    /// long conversations where the scroll distance could be several
-    /// screens. Dropping the animation also shrinks the lock window
-    /// from 450ms to 150ms, since there's no animation curve to wait
-    /// out anymore — just the layout settle.
+    /// ジャンプして欲しい。動作が軽い方がいいので". Dropping the
+    /// animation was step one; the multi-call convergence below is
+    /// step two — together they make prompt-list and
+    /// search-next clicks land on target reliably on the first try.
     private func performProgrammaticScroll(
         to id: String?,
         using proxy: ScrollViewProxy
@@ -616,7 +625,20 @@ private struct LoadedConversationDetailView: View {
         programmaticScrollLock = token
         proxy.scrollTo(id, anchor: .top)
         Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 150_000_000)
+            // One frame later: the LazyVStack has had a chance to
+            // materialise the target row, so the now-correct height
+            // map produces the correct scroll offset.
+            try? await Task.sleep(nanoseconds: 16_000_000)
+            guard programmaticScrollLock == token else { return }
+            proxy.scrollTo(id, anchor: .top)
+            // Layout settle: Dynamic Type, image loads, and Markdown
+            // rendering can push the target row by a few points after
+            // the frame-one correction. A final nudge at ~120ms
+            // absorbs that jitter.
+            try? await Task.sleep(nanoseconds: 120_000_000)
+            guard programmaticScrollLock == token else { return }
+            proxy.scrollTo(id, anchor: .top)
+            try? await Task.sleep(nanoseconds: 180_000_000)
             if programmaticScrollLock == token {
                 programmaticScrollLock = nil
             }
