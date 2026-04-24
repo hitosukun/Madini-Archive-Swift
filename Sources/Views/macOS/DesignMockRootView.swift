@@ -614,6 +614,12 @@ struct DesignMockRootView: View {
     /// look at" is one surface, not two. Persisted to UserDefaults —
     /// see `RecentThreadsStore` for cap / eviction rules.
     @StateObject private var recentThreadsStore = RecentThreadsStore()
+    /// Rolling list of find-in-page queries the user ran inside an
+    /// open thread. Feeds `.searchSuggestions` when the search field
+    /// is acting as a thread-scoped finder (`.default` / `.viewer`
+    /// modes) so the dropdown shows "what I searched for while
+    /// reading" instead of "filters I applied to the library".
+    @StateObject private var recentInThreadQueriesStore = RecentInThreadQueriesStore()
     /// Pending debounced `recordRecentSearch` call. Cancel-and-reschedule
     /// on every `composedQuery` change so typing "swift" doesn't write +
     /// re-read the saved-filters table five times in a row — the final
@@ -785,12 +791,30 @@ struct DesignMockRootView: View {
             // same query twice never double-writes.
             recordRecentSearchTask?.cancel()
             let capturedQuery = newQuery
+            let capturedMode = selectedLayoutMode
+            let capturedText = searchText
             recordRecentSearchTask = Task { @MainActor in
                 try? await Task.sleep(nanoseconds: 400_000_000)
                 guard !Task.isCancelled else { return }
-                libraryViewModel?.recordRecentSearch(
-                    archiveFilter(from: capturedQuery)
-                )
+                // Route the settled query to the history that matches
+                // the field's current role. In `.table` mode the text
+                // scoped the library (library history); in the reader
+                // modes it was a find-in-page inside the open thread
+                // (in-thread history). Mutually exclusive — one
+                // recording per settle — so the two streams don't
+                // double-count the same keystroke.
+                if capturedMode == .table {
+                    libraryViewModel?.recordRecentSearch(
+                        archiveFilter(from: capturedQuery)
+                    )
+                } else {
+                    // Strip DSL directives (`sort:`, `source:`, …) the
+                    // same way the reader's `effectiveQuery` does, so
+                    // the history stores only the substring that was
+                    // actually matched.
+                    let parsed = DesignMockQueryLanguage.parse(capturedText)
+                    recentInThreadQueriesStore.record(parsed.keyword)
+                }
             }
         }
         // Keep one canonical "currently displayed" conversation across
@@ -1252,14 +1276,37 @@ struct DesignMockRootView: View {
     }
 
     /// Query strings to surface in the search field's suggestion
-    /// dropdown. Pulled from `libraryViewModel.unifiedFilters` (which
-    /// `LibraryViewModel` keeps in last-used-first order), then
-    /// deduped and trimmed — a user who re-runs the same query ten
-    /// times shouldn't see ten rows. Empty keywords (filters that are
-    /// pure source / model / date chips without a text query) are
-    /// skipped; `.searchSuggestions` only makes sense as a text-reuse
-    /// affordance.
+    /// dropdown. The list swaps based on what the search field is
+    /// currently acting on:
+    ///
+    /// - `.table` mode → library filter. Pull from
+    ///   `libraryViewModel.unifiedFilters` keywords so recent archive
+    ///   searches bubble back up.
+    /// - `.default` / `.viewer` mode → in-thread find-in-page. Pull
+    ///   from `recentInThreadQueriesStore.queries` so the user sees
+    ///   "substrings I searched for while reading", not filters that
+    ///   scoped the whole library.
+    ///
+    /// The two histories are disjoint because the activities are
+    /// disjoint — a filter like `source:claude` is meaningless as an
+    /// in-thread substring, and "error message" as a library filter
+    /// would scope the card list (not what the user meant when they
+    /// typed it into the reader finder). Keeping them separate avoids
+    /// interleaving semantically different rows under one label.
+    ///
+    /// Both lists are deduped, trimmed, and capped at 12 so the
+    /// dropdown doesn't become a scrollable wall on a heavy user (12
+    /// is the same order of magnitude Safari / Spotlight show and
+    /// fits on-screen without resizing).
     private var searchQuerySuggestions: [String] {
+        if selectedLayoutMode == .table {
+            return librarySearchQuerySuggestions
+        } else {
+            return inThreadSearchQuerySuggestions
+        }
+    }
+
+    private var librarySearchQuerySuggestions: [String] {
         guard let libraryViewModel else { return [] }
         var seen = Set<String>()
         var ordered: [String] = []
@@ -1270,10 +1317,14 @@ struct DesignMockRootView: View {
                 ordered.append(keyword)
             }
         }
-        // Cap so the dropdown doesn't become a scrollable wall on a
-        // heavy user. 12 is the same order of magnitude Safari /
-        // Spotlight show and fits on-screen without resizing.
         return Array(ordered.prefix(12))
+    }
+
+    private var inThreadSearchQuerySuggestions: [String] {
+        // `recentInThreadQueriesStore` already enforces move-to-top
+        // dedup and move-to-top ordering at record time, so the only
+        // work here is bounding the list for the dropdown.
+        Array(recentInThreadQueriesStore.queries.prefix(12))
     }
 
     private var composedQuery: DesignMockDataStore.FetchQuery {
