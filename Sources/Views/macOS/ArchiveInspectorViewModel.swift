@@ -118,6 +118,25 @@ final class ArchiveInspectorViewModel {
     private(set) var filesState: LoadState = .idle
     private(set) var hasMoreFiles: Bool = true
 
+    /// The file currently shown in the right pane's inline preview, or
+    /// `nil` when nothing is previewed (empty state). Keyed by
+    /// `RawExportFileEntry.id` which is `"<snapshotID>:<relativePath>"`
+    /// — stable across reloads of the same snapshot, so re-paging the
+    /// list doesn't drop the preview. Reset to `nil` in
+    /// `handleSnapshotSelectionChanged()` so switching snapshots clears
+    /// the stale preview alongside the file list.
+    var selectedFileID: String?
+
+    /// Convenience lookup: the currently previewed file, resolved by
+    /// scanning `files` for the tracked id. Returns `nil` when nothing
+    /// is selected or the tracked id has since been paged out (which
+    /// shouldn't happen because we only append, but the lookup is
+    /// defensive either way).
+    var selectedFile: RawExportFileEntry? {
+        guard let id = selectedFileID else { return nil }
+        return files.first(where: { $0.id == id })
+    }
+
     // MARK: Intake activity
 
     /// Observable handle to the rolling intake log. `nil` in mock mode —
@@ -210,6 +229,10 @@ final class ArchiveInspectorViewModel {
         filesState = .idle
         hasMoreFiles = true
         filesOffset = 0
+        // Clear the inline preview too — the old file belongs to the
+        // previous snapshot and would render as an orphan row under a
+        // file list it no longer appears in.
+        selectedFileID = nil
     }
 
     /// Fetch the next page of files for the currently selected snapshot.

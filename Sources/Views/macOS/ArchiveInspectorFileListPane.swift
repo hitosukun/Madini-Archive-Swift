@@ -1,38 +1,34 @@
 #if os(macOS)
 import SwiftUI
 
-/// Right column of the consolidated archive.db surface. Lists the files
-/// inside the currently selected snapshot, paginating as the user scrolls,
-/// and routes clicks into the standalone preview windows
-/// (`ImagePreviewWindow` for bitmaps, `TextPreviewWindow` for everything
-/// else). Shows an empty-state prompt when no snapshot is selected.
+/// Right column of the consolidated archive.db surface. Split
+/// vertically into a file list (top) and an inline preview (bottom) —
+/// picking a row loads its bytes into the preview below, so flipping
+/// through rows doesn't require chasing a floating window around the
+/// desktop.
 ///
-/// Why preview lives in a floating window, not in a detail pane inside
-/// this view: the user explicitly asked for the image-preview window to
-/// be "reused" for file contents so the consolidated surface doesn't
-/// have to carry a fourth pane just for bytes. Dispatching to the
-/// existing image window (and its new text sibling) keeps the layout at
-/// three panes total and lets the user keep a file open in its own
-/// resizable / full-screenable window while they scroll past it in the
-/// list.
+/// The floating `ImagePreviewWindow` / `TextPreviewWindow` aren't
+/// retired; the inline preview's toolbar still has an "Open in window"
+/// button that detaches into the full-resizable / full-screenable
+/// standalone view when the user wants more room. Inline is the
+/// default, window is the escape hatch.
 ///
-/// Why we pass the gallery list at click time: both preview windows
-/// accept `(entries, initialIndex)` so arrow-key navigation spans the
-/// whole snapshot (or the currently-loaded page of it — we keep the
-/// list the window sees in sync with the paged files). Shipping the
-/// list on every open means a later "Load more" that extends the right
-/// pane also extends the window's arrow-key range the next time the
-/// user clicks.
+/// Why a vertical split (rather than moving the file list to the
+/// middle pane or using a NavigationStack in the right pane): keeping
+/// the file list in view as the user previews each row matches how a
+/// `Mail.app`-style list-and-reader feels. Moving the list into the
+/// middle pane would crowd the timeline; a NavigationStack would make
+/// "back to the list" a click, which is friction when the user wants
+/// to scan a handful of files in a row.
 struct ArchiveInspectorFileListPane: View {
     @Bindable var viewModel: ArchiveInspectorViewModel
-    @EnvironmentObject private var services: AppServices
 
     var body: some View {
         Group {
             if viewModel.selectedSnapshotID == nil {
                 emptyState
             } else {
-                fileList
+                splitBody
             }
         }
         .frame(minWidth: 360)
@@ -47,6 +43,23 @@ struct ArchiveInspectorFileListPane: View {
             if viewModel.selectedSnapshotID != nil {
                 await viewModel.loadMoreFiles()
             }
+        }
+    }
+
+    /// Vertical split: file list on top (fixed-ish height seeded by the
+    /// split ideal), inline preview on the bottom. We use
+    /// `VSplitView` so the user can drag the divider to give either
+    /// half more room. The ideal heights are set so the preview gets
+    /// the majority of the pane by default — opening a file is the
+    /// action that brought the user here, and the list can scroll
+    /// within its allotted band.
+    @ViewBuilder
+    private var splitBody: some View {
+        VSplitView {
+            fileList
+                .frame(minHeight: 140, idealHeight: 240)
+            ArchiveInspectorFilePreviewPane(entry: viewModel.selectedFile)
+                .frame(minHeight: 200)
         }
     }
 
@@ -68,14 +81,25 @@ struct ArchiveInspectorFileListPane: View {
 
     @ViewBuilder
     private var fileList: some View {
-        List {
-            ForEach(viewModel.files) { entry in
-                Button {
-                    openPreview(for: entry)
-                } label: {
-                    ArchiveInspectorFileRow(entry: entry)
+        // `List(selection:)` drives the inline preview via
+        // `viewModel.selectedFileID`. We wrap the binding in a deferred
+        // `Task { @MainActor in ... }` mutate for the same reason the
+        // snapshot selection does: writing to @Observable state
+        // synchronously from inside a SwiftUI Binding.set can trigger
+        // the re-entrant observe/redraw cascade that blanked the old
+        // Vault Browser's detail column on macOS.
+        let selectionBinding = Binding<String?>(
+            get: { viewModel.selectedFileID },
+            set: { newValue in
+                Task { @MainActor in
+                    viewModel.selectedFileID = newValue
                 }
-                .buttonStyle(.plain)
+            }
+        )
+        List(selection: selectionBinding) {
+            ForEach(viewModel.files) { entry in
+                ArchiveInspectorFileRow(entry: entry)
+                    .tag(entry.id)
             }
             if viewModel.hasMoreFiles {
                 loadMoreFooter
@@ -121,81 +145,6 @@ struct ArchiveInspectorFileListPane: View {
         .background(.yellow.opacity(0.18))
     }
 
-    // MARK: - Preview dispatch
-
-    /// Route a click into either `ImagePreviewWindow` (bitmap-ish
-    /// files) or `TextPreviewWindow` (everything else). The routing
-    /// decision is driven by MIME / extension so the two windows stay
-    /// purpose-built — we don't need a generic "file preview" window
-    /// that tries to handle both, which would compromise the toolbar
-    /// and body of each.
-    ///
-    /// `AssetReference`-based navigation isn't used here because the
-    /// right pane enumerates raw `RawExportFileEntry` rows, not
-    /// reader-resolved asset references. For images we build a
-    /// single-entry gallery from the clicked row's relative path; for
-    /// text we pass the whole currently-loaded file list so arrow-key
-    /// navigation spans the snapshot.
-    private func openPreview(for entry: RawExportFileEntry) {
-        if isImage(entry) {
-            openImage(entry: entry)
-        } else {
-            openText(entry: entry)
-        }
-    }
-
-    private func openImage(entry: RawExportFileEntry) {
-        // The image window takes `AssetReference`s, not
-        // `RawExportFileEntry`. The vaulted path is a stable reference
-        // key the resolver accepts directly, so we build a one-shot
-        // AssetReference for the clicked row and hand it to the
-        // existing preview infrastructure.
-        let reference = AssetReference(
-            reference: entry.relativePath,
-            mimeType: entry.mimeType
-        )
-        ImagePreviewWindow.show(
-            snapshotID: entry.snapshotID,
-            references: [reference],
-            initialIndex: 0,
-            vault: services.rawExportVault,
-            resolver: services.rawAssetResolver
-        )
-    }
-
-    private func openText(entry: RawExportFileEntry) {
-        // Gallery spans the loaded page. We start at the clicked
-        // entry's index in `viewModel.files` so arrow keys in the
-        // window walk adjacent rows as the user sees them in the
-        // list.
-        let gallery = viewModel.files
-        let index = gallery.firstIndex(where: { $0.id == entry.id }) ?? 0
-        TextPreviewWindow.show(
-            snapshotID: entry.snapshotID,
-            entries: gallery,
-            initialIndex: index,
-            vault: services.rawExportVault
-        )
-    }
-
-    /// Conservative "should this open in the image window" check:
-    /// trust the MIME first, fall back to the extension, refuse
-    /// everything else. Unknown extensions fall through to the text
-    /// preview (which handles binary with a "open externally" prompt)
-    /// so a misclassified payload still opens in *something* rather
-    /// than nothing.
-    private func isImage(_ entry: RawExportFileEntry) -> Bool {
-        if let mime = entry.mimeType?.lowercased(), mime.hasPrefix("image/") {
-            return true
-        }
-        let ext = (entry.relativePath as NSString).pathExtension.lowercased()
-        switch ext {
-        case "png", "jpg", "jpeg", "webp", "gif", "heic", "heif", "tiff", "bmp":
-            return true
-        default:
-            return false
-        }
-    }
 }
 
 // MARK: - Row
