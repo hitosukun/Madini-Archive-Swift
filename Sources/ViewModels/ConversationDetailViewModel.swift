@@ -87,11 +87,26 @@ final class ConversationDetailViewModel {
             // explicit guard avoids racing a stale context into a view
             // that's already showing a different conversation.
             guard self.detail?.summary.id == conversationId else { return }
+            // Flatten attachments into reading-order so the preview
+            // window can navigate across the whole conversation with
+            // arrow keys. Walking `detail.messages` (not
+            // `attachments.keys`) is what gives us the user-visible
+            // order — dictionaries aren't ordered, but message lists
+            // are.
+            var ordered: [AssetReference] = []
+            var offsets: [String: Int] = [:]
+            for msg in detail.messages {
+                guard let refs = attachments[msg.id], !refs.isEmpty else { continue }
+                offsets[msg.id] = ordered.count
+                ordered.append(contentsOf: refs)
+            }
             assetContext = MessageAssetContext(
                 vault: vault,
                 resolver: resolver,
                 snapshotID: raw.snapshotID,
-                attachmentsByMessageID: attachments
+                attachmentsByMessageID: attachments,
+                orderedReferences: ordered,
+                startOffsetByMessageID: offsets
             )
         } catch {
             print("Raw transcript attach failed for \(conversationId): \(error)")

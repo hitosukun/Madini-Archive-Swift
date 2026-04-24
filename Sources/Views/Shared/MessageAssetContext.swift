@@ -38,6 +38,20 @@ struct MessageAssetContext {
     /// message. Missing keys / empty values mean "no attachments" —
     /// the bubble renders text only.
     let attachmentsByMessageID: [String: [AssetReference]]
+    /// Flat list of every image reference in the conversation, in
+    /// reading order (message order, then in-message order). Used by
+    /// the preview window to power keyboard navigation (← / →) across
+    /// the entire conversation without the reader having to re-walk
+    /// its message list.
+    let orderedReferences: [AssetReference]
+    /// First index into `orderedReferences` for each message's
+    /// attachments. A bubble's local attachment index `i` maps to the
+    /// global index `startOffsetByMessageID[message.id]! + i`. We
+    /// precompute this so duplicate references (same image used
+    /// twice in a conversation) still open the preview at the clicked
+    /// occurrence rather than the first one `firstIndex(of:)` would
+    /// find.
+    let startOffsetByMessageID: [String: Int]
 }
 
 private struct MessageAssetContextKey: EnvironmentKey {

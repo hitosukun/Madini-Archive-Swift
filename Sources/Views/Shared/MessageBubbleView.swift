@@ -656,13 +656,16 @@ struct MessageBubbleView: View, Equatable {
         if let context = messageAssetContext,
            let refs = context.attachmentsByMessageID[message.id],
            !refs.isEmpty {
+            let baseOffset = context.startOffsetByMessageID[message.id] ?? 0
             VStack(alignment: alignment, spacing: 8) {
-                ForEach(Array(refs.enumerated()), id: \.offset) { _, ref in
+                ForEach(Array(refs.enumerated()), id: \.offset) { localIndex, ref in
                     RawTranscriptImageView(
                         reference: ref,
                         snapshotID: context.snapshotID,
                         vault: context.vault,
-                        resolver: context.resolver
+                        resolver: context.resolver,
+                        globalIndex: baseOffset + localIndex,
+                        orderedReferences: context.orderedReferences
                     )
                 }
             }
