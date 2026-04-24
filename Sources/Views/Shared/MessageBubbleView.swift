@@ -907,13 +907,33 @@ struct MessageBubbleView: View, Equatable {
     /// grouping pass is itself non-trivial (NL detection per block) and
     /// `body` is re-evaluated on parent updates.
     private var renderItems: [MessageRenderItem] {
-        let key = message.id as NSString
+        // Cache key is (message.id, collapseFlag) because the same
+        // message rendered under two different source profiles would
+        // produce different item arrays. In practice every message in
+        // a conversation shares one profile, but keying on the flag
+        // makes the cache safe if the profile ever varies within a
+        // run (e.g. import-time source correction) and costs nothing.
+        let profile = renderProfile
+        let collapse = profile.collapsesForeignLanguageRuns
+        let key = "\(message.id)#\(collapse ? 1 : 0)" as NSString
         if let cached = Self.renderItemsCache.object(forKey: key) {
             return cached.items
         }
-        let items = ForeignLanguageGrouping.group(contentBlocks)
+        let items = ForeignLanguageGrouping.items(
+            from: contentBlocks,
+            collapseForeignRuns: collapse
+        )
         Self.renderItemsCache.setObject(RenderItemsBox(items), forKey: key)
         return items
+    }
+
+    /// Per-bubble rendering policy, resolved from the conversation's
+    /// source. See `MessageRenderProfile` for the dispatch table.
+    private var renderProfile: MessageRenderProfile {
+        MessageRenderProfile.resolve(
+            source: identityContext?.source,
+            model: identityContext?.model
+        )
     }
 
     private static let renderItemsCache: NSCache<NSString, RenderItemsBox> = {
@@ -961,13 +981,21 @@ struct MessageBubbleView: View, Equatable {
     /// view that renders the blocks — the two can't drift out of
     /// sync as the markdown parser / grouper evolves.
     static func searchableBlocks(
-        for message: Message
+        for message: Message,
+        profile: MessageRenderProfile = .passthrough
     ) -> [(text: String, anchorID: String)] {
         if message.isUser {
             return [(message.content, message.id)]
         }
         let parsed = ContentBlock.parse(message.content)
-        let items = ForeignLanguageGrouping.group(parsed)
+        // MUST mirror the grouping decision `renderItems` makes, or
+        // the per-block occurrence indices produced here will not line
+        // up with `applyingSearchHighlight`'s render-time scan. Take
+        // the same path by routing through the profile-gated helper.
+        let items = ForeignLanguageGrouping.items(
+            from: parsed,
+            collapseForeignRuns: profile.collapsesForeignLanguageRuns
+        )
         return items.enumerated().map { offset, item in
             let anchorID = searchBlockAnchorID(
                 messageID: message.id,

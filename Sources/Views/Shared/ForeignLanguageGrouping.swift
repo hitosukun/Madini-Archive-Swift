@@ -31,6 +31,22 @@ enum MessageRenderItem {
 ///    Below that we treat the text as "not confidently foreign" and
 ///    leave it as a normal block.
 enum ForeignLanguageGrouping {
+    /// Profile-gated entry point. When `collapseForeignRuns` is false,
+    /// returns each block wrapped as `.block(_)` without language
+    /// detection — the render pipeline stays uniform (still a
+    /// `[MessageRenderItem]`) but no grouping is applied. Callers that
+    /// know their source always wants grouping (or never wants it) can
+    /// skip this and call `group(_:)` / build trivially directly.
+    static func items(
+        from blocks: [ContentBlock],
+        collapseForeignRuns: Bool
+    ) -> [MessageRenderItem] {
+        guard collapseForeignRuns else {
+            return blocks.map { .block($0) }
+        }
+        return group(blocks)
+    }
+
     static func group(_ blocks: [ContentBlock]) -> [MessageRenderItem] {
         let system = systemLanguage
         var result: [MessageRenderItem] = []

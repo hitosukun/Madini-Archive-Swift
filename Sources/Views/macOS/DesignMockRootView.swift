@@ -2656,9 +2656,20 @@ private struct DesignMockReaderPaneContent: View {
             // occurrence indices aligned with
             // `applyingSearchHighlight`'s per-block scan.
             let needle = query
+            // Resolve the bubble's rendering profile from the same
+            // summary.source the view uses, so the per-block anchor
+            // enumeration here matches what the renderer emits. If we
+            // pass the default `.passthrough` for a Claude thread, the
+            // renderer's grouped-foreign blocks get collapsed into
+            // fewer anchor ids than this scan produces → find-bar
+            // cursor lands on a block that doesn't exist.
+            let profile = MessageRenderProfile.resolve(
+                source: detail.summary.source,
+                model: detail.summary.model
+            )
             var locations: [MatchLocation] = []
             for message in detail.messages {
-                let blocks = MessageBubbleView.searchableBlocks(for: message)
+                let blocks = MessageBubbleView.searchableBlocks(for: message, profile: profile)
                 for (text, anchorID) in blocks {
                     var searchFrom = text.startIndex
                     var occurrence = 0
