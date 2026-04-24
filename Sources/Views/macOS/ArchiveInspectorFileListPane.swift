@@ -81,17 +81,32 @@ struct ArchiveInspectorFileListPane: View {
 
     @ViewBuilder
     private var fileList: some View {
-        // Direct `@Bindable` binding — unlike the snapshot selection
-        // (which triggers a `.task(id:)` that mutates the VM inside a
-        // SwiftUI update pass and needed a deferred `Task { ... }`
-        // indirection to avoid the re-entrant blanking bug), the file
-        // selection only drives a downstream preview rebuild and has
-        // no cascading observed mutations. A synchronous write keeps
-        // List's native row-highlight in lock-step with the click.
-        List(selection: $viewModel.selectedFileID) {
+        // Click handling via an explicit `Button` per row rather than
+        // `List(selection:)` — the native selection binding refused to
+        // register a row on click here (likely because the non-tagged
+        // "Load more" / error footer rows inside the List blocked the
+        // selection gesture from binding cleanly). A plain-style Button
+        // with an explicit write to `selectedFileID` is bulletproof and
+        // matches the click-to-open behavior the rest of the pane
+        // already expects.
+        //
+        // The visual selection is painted via `.listRowBackground` so
+        // the selected row still reads the same as a native List
+        // selection would — a colored band with the accent color —
+        // without relying on List's own selection machinery.
+        List {
             ForEach(viewModel.files) { entry in
-                ArchiveInspectorFileRow(entry: entry)
-                    .tag(entry.id)
+                Button {
+                    viewModel.selectedFileID = entry.id
+                } label: {
+                    ArchiveInspectorFileRow(entry: entry)
+                }
+                .buttonStyle(.plain)
+                .listRowBackground(
+                    viewModel.selectedFileID == entry.id
+                        ? Color.accentColor.opacity(0.18)
+                        : Color.clear
+                )
             }
             if viewModel.hasMoreFiles {
                 loadMoreFooter
