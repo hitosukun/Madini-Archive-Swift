@@ -192,13 +192,14 @@ final class GRDBViewService: ViewService, @unchecked Sendable {
             // capture dimensions the current shell has no way to
             // reproduce (bookmarkTags, sourceFiles, roles, date
             // ranges, multi-source / multi-model). Those rows sit in
-            // HISTORY forever — clicking one can never round-trip
-            // back through the search field because the shell has no
-            // UI for the missing dimension. Purge both `kind = 'recent'`
-            // AND `kind = 'saved_view'` rows that match: the user's
-            // bug report was specifically about pinned tag entries
-            // (`#アルラウネ`, `#ゴミ箱`) lingering in the sidebar, so
-            // sparing saved_view no longer matches intent.
+            // the recent-filter surfaces forever — clicking one can
+            // never round-trip back through the search field because
+            // the shell has no UI for the missing dimension. Purge
+            // both `kind = 'recent'` AND `kind = 'saved_view'` rows
+            // that match: the user's bug report was specifically about
+            // pinned tag entries (`#アルラウネ`, `#ゴミ箱`) lingering
+            // in the sidebar, so sparing saved_view no longer matches
+            // intent.
             try Self.purgeLegacyRows(db: db, targetType: targetType)
 
             let rows = try Row.fetchAll(

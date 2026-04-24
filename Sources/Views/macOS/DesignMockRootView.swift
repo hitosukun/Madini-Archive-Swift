@@ -2,6 +2,33 @@
 import AppKit
 import SwiftUI
 
+/// Step through an ordered id list by `delta`, clamping at the edges
+/// (no wrap — wrapping would silently teleport the user across the
+/// whole list on a single keypress, more disorienting than useful).
+/// When `cursor` is nil, seeds the edge: `delta >= 0` → first id,
+/// `delta < 0` → last id (matches the "unfocused list" convention in
+/// Mail and Finder). Returns nil when the list is empty or the cursor
+/// is already at the target edge.
+///
+/// Shared by the three keyboard-nav call sites in this file — the
+/// card-list thread stepper, the prompt-list stepper inside an
+/// expanded card, and the viewer's ⌘↑/⌘↓ prompt walker — all of
+/// which used to carry their own copy of the same clamp-and-seed
+/// logic.
+fileprivate func steppedID<T: Identifiable>(
+    in items: [T],
+    from cursor: T.ID?,
+    by delta: Int
+) -> T.ID? {
+    guard !items.isEmpty else { return nil }
+    let ids = items.map(\.id)
+    if let cursor, let current = ids.firstIndex(of: cursor) {
+        let next = min(max(current + delta, 0), ids.count - 1)
+        return next == current ? nil : ids[next]
+    }
+    return delta >= 0 ? ids.first : ids.last
+}
+
 /// Live data backing the macOS shell. Talks directly to `AppServices`
 /// repositories — no mock fallback once a database is attached. The store is
 /// the single source of truth for what the center pane lists, what facets the
@@ -653,8 +680,21 @@ struct DesignMockRootView: View {
     /// re-read the saved-filters table five times in a row — the final
     /// settled query is the only one that gets recorded. Pairs with the
     /// store's own "last write wins" fetch: whatever the user actually
-    /// landed on is what enters History.
+    /// landed on is what enters the recent-filter history.
     @State private var recordRecentSearchTask: Task<Void, Never>?
+    /// Min / max bounds for the `.default` layout's center pane. Used
+    /// in three places — the `navigationSplitViewColumnWidth(min:max:)`
+    /// modifier, the `currentCenterIdeal` clamp of the persisted value
+    /// on read-back, and the `persistCenterWidth` clamp on write. All
+    /// three must agree or a hand-edited / stale preference can lock
+    /// the user out of the split.
+    private static let centerWidthMin: CGFloat = 180
+    private static let centerWidthMax: CGFloat = 760
+    /// Min / max bounds for the sidebar column. See `centerWidthMin`
+    /// / `centerWidthMax` for the three-call-site invariant.
+    private static let sidebarWidthMin: CGFloat = 150
+    private static let sidebarWidthMax: CGFloat = 320
+
     /// Persisted center-pane width for the `.default` layout. Single
     /// slot because the default pane now renders only the card list —
     /// the historical split between card and table widths was dropped
@@ -700,12 +740,8 @@ struct DesignMockRootView: View {
         .searchable(text: $searchText, prompt: searchPrompt)
         // Query history lives inside the search field's own dropdown —
         // `.searchSuggestions` renders a list beneath the field whenever
-        // it has focus. Previously the sidebar HISTORY section carried
-        // both recent filters and recent threads side-by-side, which
-        // tangled two different "recent" streams (text queries the user
-        // typed vs. threads they opened) and made the sidebar feel noisy.
-        // Moving query reuse into the search field keeps each surface
-        // focused on one job: sidebar = navigate, search box = re-run.
+        // it has focus. Keeps each surface focused on one job: sidebar =
+        // navigate, search box = re-run a recent query.
         .searchSuggestions {
             ForEach(searchQuerySuggestions, id: \.self) { suggestion in
                 // `.searchCompletion(_)` makes the row selectable — click
@@ -813,10 +849,11 @@ struct DesignMockRootView: View {
                     intakeLog: services.intakeActivityLog
                 )
             }
-            // Populate `unifiedFilters` up-front so the sidebar HISTORY
-            // section has something to render on first paint. Without
-            // this the section stays hidden until the user happens to
-            // trigger a save-recent path somewhere else in the app.
+            // Populate `unifiedFilters` up-front so the saved-filter
+            // surfaces (sidebar rows + `.searchSuggestions` dropdown)
+            // have something to render on first paint. Without this
+            // they stay empty until the user triggers a save-recent
+            // path somewhere else in the app.
             if let libraryViewModel {
                 await libraryViewModel.reloadSupportingState()
             }
@@ -830,7 +867,7 @@ struct DesignMockRootView: View {
         // exactly what the current toolbar + sidebar configuration demands.
         .onChange(of: composedQuery) { _, newQuery in
             store.setQuery(newQuery, services: services)
-            // Debounce the HISTORY recording. Prior version fired on
+            // Debounce the recent-filter recording. Prior version fired on
             // every keystroke, and each call triggered a DB UPSERT +
             // three reads (`listRecentFilters` + `listSavedViews` +
             // `listUnifiedFilters`) + a `@Published` update that re-
@@ -1004,27 +1041,13 @@ struct DesignMockRootView: View {
         let cursor = viewerActivePromptID
         let pendingBinding = $pendingPromptID
         let cursorBinding = $viewerActivePromptID
-        // Step by ±1 through the outline. First press when no
-        // cursor exists seeds the edge: ⌘↓ → first, ⌘↑ → last
-        // (matches the "unfocused list" convention used elsewhere).
+        // Step by ±1 through the outline. `steppedID` returns nil at
+        // the edges (clamp, no wrap) and seeds first/last when no
+        // cursor exists yet.
         let step: (Int) -> Void = { delta in
-            let ids = outline.map(\.id)
-            let currentIndex = cursor.flatMap { id in
-                ids.firstIndex(of: id)
+            guard let nextID = steppedID(in: outline, from: cursor, by: delta) else {
+                return
             }
-            let nextIndex: Int
-            if let currentIndex {
-                // Clamp at the edges so the cursor stops at the
-                // ends rather than wrapping around — wrapping
-                // would silently teleport the reader across the
-                // whole transcript on a single keypress, which is
-                // more disorienting than useful.
-                nextIndex = min(max(currentIndex + delta, 0), ids.count - 1)
-                if nextIndex == currentIndex { return }
-            } else {
-                nextIndex = delta >= 0 ? 0 : ids.count - 1
-            }
-            let nextID = ids[nextIndex]
             cursorBinding.wrappedValue = nextID
             // Rotating the anchor through `pendingPromptID`
             // re-fires the reader's scroll even if the same id
@@ -1240,20 +1263,15 @@ struct DesignMockRootView: View {
     /// selected thread so the center pane's prompt list stays in
     /// sync with whichever row we landed on.
     private func moveSelection(by delta: Int) {
-        let ids = store.conversations.map(\.id)
-        guard !ids.isEmpty else { return }
-        let currentIndex = ids.firstIndex { selectedConversationIDs.contains($0) }
-        let nextIndex: Int
-        if let currentIndex {
-            nextIndex = min(max(currentIndex + delta, 0), ids.count - 1)
-            guard nextIndex != currentIndex else { return }
-        } else {
-            // No selection yet — ↓ picks the top, ↑ picks the
-            // bottom. Mirrors Mail's behaviour for an unfocused
-            // message list.
-            nextIndex = delta >= 0 ? 0 : ids.count - 1
+        let conversations = store.conversations
+        // Pick whichever selected id appears first in the list order
+        // as the "cursor" — multi-select is allowed but stepping
+        // only tracks the topmost entry, which matches Mail's
+        // behaviour under arrow keys while a multi-selection is held.
+        let cursor = conversations.map(\.id).first { selectedConversationIDs.contains($0) }
+        guard let nextID = steppedID(in: conversations, from: cursor, by: delta) else {
+            return
         }
-        let nextID = ids[nextIndex]
         selectedConversationIDs = [nextID]
         if expandedPromptConversationID != nil {
             expandedPromptConversationID = nextID
@@ -1363,7 +1381,11 @@ struct DesignMockRootView: View {
                 // prevents the narrow layout from ever appearing,
                 // which defeats the point of making the row
                 // responsive.
-                .navigationSplitViewColumnWidth(min: 180, ideal: currentCenterIdeal, max: 760)
+                .navigationSplitViewColumnWidth(
+                    min: Self.centerWidthMin,
+                    ideal: currentCenterIdeal,
+                    max: Self.centerWidthMax
+                )
             } detail: {
                 // Unified with viewer/focus mode: the toolbar search
                 // field is an in-thread finder in default mode too.
@@ -1373,7 +1395,7 @@ struct DesignMockRootView: View {
                 // as a library-level keyword filter on the card
                 // list; now both modes share the same reader-find
                 // behavior, and library-scoped filtering happens
-                // via the sidebar (Sources / Bookmarks / History)
+                // via the sidebar (Sources / Bookmarks / saved filters)
                 // and DSL directives (`source:` etc., which still
                 // flow through `parsed.sortToken` + scope logic in
                 // `composedQuery`). `.table` mode still uses the
@@ -1399,11 +1421,12 @@ struct DesignMockRootView: View {
     private var currentCenterIdeal: CGFloat {
         // Clamp defensively so a stale / hand-edited preferences value
         // can't lock the user out of the split (below-min disappears
-        // the pane, above-max is equally unusable). Floor matches the
-        // `navigationSplitViewColumnWidth(min:)` above so a persisted
-        // narrow width is reproduced on next launch instead of being
-        // rounded back up to 320.
-        return CGFloat(min(max(centerWidthCards, 180), 760))
+        // the pane, above-max is equally unusable). Bounds are shared
+        // with `navigationSplitViewColumnWidth(min:max:)` and
+        // `persistCenterWidth` via the static constants above so a
+        // persisted narrow width is reproduced on next launch instead
+        // of being rounded back up.
+        return min(max(CGFloat(centerWidthCards), Self.centerWidthMin), Self.centerWidthMax)
     }
 
     /// Transparent width probe mounted as the content pane's background.
@@ -1435,7 +1458,7 @@ struct DesignMockRootView: View {
     /// faithfully restored on next launch instead of being rounded
     /// back up.
     private func persistCenterWidth(_ width: CGFloat) {
-        let clamped = min(max(Double(width), 180), 760)
+        let clamped = Double(min(max(width, Self.centerWidthMin), Self.centerWidthMax))
         // GeometryReader transiently reports 0 during teardown / mode
         // switch. Treating that as a real preference would wipe the
         // saved width the moment the user flips mode.
@@ -1455,7 +1478,7 @@ struct DesignMockRootView: View {
     /// hand-edited / stale preference can't lock the user out of
     /// the split.
     private var currentSidebarIdeal: CGFloat {
-        CGFloat(min(max(sidebarWidthPref, 150), 320))
+        min(max(CGFloat(sidebarWidthPref), Self.sidebarWidthMin), Self.sidebarWidthMax)
     }
 
     /// Transparent width probe mounted as the sidebar's background.
@@ -1476,7 +1499,7 @@ struct DesignMockRootView: View {
     }
 
     private func persistSidebarWidth(_ width: CGFloat) {
-        let clamped = min(max(Double(width), 150), 320)
+        let clamped = Double(min(max(width, Self.sidebarWidthMin), Self.sidebarWidthMax))
         guard width > 1 else { return }
         persistSidebarWidthTask?.cancel()
         persistSidebarWidthTask = Task { @MainActor in
@@ -1516,19 +1539,19 @@ struct DesignMockRootView: View {
     }
 
     private var sidebar: some View {
-        // Custom binding so a USER click on a Library / Sources row
-        // clears any DSL-filled search text lingering from a previous
-        // HISTORY pick. Without this, clicking a HISTORY filter
-        // entry stuffs `source:claude` (or similar) into the toolbar,
-        // then clicking "Bookmarks" / "Sources → chatgpt" appears to
-        // do nothing — the DSL in `searchText` overrides the sidebar-
-        // derived scope in `composedQuery`, so the fetch query never
-        // actually matches what the user just clicked. Clearing
-        // `searchText` through the setter (NOT in `.onChange`) means
-        // it only fires for List-driven writes; the programmatic
-        // `selectedSidebarItemID = allThreads.id` inside
-        // `onSelectHistoryEntry` bypasses this setter and leaves the
-        // just-restored DSL in place.
+        // Custom binding so a USER click on a Library / Sources /
+        // Bookmarks row clears any DSL-filled search text lingering
+        // from a previous saved-filter pick. Without this, selecting
+        // a saved-filter entry stuffs `source:claude` (or similar)
+        // into the toolbar, then clicking "Bookmarks" / "Sources →
+        // chatgpt" appears to do nothing — the DSL in `searchText`
+        // overrides the sidebar-derived scope in `composedQuery`, so
+        // the fetch query never actually matches what the user just
+        // clicked. Clearing `searchText` through the setter (NOT in
+        // `.onChange`) means it only fires for List-driven writes;
+        // programmatic writes to `selectedSidebarItemID` (e.g. the
+        // saved-filter click handler re-routing to "All Threads")
+        // bypass this setter and leave the just-restored DSL in place.
         let sidebarSelection = Binding<DesignMockSidebarItem.ID?>(
             get: { selectedSidebarItemID },
             set: { newValue in
@@ -1558,7 +1581,11 @@ struct DesignMockRootView: View {
         // live width (NavigationSplitView has no binding for it) and
         // writes the debounced result back to UserDefaults.
         .background(sidebarWidthProbe)
-        .navigationSplitViewColumnWidth(min: 150, ideal: currentSidebarIdeal, max: 320)
+        .navigationSplitViewColumnWidth(
+            min: Self.sidebarWidthMin,
+            ideal: currentSidebarIdeal,
+            max: Self.sidebarWidthMax
+        )
     }
 
     /// Single source of truth for the center-pane thread table. Both the
@@ -1633,10 +1660,9 @@ struct DesignMockRootView: View {
         // so the reader always had *something* to render, but that
         // silently opened the top thread every time the sidebar
         // filter changed — the user saw random threads slide into
-        // the reader without their consent and get recorded into
-        // History. Returning nil when no selected id is visible lets
-        // the reader render its empty state and keeps History clean;
-        // the user explicitly picks a thread to open it.
+        // the reader without their consent. Returning nil when no
+        // selected id is visible lets the reader render its empty
+        // state; the user explicitly picks a thread to open it.
         return store.conversations.first { selectedConversationIDs.contains($0.id) }
     }
 
@@ -1748,18 +1774,18 @@ struct DesignMockRootView: View {
 
     /// Translate a DesignMock `FetchQuery` back into the canonical
     /// `ArchiveSearchFilter` the shared saved-filters store expects.
-    /// Inverse (best-effort) of `DesignMockQueryLanguage.searchText(from:)`
-    /// + the `composedQuery` builder: keyword, single-source, single-
-    /// model, bookmarksOnly are the only dimensions this shell can
-    /// produce, so those are the only ones round-tripped.
+    /// Inverse (best-effort) of the `composedQuery` builder: keyword,
+    /// single-source, single-model, bookmarksOnly are the only
+    /// dimensions this shell can produce, so those are the only ones
+    /// round-tripped.
     ///
     /// `query.tagName` is intentionally dropped. The tag-picker UI was
     /// removed in the "ditch tags" redesign, and although the `tag:`
     /// DSL token still filters live results, we do NOT want it seeding
     /// `bookmarkTags`-bearing rows in `saved_filters` — those are the
     /// rows `isUnproducibleByCurrentShell` treats as legacy and evicts
-    /// from HISTORY. Keeping them out at the write side means the
-    /// eviction pass has nothing new to clean up.
+    /// from the recent-filter surfaces. Keeping them out at the write
+    /// side means the eviction pass has nothing new to clean up.
     private func archiveFilter(from query: DesignMockDataStore.FetchQuery) -> ArchiveSearchFilter {
         var filter = ArchiveSearchFilter(keyword: query.keyword)
         if let source = query.source {
@@ -1834,11 +1860,7 @@ private struct DesignMockSidebar: View {
     let totalCount: Int
     /// Shared library VM. Kept optional because it's built lazily in
     /// the shell; Phase-4 prompt-bookmark surfaces and other sidebar-
-    /// adjacent features read from it. Previously also fed a HISTORY
-    /// section listing recently-opened threads + saved filter
-    /// entries; that surface was retired on user request ("サイドバー
-    /// の History は消そうかな"), so the VM is kept only for the
-    /// non-History consumers now.
+    /// adjacent features read from it.
     let libraryViewModel: LibraryViewModel?
     /// Which sources are currently expanded. We seed from `sources` on
     /// first appear *and* whenever the source list changes shape (e.g. a
@@ -1915,13 +1937,10 @@ private struct DesignMockSidebar: View {
                     }
                 }
 
-                // HISTORY section removed on user request ("サイドバー
-                // の History は消そうかな"). Previously listed recently-
-                // opened threads + saved filter entries interleaved by
-                // timestamp; with it gone the sidebar is strictly a
-                // library-scope narrower (Library → Sources) and the
-                // thread-reopening + filter-recall flows live elsewhere
-                // (toolbar search recall, ⌘⇧↑/↓ jump navigation, etc.).
+                // Sidebar is strictly a library-scope narrower (Library
+                // → Sources → Bookmarks). Thread-reopening and recent-
+                // filter recall live elsewhere: toolbar search suggestions
+                // for query recall, ⌘⇧↑/⌘⇧↓ for edge-jump navigation.
             }
             .padding(.horizontal, 6)
             .padding(.top, 10)
@@ -2243,8 +2262,9 @@ private struct DesignMockThreadListPane: View {
         //
         // Wrap in `ScrollViewReader` so the same selection-driven
         // scroll-to-top pattern used in the table pane also applies
-        // here — opening a thread from ANY surface (sidebar HISTORY,
-        // bookmark, etc.) lands the row at the top of the card list.
+        // here — opening a thread from ANY surface (bookmark click,
+        // filter swap, keyboard jump, etc.) lands the row at the top
+        // of the card list.
         ScrollViewReader { proxy in
         ScrollView {
             LazyVStack(spacing: 0) {
@@ -2352,8 +2372,8 @@ private struct DesignMockThreadListPane: View {
         // of the viewport. That's the only case the user asked for:
         // "テーブルから開いてカードに切り替わった時だけ上に行く".
         //
-        // Within the card pane itself (sidebar HISTORY click,
-        // bookmark click, tapping a different card) the selection
+        // Within the card pane itself (bookmark click, tapping a
+        // different card, keyboard step) the selection
         // changes but the pane doesn't remount, so this `.task`
         // doesn't refire — and intentionally. A prior
         // `.onChange(of: selection)` handler used to scroll-to-top on
@@ -2532,8 +2552,8 @@ private struct DesignMockThreadTablePane: View {
         // pagination order) is unaffected.
         let rows = conversations.sorted(using: sortOrder)
         // `ScrollViewReader` so selection changes driven from OUTSIDE the
-        // table (sidebar HISTORY click, bookmark click, filter swap that
-        // repairs the selection) can scroll the target row to the top.
+        // table (bookmark click, filter swap that repairs the selection,
+        // keyboard edge-jump) can scroll the target row to the top.
         // SwiftUI `Table` on macOS forwards `proxy.scrollTo(id)` through
         // its underlying `NSScrollView`, so the same row-id we bind the
         // selection on doubles as the scroll anchor.
@@ -2675,13 +2695,13 @@ private struct DesignMockThreadTablePane: View {
         // should just highlight it in place, not yank the scroll
         // position. Auto-scroll now only fires via the `.task`
         // below, which runs once on fresh table mount (e.g. flipping
-        // into `.table` mode with a pre-existing selection, or
-        // clicking a HISTORY row which flips layout) so cross-
-        // surface navigation still lands the target row at the top
-        // without disturbing in-table clicks.
+        // into `.table` mode with a pre-existing selection, or a
+        // bookmark click that flips layout) so cross-surface
+        // navigation still lands the target row at the top without
+        // disturbing in-table clicks.
         //
         // On first mount, if the selection was already set by the
-        // sidebar path (recent-thread click flips layout to `.default`
+        // sidebar path (e.g. a bookmark click flips layout to `.default`
         // *and* writes the id into `selectedConversationIDs` in the
         // same tick), we need to scroll to it too — any on-transition
         // handler wouldn't fire for the initial value. A brief poll
@@ -2935,29 +2955,17 @@ private struct DesignMockExpandedPromptList: View {
     /// target edge. `proxy` lets the move scroll the new row into
     /// view when it's past the viewport edge.
     private func movePromptSelection(by delta: Int, proxy: ScrollViewProxy) {
-        guard !prompts.isEmpty else { return }
-        let currentIndex = selectedPromptID.flatMap { id in
-            prompts.firstIndex { $0.id == id }
+        guard let nextID = steppedID(in: prompts, from: selectedPromptID, by: delta) else {
+            return
         }
-        let nextIndex: Int
-        if let currentIndex {
-            nextIndex = min(max(currentIndex + delta, 0), prompts.count - 1)
-            guard nextIndex != currentIndex else { return }
-        } else {
-            // No prompt selected yet — ↓ picks first, ↑ picks last.
-            // Matches the thread-list convention for unfocused
-            // lists so the two levels behave consistently.
-            nextIndex = delta >= 0 ? 0 : prompts.count - 1
-        }
-        let next = prompts[nextIndex]
-        selectedPromptID = next.id
-        pendingPromptID = next.id
+        selectedPromptID = nextID
+        pendingPromptID = nextID
         // Keep the highlighted row visible as we walk off the
         // top/bottom edges of the viewport. `.center` matches the
         // card-list / table behaviour for consistency across
         // levels.
         withAnimation(.easeOut(duration: 0.18)) {
-            proxy.scrollTo(next.id, anchor: .center)
+            proxy.scrollTo(nextID, anchor: .center)
         }
     }
 
@@ -4239,38 +4247,6 @@ private enum DesignMockQueryLanguage {
         }
     }
 
-    /// Re-serialize an `ArchiveSearchFilter` back into a searchText
-    /// string the toolbar field can display. Used by the HISTORY
-    /// sidebar section: clicking a saved entry pushes the
-    /// corresponding DSL sentence into the field, which in turn
-    /// flows through `composedQuery` → store fetch. The round-trip
-    /// is lossy by design — only dimensions the DSL natively
-    /// supports (keyword, single source, single model,
-    /// bookmarks-only) survive. Multi-value or advanced fields
-    /// (date ranges, role, source-file paths, #tags) are dropped;
-    /// the corresponding rows won't disappear from history but
-    /// they also won't fully reproduce their filter when selected.
-    /// That tradeoff is acceptable for a Phase-3 slice — the
-    /// common case (keyword + source + model) is what users save
-    /// and re-invoke; richer selection UX can come later if the
-    /// gap proves painful.
-    static func searchText(from filter: ArchiveSearchFilter) -> String {
-        var parts: [String] = []
-        let keyword = filter.normalizedKeyword
-        if !keyword.isEmpty {
-            parts.append(keyword)
-        }
-        if let source = filter.sources.sorted().first {
-            parts.append("source:\(source)")
-        }
-        if let model = filter.models.sorted().first {
-            parts.append("model:\(model)")
-        }
-        if filter.bookmarkedOnly {
-            parts.append("is:bookmarked")
-        }
-        return parts.joined(separator: " ")
-    }
 }
 
 private enum DesignMockData {

@@ -911,11 +911,11 @@ final class LibraryViewModel {
     /// Record a query the user ran in the DesignMock shell (or any
     /// surface that doesn't funnel its filter through `LibraryViewModel.filter`)
     /// as a recent-filter row in the shared DB, then refresh
-    /// `unifiedFilters` so the sidebar HISTORY section picks it up.
-    /// Silently no-ops when the filter carries nothing meaningful —
-    /// mirrors `saveRecentFilter`'s own guard so an empty toolbar
-    /// doesn't flood the history list with identical "Filtered View"
-    /// rows.
+    /// `unifiedFilters` so the saved-filter surfaces (sidebar rows +
+    /// toolbar search suggestions) pick it up. Silently no-ops when
+    /// the filter carries nothing meaningful — mirrors `saveRecentFilter`'s
+    /// own guard so an empty toolbar doesn't flood the list with
+    /// identical "Filtered View" rows.
     func recordRecentSearch(_ filter: ArchiveSearchFilter) {
         guard filter.hasMeaningfulFilters else { return }
         Task {
