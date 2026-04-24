@@ -44,7 +44,6 @@ struct MadiniArchiveApp: App {
         .defaultSize(width: 1200, height: 800)
         .commands {
             AppCommands()
-            VaultBrowserCommands()
         }
         #endif
 
@@ -54,20 +53,13 @@ struct MadiniArchiveApp: App {
                 .environment(identityPreferences)
                 .environment(archiveEvents)
         }
-
-        // Phase D1: stand-alone raw-export vault browser. Lives in its own
-        // Window so it can be opened / closed without touching the main
-        // reader UI. Accessible from Window → Vault Browser (⌘⌥V, wired in
-        // `VaultBrowserCommands`).
-        Window("Vault Browser", id: VaultBrowserCommands.windowID) {
-            VaultBrowserView(
-                vault: services.rawExportVault,
-                assetResolver: services.rawAssetResolver
-            )
-                .environmentObject(services)
-                .frame(minWidth: 720, minHeight: 480)
-        }
-        .defaultSize(width: 960, height: 640)
+        // The standalone Vault Browser window scene and its ⌘⌥V menu
+        // binding have been retired. Everything that surface used to
+        // show — snapshot list, per-snapshot files, file-content
+        // preview — now lives inside the sidebar's archive.db entry
+        // (see `ArchiveInspectorPane` + `ArchiveInspectorFileListPane`),
+        // which keeps the vault browsing surface discoverable from one
+        // place instead of three.
         #endif
     }
 }
@@ -103,26 +95,6 @@ extension FocusedValues {
         set { self[LibraryViewModelKey.self] = newValue }
     }
 }
-
-#if os(macOS)
-/// Adds a `Window → Vault Browser` menu entry bound to ⌘⌥V, opening the
-/// Phase D1 Vault Browser window scene. Isolated from `AppCommands` so the
-/// main-reader navigation shortcuts stay untouched.
-struct VaultBrowserCommands: Commands {
-    static let windowID = "vault-browser"
-
-    @Environment(\.openWindow) private var openWindow
-
-    var body: some Commands {
-        CommandGroup(after: .windowArrangement) {
-            Button("Vault Browser") {
-                openWindow(id: Self.windowID)
-            }
-            .keyboardShortcut("v", modifiers: [.command, .option])
-        }
-    }
-}
-#endif
 
 struct AppCommands: Commands {
     @FocusedValue(\.browseViewModel) private var viewModel

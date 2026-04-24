@@ -6,6 +6,19 @@ import UniformTypeIdentifiers
 import UIKit
 #endif
 
+// Shared platform image typealias. Used to live alongside
+// `VaultAssetPreviewView` when the standalone Vault Browser was a
+// separate surface, but the asset-preview view and its sibling vault-
+// browser files were retired when archive.db absorbed their job. The
+// raw-transcript inline image view is the one remaining consumer, so
+// the typealias comes with it rather than sitting in a dedicated
+// utility file of its own.
+#if os(macOS)
+typealias CrossPlatformImage = NSImage
+#elseif os(iOS)
+typealias CrossPlatformImage = UIImage
+#endif
+
 /// Lazily resolves an image `AssetReference` against the Raw Export Vault and
 /// renders the decoded bitmap. Runs the resolver + blob load off the main
 /// actor, and degrades to a labelled placeholder when the reference can't be
