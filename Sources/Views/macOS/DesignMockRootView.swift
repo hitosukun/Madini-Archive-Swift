@@ -883,6 +883,78 @@ struct DesignMockRootView: View {
             // guards on `selectedConversation != nil`.
             recordCurrentThreadInHistory()
         }
+        // Publish shell-scoped actions for the main menu. The struct
+        // is rebuilt on every body recompute so `currentLayout`,
+        // `deleteSelectedSnapshot`'s enablement, and the library
+        // reload closure all track the shell's live state. SwiftUI
+        // diffs at the Commands layer against the new value, so the
+        // menu item states (disabled / enabled) stay in lockstep
+        // with the window.
+        .focusedSceneValue(\.shellCommands, shellCommandActions)
+        // Publish the library view model so `AppCommands`' Next /
+        // Previous Conversation buttons have something to call.
+        // Previously only `MacOSRootView` (the deprecated alternate
+        // shell) published this, which meant the menu item rendered
+        // but did nothing in the shipping UI. Optional because the
+        // shared VM is materialized lazily in the root `.task` —
+        // SwiftUI drops the publish when nil so the menu item
+        // correctly disables until the VM is ready.
+        .focusedSceneValue(\.libraryViewModel, libraryViewModel)
+    }
+
+    /// Build the `ShellCommandActions` bundle that `AppCommands`
+    /// pulls from `FocusedValues`. Computed property rather than
+    /// `@State` because every value inside is either already-stored
+    /// state or a closure — reconstructing it per body pass is free
+    /// and avoids the co-ordination overhead of a redundant mirror.
+    private var shellCommandActions: ShellCommandActions {
+        // Capture the projected bindings / references once so the
+        // closures don't have to reach back into `self` (which, as a
+        // SwiftUI View value-type snapshot, can be stale by the time
+        // a menu click fires).
+        let layoutBinding = $selectedLayoutMode
+        let capturedServices = services
+        let capturedStore = store
+        let capturedLibraryVM = libraryViewModel
+        let capturedArchiveVM = archiveInspectorVM
+        let archiveFocused = showingArchiveInspector
+
+        // Enable "Delete Snapshot…" only when:
+        //   1. the sidebar is pointing at archive.db (so the
+        //      Archive Inspector actually owns the current view)
+        //   2. a snapshot row is selected, and
+        //   3. that id still resolves against the loaded list.
+        // Otherwise ship nil so SwiftUI disables the menu item.
+        let deleteClosure: (() -> Void)?
+        if archiveFocused,
+           let vm = capturedArchiveVM,
+           let selectedID = vm.selectedSnapshotID,
+           let snapshot = vm.snapshots.first(where: { $0.id == selectedID }) {
+            deleteClosure = {
+                vm.requestDelete(snapshot: snapshot)
+            }
+        } else {
+            deleteClosure = nil
+        }
+
+        return ShellCommandActions(
+            currentLayout: selectedLayoutMode,
+            setLayout: { newMode in
+                layoutBinding.wrappedValue = newMode
+            },
+            reloadLibrary: {
+                Task { await capturedStore.refreshAll(services: capturedServices) }
+                if let libraryVM = capturedLibraryVM {
+                    Task { await libraryVM.reloadSupportingState() }
+                }
+            },
+            openDropFolder: {
+                #if os(macOS)
+                NSWorkspace.shared.open(capturedServices.intakeDirURL)
+                #endif
+            },
+            deleteSelectedSnapshot: deleteClosure
+        )
     }
 
     /// Shared entry point for "the reader is now showing this
@@ -3468,7 +3540,11 @@ private struct DesignMockSidebarItem: Identifiable {
     }
 }
 
-private enum DesignMockLayoutMode: String, CaseIterable, Identifiable {
+/// Outer layout mode toggled from the toolbar (Table / Default / Viewer).
+/// Promoted from `private` to module-internal so `AppCommands` can reference
+/// it when wiring up ⌘1 / ⌘2 / ⌘3 — the menu actions flip this via a
+/// shared `ShellCommandActions` bundle published as a `FocusedValue`.
+enum DesignMockLayoutMode: String, CaseIterable, Identifiable {
     case table
     case `default`
     case viewer

@@ -84,6 +84,42 @@ struct LibraryViewModelKey: FocusedValueKey {
     typealias Value = LibraryViewModel
 }
 
+/// Bundle of window-scoped actions the main menu bar's `AppCommands` needs
+/// to invoke — layout switching, library reload, archive-inspector delete,
+/// drop-folder open. Published by `DesignMockRootView` as a single
+/// `FocusedValue` (instead of many) so the command struct stays readable
+/// and each new menu entry is a one-line closure wire-up.
+///
+/// Closures rather than raw state so the shell can do whatever it needs to
+/// (mutate `@State`, dispatch async Tasks, reach into
+/// `ArchiveInspectorViewModel`) without leaking its internals to the
+/// commands layer.
+struct ShellCommandActions {
+    /// Currently-selected outer layout mode. Used by the menu to show
+    /// the check mark next to the active item (SwiftUI doesn't offer a
+    /// built-in state indicator for menu items, but comparing here lets
+    /// us disable the "set layout" action for the mode we're already in).
+    let currentLayout: DesignMockLayoutMode
+    let setLayout: (DesignMockLayoutMode) -> Void
+    /// Re-run the in-flight library query and re-sync the library view
+    /// model's supporting state. Bound to ⌘R (matches the universal
+    /// "refresh" shortcut across Safari / Mail / Finder).
+    let reloadLibrary: () -> Void
+    /// Open the intake drop folder in Finder. Works whether the user is
+    /// using the default location or has pointed the app at a custom
+    /// folder via the Archive Inspector's header buttons.
+    let openDropFolder: () -> Void
+    /// Non-nil only when the Archive Inspector is the focused pane AND
+    /// a snapshot row is selected. Calling it fires the same
+    /// confirmation-alert flow the context menu's "Delete snapshot…"
+    /// uses. Nil disables the menu item (SwiftUI renders it grey).
+    let deleteSelectedSnapshot: (() -> Void)?
+}
+
+struct ShellCommandsKey: FocusedValueKey {
+    typealias Value = ShellCommandActions
+}
+
 extension FocusedValues {
     var browseViewModel: BrowseViewModel? {
         get { self[BrowseViewModelKey.self] }
@@ -94,25 +130,114 @@ extension FocusedValues {
         get { self[LibraryViewModelKey.self] }
         set { self[LibraryViewModelKey.self] = newValue }
     }
+
+    var shellCommands: ShellCommandActions? {
+        get { self[ShellCommandsKey.self] }
+        set { self[ShellCommandsKey.self] = newValue }
+    }
 }
 
+/// Main-menu commands. Follows macOS HIG conventions:
+///
+/// - **View menu** (via `CommandGroup(after: .sidebar)`) — Finder-style
+///   layout switchers on ⌘1 / ⌘2 / ⌘3.
+/// - **Library menu** (new top-level via `CommandMenu`) — thread
+///   navigation (moved here from the Edit menu where it used to live)
+///   plus ⌘R for reload.
+/// - **Archive menu** (new top-level) — drop-folder access and
+///   snapshot deletion, enabled only when the Archive Inspector is in
+///   focus with a selected snapshot.
+///
+/// Commands that depend on per-window state (layout, archive, library)
+/// read through `ShellCommandActions` / `libraryViewModel` /
+/// `browseViewModel` FocusedValues. When the focused window doesn't
+/// publish these (e.g. Settings scene), the buttons render disabled
+/// rather than throwing — matches how Mail and Finder disable their
+/// context-specific menu items when the relevant pane isn't the key
+/// one.
 struct AppCommands: Commands {
-    @FocusedValue(\.browseViewModel) private var viewModel
+    @FocusedValue(\.browseViewModel) private var browseViewModel
     @FocusedValue(\.libraryViewModel) private var libraryViewModel
+    @FocusedValue(\.shellCommands) private var shell
 
     var body: some Commands {
-        CommandGroup(after: .textEditing) {
-            Section {
-                Button("Next Conversation") {
-                    libraryViewModel?.selectNext() ?? viewModel?.selectNext()
-                }
-                .keyboardShortcut(.downArrow, modifiers: .command)
-
-                Button("Previous Conversation") {
-                    libraryViewModel?.selectPrevious() ?? viewModel?.selectPrevious()
-                }
-                .keyboardShortcut(.upArrow, modifiers: .command)
+        // View menu — layout switchers. `after: .sidebar` slots them
+        // directly beneath the default "Show Sidebar" item SwiftUI
+        // already publishes for NavigationSplitView, which is where a
+        // user scanning the View menu will look first.
+        CommandGroup(after: .sidebar) {
+            Divider()
+            Button("Table Layout") {
+                shell?.setLayout(.table)
             }
+            .keyboardShortcut("1", modifiers: .command)
+            .disabled(shell == nil)
+
+            Button("Default Layout") {
+                shell?.setLayout(.default)
+            }
+            .keyboardShortcut("2", modifiers: .command)
+            .disabled(shell == nil)
+
+            Button("Viewer Layout") {
+                shell?.setLayout(.viewer)
+            }
+            .keyboardShortcut("3", modifiers: .command)
+            .disabled(shell == nil)
+        }
+
+        // Library menu — thread-level navigation + reload. Lives at
+        // the top level (between View and Window) because these are
+        // the highest-frequency actions in the app and the Edit menu
+        // was getting misused as a catch-all. Mirrors how Mail keeps
+        // "Message" as its own top-level menu.
+        CommandMenu("Library") {
+            Button("Next Conversation") {
+                libraryViewModel?.selectNext() ?? browseViewModel?.selectNext()
+            }
+            .keyboardShortcut(.downArrow, modifiers: .command)
+            .disabled(libraryViewModel == nil && browseViewModel == nil)
+
+            Button("Previous Conversation") {
+                libraryViewModel?.selectPrevious() ?? browseViewModel?.selectPrevious()
+            }
+            .keyboardShortcut(.upArrow, modifiers: .command)
+            .disabled(libraryViewModel == nil && browseViewModel == nil)
+
+            Divider()
+
+            Button("Reload") {
+                shell?.reloadLibrary()
+            }
+            .keyboardShortcut("r", modifiers: .command)
+            .disabled(shell == nil)
+        }
+
+        // Archive menu — drop-folder access and snapshot deletion.
+        // Separate from Library because these act on archive.db
+        // (import surface / vaulted snapshots) rather than on the
+        // conversation list.
+        CommandMenu("Archive") {
+            Button("Open Drop Folder") {
+                shell?.openDropFolder()
+            }
+            .keyboardShortcut("o", modifiers: [.command, .shift])
+            .disabled(shell == nil)
+
+            Divider()
+
+            // ⌘⌫ matches Finder's "Move to Trash" and Mail's "Delete
+            // Message". Plain ⌫ would fire inside text fields (search
+            // box) which is unsafe for a destructive action; the
+            // ⌘-modified form only fires when the menu item is in the
+            // focus path and the archive inspector owns the key
+            // column. The shell publishes a nil closure when no
+            // snapshot is selected, which greys this out.
+            Button("Delete Snapshot…") {
+                shell?.deleteSelectedSnapshot?()
+            }
+            .keyboardShortcut(.delete, modifiers: .command)
+            .disabled(shell?.deleteSelectedSnapshot == nil)
         }
     }
 }
