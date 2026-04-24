@@ -714,6 +714,23 @@ struct DesignMockRootView: View {
             // per-column via the filter card's segmented picker, and the
             // initial "global" sort lives implicitly in the DB query.
 
+            // Small spinner that appears while the store is refreshing.
+            // Keeps ⌘R observably feedback-ful: the sidebar may end up
+            // with identical rows after a refresh (no actual data
+            // change), which earlier left the user unsure whether the
+            // shortcut had fired. A ProgressView here lights up for
+            // the ~100-300ms the query takes, giving a clear "we heard
+            // you" signal. `.controlSize(.small)` keeps it from
+            // dominating the title bar height.
+            ToolbarItem(placement: .primaryAction) {
+                if store.isLoading {
+                    ProgressView()
+                        .controlSize(.small)
+                        .progressViewStyle(.circular)
+                        .frame(width: 16, height: 16)
+                }
+            }
+
             ToolbarItem(placement: .primaryAction) {
                 DesignMockLayoutModePicker(selection: $selectedLayoutMode)
             }
