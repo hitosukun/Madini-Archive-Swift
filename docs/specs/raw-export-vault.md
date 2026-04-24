@@ -354,19 +354,20 @@ Project/tag/Saved View features operate on normalized conversation identity or
 user annotations. They may refer to Vault provenance later, but Vault must not
 become an annotation engine.
 
-## Python Compatibility Checklist
+## Legacy Python Prototype (Informational)
 
-The SwiftUI app and the older Python app share the SQLite data directory.
-Before treating Vault as cross-version stable, Python compatibility needs an
-explicit pass:
+An earlier Python prototype exists but is unpublished and is not a peer of the
+Swift implementation. It no longer constrains schema decisions here.
 
-- Add the five Vault tables with identical names and column definitions.
-- Preserve `search_idx` tokenizer behavior separately from
-  `raw_export_search_idx`.
-- Do not rename or repurpose existing Python-visible tables.
-- Ensure Python readers tolerate unknown Vault rows.
-- Decide whether Python should write Vault rows or only read them.
-- Document any Python-side rebuild/repair command for raw export indexes.
+Treat the Python artifact as a one-way legacy data source:
+
+- If a user has a pre-existing Python-era SQLite database, a future migration
+  may ingest it into the Swift-owned schema.
+- The Swift app does not guarantee its writes will be readable by the Python
+  prototype, and is not required to.
+- `raw_export_search_idx` and the main `search_idx` may diverge structurally
+  from any Python-era shape; the only constraint is that the Swift
+  `DatabaseMigrator` can upgrade in place.
 
 ## Maintenance Notes
 

@@ -9,17 +9,7 @@ final class GRDBSearchRepository: SearchRepository, @unchecked Sendable {
     }
 
     func search(query: SearchQuery) async throws -> [SearchResult] {
-        let normalized = query.normalizedText
-        guard query.filter.hasMeaningfulFilters,
-              !normalized.isEmpty
-                || query.filter.bookmarkedOnly
-                || !query.filter.sources.isEmpty
-                || !query.filter.models.isEmpty
-                || !query.filter.sourceFiles.isEmpty
-                || query.filter.dateFrom != nil
-                || query.filter.dateTo != nil
-                || !query.filter.roles.isEmpty
-                || !query.filter.bookmarkTags.isEmpty else {
+        guard Self.shouldExecute(query: query) else {
             return []
         }
 
@@ -70,17 +60,7 @@ final class GRDBSearchRepository: SearchRepository, @unchecked Sendable {
     }
 
     func count(query: SearchQuery) async throws -> Int {
-        let normalized = query.normalizedText
-        guard query.filter.hasMeaningfulFilters,
-              !normalized.isEmpty
-                || query.filter.bookmarkedOnly
-                || !query.filter.sources.isEmpty
-                || !query.filter.models.isEmpty
-                || !query.filter.sourceFiles.isEmpty
-                || query.filter.dateFrom != nil
-                || query.filter.dateTo != nil
-                || !query.filter.roles.isEmpty
-                || !query.filter.bookmarkTags.isEmpty else {
+        guard Self.shouldExecute(query: query) else {
             return 0
         }
 
@@ -138,6 +118,49 @@ final class GRDBSearchRepository: SearchRepository, @unchecked Sendable {
     )
     """
 
+    /// Guard used by both `search` and `count` to decide whether the
+    /// query should actually hit the database. Three cases reject:
+    ///
+    /// 1. No meaningful filters at all (the legacy bail).
+    /// 2. The user typed search text, but the parser couldn't turn it
+    ///    into a positive FTS5 expression — e.g. `-foo` on its own.
+    ///    Without this guard the FROM clause would end up as an
+    ///    unconstrained FTS5 JOIN and return every row in the index.
+    /// 3. Case 2 happened but there are other non-text filters → we
+    ///    still bail, because returning "everything matching source=X"
+    ///    when the user's text search produced nothing is surprising
+    ///    (they expect zero results from "exclude foo").
+    ///
+    /// The third point is a conscious UX choice: the user can combine
+    /// `-foo` with any positive term (`bar -foo`) when they want to
+    /// exclude from a real result set. Pure-negation-plus-filter
+    /// returning the filter's full set was the old behaviour that
+    /// looked like a bug.
+    private static func shouldExecute(query: SearchQuery) -> Bool {
+        guard query.filter.hasMeaningfulFilters else { return false }
+
+        let hasText = !query.normalizedText.isEmpty
+        if hasText {
+            // Text typed but unparseable (only negations, only
+            // separators, etc.) → reject.
+            guard SearchQueryParser.parse(query.normalizedText).ftsMatchExpression != nil else {
+                return false
+            }
+            return true
+        }
+
+        // No text search — require at least one other filter to be
+        // set, otherwise we'd return every conversation.
+        return query.filter.bookmarkedOnly
+            || !query.filter.sources.isEmpty
+            || !query.filter.models.isEmpty
+            || !query.filter.sourceFiles.isEmpty
+            || query.filter.dateFrom != nil
+            || query.filter.dateTo != nil
+            || !query.filter.roles.isEmpty
+            || !query.filter.bookmarkTags.isEmpty
+    }
+
     static func makeSearchWhereClause(
         query: SearchQuery,
         includePagination: Bool = true
@@ -149,9 +172,10 @@ final class GRDBSearchRepository: SearchRepository, @unchecked Sendable {
         // `GRDBConversationRepository.makeConversationWhereClause` と揃える。
         filters.append("COALESCE(c.source, '') != 'markdown'")
 
-        if !query.normalizedText.isEmpty {
+        if !query.normalizedText.isEmpty,
+           let match = SearchQueryParser.parse(query.normalizedText).ftsMatchExpression {
             filters.append("search_idx MATCH ?")
-            arguments += [makeMatchQuery(from: query.normalizedText)]
+            arguments += [match]
         }
 
         if !query.filter.sources.isEmpty {
@@ -244,20 +268,4 @@ final class GRDBSearchRepository: SearchRepository, @unchecked Sendable {
         return (whereSQL, arguments)
     }
 
-    private static func makeMatchQuery(from rawValue: String) -> String {
-        let tokens = rawValue
-            .split(whereSeparator: \.isWhitespace)
-            .map { token in
-                token.replacingOccurrences(of: "\"", with: "\"\"")
-            }
-            .filter { !$0.isEmpty }
-
-        if tokens.isEmpty {
-            return "\"\(rawValue.replacingOccurrences(of: "\"", with: "\"\""))\""
-        }
-
-        return tokens
-            .map { "\"\($0)\"" }
-            .joined(separator: " AND ")
-    }
 }

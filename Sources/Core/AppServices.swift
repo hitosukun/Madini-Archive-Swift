@@ -343,6 +343,108 @@ final class AppServices: ObservableObject {
                 ON conversation_raw_refs(conversation_id)
                 """)
 
+            // Body-data search index (`search_idx`). The Swift app owns this
+            // index and uses FTS5 trigram tokenization so `title:マディニ`
+            // matches "マディニちゃん画像" style titles (substring search
+            // that the legacy `unicode61` tokenizer couldn't express for
+            // CJK text). See `SearchQueryParser` for the query grammar.
+            //
+            // Migration policy:
+            //   - Fresh DB: create empty trigram index. Rebuild is a no-op.
+            //   - Legacy index (unicode61, or any non-trigram config):
+            //     drop + recreate + repopulate from `conversations` +
+            //     `messages`. At ~1,000 conversations this finishes in well
+            //     under a second; scaling to ~100,000 (the 100x target) is
+            //     tracked as a separate task that hoists this out of the
+            //     synchronous bootstrap and wraps it with progress UI.
+            //
+            // We detect the need for migration by scanning the existing
+            // `CREATE VIRTUAL TABLE` statement in `sqlite_master` for the
+            // word "trigram". Any other tokenizer (or no table at all)
+            // triggers a rebuild.
+            let searchSchemaRow = try Row.fetchOne(db, sql: """
+                SELECT sql FROM sqlite_master
+                WHERE type = 'table' AND name = 'search_idx'
+                """)
+            let existingSearchSQL = (searchSchemaRow?["sql"] as String?) ?? ""
+            let isTrigramIndex = existingSearchSQL.range(
+                of: "trigram",
+                options: .caseInsensitive
+            ) != nil
+            if !isTrigramIndex {
+                if !existingSearchSQL.isEmpty {
+                    try db.execute(sql: "DROP TABLE search_idx")
+                }
+                try db.execute(sql: """
+                    CREATE VIRTUAL TABLE IF NOT EXISTS search_idx USING fts5(
+                        conv_id UNINDEXED,
+                        title,
+                        content,
+                        tokenize = "trigram case_sensitive 0"
+                    )
+                    """)
+                // Only repopulate if the canonical tables are present.
+                // A fresh DB (no conversations yet) can skip rebuild — the
+                // import pipeline inserts into `search_idx` when a
+                // conversation is added.
+                let convTableExists = try Row.fetchOne(db, sql: """
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name = 'conversations'
+                    """) != nil
+                let messagesTableExists = try Row.fetchOne(db, sql: """
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name = 'messages'
+                    """) != nil
+                if convTableExists && messagesTableExists {
+                    // Emit a timing + size diagnostic so scale problems
+                    // show up in Console.app rather than as a silent
+                    // launch freeze. The threshold for "this will feel
+                    // slow" is roughly 10k conversations on M-series
+                    // hardware — beyond that we should hoist the
+                    // rebuild out of bootstrap (see TODO below).
+                    let convCount = try Int.fetchOne(
+                        db,
+                        sql: "SELECT COUNT(*) FROM conversations"
+                    ) ?? 0
+                    let startedAt = Date()
+                    if convCount > 10_000 {
+                        print("[search_idx] Rebuilding FTS5 trigram index over \(convCount) conversations. UI may appear frozen; see TODO in AppServices for progress-UI follow-up.")
+                    }
+                    try db.execute(sql: """
+                        INSERT INTO search_idx (conv_id, title, content)
+                        SELECT
+                            c.id,
+                            COALESCE(c.title, ''),
+                            COALESCE((
+                                SELECT GROUP_CONCAT(m.content, ' ')
+                                FROM messages m
+                                WHERE m.conv_id = c.id
+                            ), '')
+                        FROM conversations c
+                        """)
+                    let elapsed = Date().timeIntervalSince(startedAt)
+                    print(String(format: "[search_idx] Rebuilt trigram index: %d conversations in %.2fs", convCount, elapsed))
+                }
+            }
+            // TODO (100x-scale follow-up): hoist the trigram rebuild
+            // out of this synchronous bootstrap transaction once library
+            // sizes cross ~10k conversations. Proposed shape:
+            //
+            //   1. Add a `pending_migrations(name TEXT PRIMARY KEY)` table.
+            //   2. In bootstrap, insert `'search_idx_trigram'` into it
+            //      instead of running the INSERT inline.
+            //   3. On app launch, after AppServices is wired up, check
+            //      `pending_migrations` and run the rebuild in an async
+            //      task with a launch-screen progress view that reads
+            //      `SELECT COUNT(*) FROM search_idx` periodically.
+            //   4. Delete the pending-migrations row on success.
+            //
+            // At today's scale (hundreds-to-low-thousands of threads)
+            // the inline path is fast enough that the extra
+            // orchestration isn't worth the complexity; revisit when
+            // the live DB crosses the threshold or when a user reports
+            // a slow first-launch after upgrade.
+
             // Seed the Trash system tag. Trash is a "rescue lane" — when a
             // user-defined tag is deleted, the conversations that had it get
             // Trash attached in its place, so nothing silently disappears.
