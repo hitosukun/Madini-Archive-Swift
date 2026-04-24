@@ -790,42 +790,24 @@ private struct ConversationHeaderView: View {
     var onDoubleTapToTop: (() -> Void)? = nil
 
     var body: some View {
-        HStack(spacing: 8) {
-            // Thread title on the left, time + source pill on the
-            // right. Title gets `layoutPriority(1)` + `Spacer()` push
-            // so it absorbs available width without shoving the
-            // metadata off-screen; truncation happens on the title
-            // first, which is the right default (the metadata is
-            // always short — a pill plus a formatted date — and is
-            // what the user scans to identify the thread at a
-            // glance). `textSelection(.enabled)` so the title is
-            // copy-paste-friendly.
-            Text(summary.title ?? "Untitled")
-                .font(.callout.weight(.semibold))
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .foregroundStyle(.primary)
-                .textSelection(.enabled)
-                .layoutPriority(1)
-
-            Spacer(minLength: 8)
-
-            // Source-origin pill sits immediately to the LEFT of the
-            // date timestamp so the eye doesn't have to traverse the
-            // full pane width to find it. The tag editor that used
-            // to sit alongside was retired when tags were dropped
-            // from the UI.
-            SourceOriginPill(
-                conversationID: summary.id,
-                source: summary.source,
-                model: summary.model
-            )
-
-            if let time = summary.primaryTime {
-                Text(time)
-                    .font(.callout)
-                    .foregroundStyle(.tertiary)
-            }
+        // Two layouts. `ViewThatFits` picks horizontal when the pane
+        // is wide enough to carry the title + pill + date on one
+        // line without compressing any of them, and falls through to
+        // a vertical stack otherwise so the pill and date wrap onto
+        // a second row instead of getting clipped off-screen.
+        //
+        // The wide candidate declares an explicit `minWidth` to make
+        // `ViewThatFits` reject it once the pane drops below that
+        // threshold — without it, the HStack happily shrinks forever
+        // (title truncates down to an ellipsis) because SwiftUI
+        // considers a truncated text "fitting." The minWidth is
+        // tuned against typical title lengths: below ~480pt, the
+        // title has to truncate so aggressively that the vertical
+        // layout becomes the better read.
+        ViewThatFits(in: .horizontal) {
+            horizontalLayout
+                .frame(minWidth: 480)
+            verticalLayout
         }
         .padding(.horizontal, 4)
         // Hit-test the whole row (including the Spacer) so a
@@ -837,6 +819,77 @@ private struct ConversationHeaderView: View {
         .onTapGesture(count: 2) {
             onDoubleTapToTop?()
         }
+    }
+
+    /// Wide layout: title / pill / date on one line. Title gets
+    /// `layoutPriority(1)` + `Spacer()` push so it absorbs available
+    /// width without shoving the metadata off-screen; truncation
+    /// happens on the title first, which is the right default (the
+    /// metadata is always short — a pill plus a formatted date —
+    /// and is what the user scans to identify the thread at a
+    /// glance). `textSelection(.enabled)` so the title is
+    /// copy-paste-friendly.
+    private var horizontalLayout: some View {
+        HStack(spacing: 8) {
+            titleText
+                .layoutPriority(1)
+
+            Spacer(minLength: 8)
+
+            // Source-origin pill sits immediately to the LEFT of the
+            // date timestamp so the eye doesn't have to traverse the
+            // full pane width to find it. The tag editor that used
+            // to sit alongside was retired when tags were dropped
+            // from the UI.
+            sourcePill
+
+            if let time = summary.primaryTime {
+                Text(time)
+                    .font(.callout)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    /// Narrow layout: title on line 1, pill + date on line 2. Keeps
+    /// the same information density but trades horizontal space for
+    /// vertical so nothing has to truncate or clip. Pill sits first
+    /// on the metadata row so the source-origin affordance (click
+    /// to open raw data) stays visible even when the pane is very
+    /// narrow.
+    private var verticalLayout: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            titleText
+
+            HStack(spacing: 8) {
+                sourcePill
+
+                if let time = summary.primaryTime {
+                    Text(time)
+                        .font(.callout)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 0)
+            }
+        }
+    }
+
+    private var titleText: some View {
+        Text(summary.title ?? "Untitled")
+            .font(.callout.weight(.semibold))
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .foregroundStyle(.primary)
+            .textSelection(.enabled)
+    }
+
+    private var sourcePill: some View {
+        SourceOriginPill(
+            conversationID: summary.id,
+            source: summary.source,
+            model: summary.model
+        )
     }
 
 }

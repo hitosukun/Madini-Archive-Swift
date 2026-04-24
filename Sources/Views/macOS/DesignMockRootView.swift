@@ -617,10 +617,21 @@ struct DesignMockRootView: View {
     /// lives only in the separate `.table` outer layout, which sets
     /// its own pane width via a different mechanism.
     @AppStorage("designmock.centerPaneIdealWidth.cards") private var centerWidthCards: Double = 460
+    /// Persisted sidebar width. Same GeometryReader-probe pattern as
+    /// the center pane — `NavigationSplitView` doesn't publish a
+    /// current-width binding so we have to observe it from inside
+    /// the column and debounce writes back into UserDefaults.
+    /// Default seeded to the pre-persistence `ideal` (270pt) so
+    /// first launches look identical to the prior build.
+    @AppStorage("designmock.sidebarWidth") private var sidebarWidthPref: Double = 270
     /// Debounces the GeometryReader-driven save so a drag-resize doesn't
     /// write to UserDefaults once per frame. Fires ~200ms after the user
     /// stops dragging.
     @State private var persistCenterWidthTask: Task<Void, Never>?
+    /// Mirror of `persistCenterWidthTask` for the sidebar width probe.
+    /// Debouncing lives per-column so a drag on one side doesn't
+    /// cancel a pending write for the other.
+    @State private var persistSidebarWidthTask: Task<Void, Never>?
 
     var body: some View {
         rootSplitView
@@ -853,7 +864,7 @@ struct DesignMockRootView: View {
             } content: {
                 if showingAutoIntake {
                     AutoIntakePane()
-                        .navigationSplitViewColumnWidth(min: 320, ideal: currentCenterIdeal, max: 760)
+                        .navigationSplitViewColumnWidth(min: 180, ideal: currentCenterIdeal, max: 760)
                 } else {
                     DesignMockThreadListPane(
                         conversations: store.conversations,
@@ -866,7 +877,16 @@ struct DesignMockRootView: View {
                         }
                     )
                     .background(centerWidthProbe)
-                    .navigationSplitViewColumnWidth(min: 320, ideal: currentCenterIdeal, max: 760)
+                    // Min drops from 320 → 240 so the user can squeeze
+                    // the center pane narrow enough to exercise the
+                    // vertical fall-through inside
+                    // `DesignMockConversationListRow` (switch point
+                    // ~260pt + 24pt of row padding ≈ 284pt of pane
+                    // width). Keeping the pane any wider than that
+                    // prevents the narrow layout from ever appearing,
+                    // which defeats the point of making the row
+                    // responsive.
+                    .navigationSplitViewColumnWidth(min: 180, ideal: currentCenterIdeal, max: 760)
                 }
             } detail: {
                 if showingAutoIntake {
@@ -897,8 +917,11 @@ struct DesignMockRootView: View {
     private var currentCenterIdeal: CGFloat {
         // Clamp defensively so a stale / hand-edited preferences value
         // can't lock the user out of the split (below-min disappears
-        // the pane, above-max is equally unusable).
-        return CGFloat(min(max(centerWidthCards, 320), 760))
+        // the pane, above-max is equally unusable). Floor matches the
+        // `navigationSplitViewColumnWidth(min:)` above so a persisted
+        // narrow width is reproduced on next launch instead of being
+        // rounded back up to 320.
+        return CGFloat(min(max(centerWidthCards, 180), 760))
     }
 
     /// Transparent width probe mounted as the content pane's background.
@@ -925,9 +948,12 @@ struct DesignMockRootView: View {
     /// burst into a single write landing after the user lets go. Values
     /// outside the slider clamp are dropped so the split view's own min/max
     /// stays authoritative — we're just recording what the user chose
-    /// *within* the allowed range.
+    /// *within* the allowed range. Clamp floor mirrors
+    /// `navigationSplitViewColumnWidth(min:)` so a narrow drag is
+    /// faithfully restored on next launch instead of being rounded
+    /// back up.
     private func persistCenterWidth(_ width: CGFloat) {
-        let clamped = min(max(Double(width), 320), 760)
+        let clamped = min(max(Double(width), 180), 760)
         // GeometryReader transiently reports 0 during teardown / mode
         // switch. Treating that as a real preference would wipe the
         // saved width the moment the user flips mode.
@@ -938,6 +964,44 @@ struct DesignMockRootView: View {
             guard !Task.isCancelled else { return }
             if abs(centerWidthCards - clamped) > 0.5 {
                 centerWidthCards = clamped
+            }
+        }
+    }
+
+    /// Ideal sidebar width, clamped to the same bounds as
+    /// `navigationSplitViewColumnWidth(min:max:)` below so a
+    /// hand-edited / stale preference can't lock the user out of
+    /// the split.
+    private var currentSidebarIdeal: CGFloat {
+        CGFloat(min(max(sidebarWidthPref, 150), 320))
+    }
+
+    /// Transparent width probe mounted as the sidebar's background.
+    /// Mirrors `centerWidthProbe` — SwiftUI's `NavigationSplitView`
+    /// has no binding for the current sidebar width, so we read it
+    /// from a `GeometryReader` parked inside the column and write
+    /// the result back after a debounce window.
+    private var sidebarWidthProbe: some View {
+        GeometryReader { proxy in
+            Color.clear
+                .onChange(of: proxy.size.width) { _, newValue in
+                    persistSidebarWidth(newValue)
+                }
+                .onAppear {
+                    persistSidebarWidth(proxy.size.width)
+                }
+        }
+    }
+
+    private func persistSidebarWidth(_ width: CGFloat) {
+        let clamped = min(max(Double(width), 150), 320)
+        guard width > 1 else { return }
+        persistSidebarWidthTask?.cancel()
+        persistSidebarWidthTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            guard !Task.isCancelled else { return }
+            if abs(sidebarWidthPref - clamped) > 0.5 {
+                sidebarWidthPref = clamped
             }
         }
     }
@@ -1023,7 +1087,20 @@ struct DesignMockRootView: View {
                 recentThreadsStore.remove(id: entry.id)
             }
         )
-        .navigationSplitViewColumnWidth(min: 240, ideal: 270, max: 320)
+        // Finder-parity minimum (~150pt). All sidebar row kinds —
+        // `sidebarRow` (icon + title + optional subtitle),
+        // `sourceRow` disclosure groups, and the History stream's
+        // `SavedFilterRow` / `RecentThreadRow` — cap at `lineLimit(1)`
+        // so they truncate cleanly when the column is squeezed below
+        // the text's natural width.
+        //
+        // `ideal` reads from `@AppStorage` via `currentSidebarIdeal`
+        // so a user-dragged width is faithfully reproduced on next
+        // launch. The `sidebarWidthProbe` background captures the
+        // live width (NavigationSplitView has no binding for it) and
+        // writes the debounced result back to UserDefaults.
+        .background(sidebarWidthProbe)
+        .navigationSplitViewColumnWidth(min: 150, ideal: currentSidebarIdeal, max: 320)
     }
 
     /// Single source of truth for the center-pane thread table. Both the
@@ -1261,90 +1338,106 @@ private struct DesignMockSidebar: View {
             systemImage: DesignMockSidebarItem.bookmarks.systemImage,
             kind: .bookmarks
         )
-        return List(selection: $selection) {
-            Section("Library") {
-                sidebarRow(allItem)
-                sidebarRow(bookmarksRow)
-                sidebarRow(archiveRow)
-                sidebarRow(DesignMockSidebarItem.autoIntake)
-            }
-
-            Section("Sources") {
-                if sources.isEmpty {
-                    Text("No sources yet")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(sources, id: \.name) { source in
-                        sourceRow(source)
-                    }
+        // Hand-built ScrollView + VStack replaces the earlier
+        // `List(selection:) + .listStyle(.sidebar)` structure. The native
+        // sidebar list forced three things we couldn't override:
+        //
+        //   1. Section headers sit at a smaller leading inset than
+        //      content rows, creating a visible step between the
+        //      "Library" label and the first row's icon.
+        //   2. `DisclosureGroup` reserves a chevron column for its
+        //      siblings too, indenting every row in the section even
+        //      when the chevron isn't rendered on them.
+        //   3. Selection paints a saturated accent-blue pill over the
+        //      full row, which washes out the coloured source dots
+        //      (green = chatgpt, blue = gemini, orange = claude).
+        //
+        // With a manual layout we can line icons up with the section
+        // header, put the disclosure chevron on the trailing edge
+        // (clean alignment for all rows), and draw a low-chrome
+        // selection pill that leaves source colours visible — the
+        // pattern the user pointed to in their Finder reference shots.
+        return ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                sectionGroup("Library") {
+                    customRow(allItem)
+                    customRow(bookmarksRow)
+                    customRow(archiveRow)
+                    customRow(DesignMockSidebarItem.autoIntake)
                 }
-            }
 
-            // HISTORY — a single chronological stream. Filter entries
-            // (from `LibraryViewModel.unifiedFilters`) and opened-thread
-            // entries (from `RecentThreadsStore`) are interleaved and
-            // ordered strictly by their most-recent-use timestamp, so
-            // "what I searched" and "what I opened" appear in the same
-            // order the user actually performed the actions. The prior
-            // split (filters grouped first, threads grouped after) was
-            // dropped per user request: "Historyはクエリとスレッドを
-            // 分けずに、シンプルに履歴を順番に表示して".
-            //
-            // Pinned filters keep their star affordance and their
-            // pin/unpin action, but no longer jump to the top — the
-            // unified order is purely time-based. Users who want a
-            // pinned filter near the top can re-run it to bump its
-            // timestamp.
-            if !historyItems.isEmpty {
-                Section("History") {
-                    ForEach(historyItems) { item in
-                        // Each row manages its own internal padding +
-                        // hover highlight — collapse the List's
-                        // default row insets to zero so rows sit flush
-                        // against each other. Without this override
-                        // macOS sidebar List adds ~4pt of top/bottom
-                        // inset per row, which combined with the
-                        // row's own padding produced the too-airy
-                        // gaps the user flagged ("行間を詰めて").
-                        Group {
-                            switch item {
-                            case .filter(let entry):
-                                SavedFilterRow(
-                                    entry: entry,
-                                    onSelect: { onSelectHistoryEntry(entry) },
-                                    onTogglePin: {
-                                        libraryViewModel?.togglePinned(entry)
-                                    },
-                                    onDelete: {
-                                        libraryViewModel?.deleteFilterEntry(entry)
-                                    }
-                                )
-                            case .thread(let entry):
-                                RecentThreadRow(entry: entry)
-                                    .contentShape(Rectangle())
-                                    .onTapGesture {
-                                        onSelectRecentThread(entry)
-                                    }
-                                    .contextMenu {
-                                        Button("Remove from History", role: .destructive) {
-                                            onRemoveRecentThread(entry)
-                                        }
-                                    }
-                            }
+                sectionGroup("Sources") {
+                    if sources.isEmpty {
+                        Text("No sources yet")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 8)
+                    } else {
+                        ForEach(sources, id: \.name) { source in
+                            sourceBlock(source)
                         }
-                        .listRowInsets(EdgeInsets(top: 0, leading: 6, bottom: 0, trailing: 6))
+                    }
+                }
+
+                // HISTORY — a single chronological stream. Filter entries
+                // (from `LibraryViewModel.unifiedFilters`) and opened-thread
+                // entries (from `RecentThreadsStore`) are interleaved and
+                // ordered strictly by their most-recent-use timestamp, so
+                // "what I searched" and "what I opened" appear in the same
+                // order the user actually performed the actions. Pinned
+                // filters keep their star affordance and their pin/unpin
+                // action, but no longer jump to the top — the unified order
+                // is purely time-based.
+                if !historyItems.isEmpty {
+                    sectionGroup("History") {
+                        ForEach(historyItems) { item in
+                            historyItemRow(item)
+                        }
                     }
                 }
             }
+            .padding(.horizontal, 6)
+            .padding(.top, 10)
+            .padding(.bottom, 14)
         }
-        .listStyle(.sidebar)
+        .scrollContentBackground(.hidden)
         .onChange(of: sources.map(\.name)) { _, _ in
             seedExpansionIfNeeded()
         }
         .onAppear {
             seedExpansionIfNeeded()
         }
+    }
+
+    /// Wraps a section under a single header, aligning the header text
+    /// with the icons of the rows below. Header uses `.horizontal, 4`
+    /// which matches the row's own `.horizontal, 4` so the "Library"
+    /// text sits directly above the first row's leading icon column.
+    @ViewBuilder
+    private func sectionGroup<Content: View>(
+        _ title: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.caption)
+                .fontWeight(.semibold)
+                .foregroundStyle(.secondary)
+                .textCase(nil)
+                .padding(.horizontal, 4)
+                .padding(.bottom, 2)
+            content()
+        }
+    }
+
+    /// Finder-style selection fill. Low-opacity neutral tint instead of
+    /// a saturated accent-blue pill so the coloured source dots stay
+    /// readable when their row is selected. Falls back to clear for
+    /// unselected rows (no resting state decoration).
+    private func selectionFill(for id: DesignMockSidebarItem.ID, isHovering: Bool = false) -> Color {
+        if selection == id { return Color.primary.opacity(0.10) }
+        if isHovering { return Color.primary.opacity(0.05) }
+        return .clear
     }
 
     /// Merged, chronologically-sorted history stream. Both filter
@@ -1383,11 +1476,79 @@ private struct DesignMockSidebar: View {
         haveSeededExpansion = true
     }
 
-    /// Renders a source row. Sources with a single (or zero) model stay as
-    /// flat rows; sources with multiple models expand into a `DisclosureGroup`
-    /// so the user can narrow to a specific model (`chatgpt → gpt-4o`).
+    /// A single sidebar row. Leading edge is always the item icon —
+    /// no reserved chevron column — so every row in every section
+    /// aligns at the same x. Disclosure state is communicated by a
+    /// trailing `chevron.right` that rotates when expanded, which
+    /// keeps the leading alignment identical whether a row is a
+    /// disclosure parent or a plain leaf.
     @ViewBuilder
-    private func sourceRow(_ source: DesignMockSource) -> some View {
+    private func customRow(
+        _ item: DesignMockSidebarItem,
+        hasDisclosure: Bool = false,
+        isExpanded: Bool = false,
+        onToggleDisclosure: (() -> Void)? = nil
+    ) -> some View {
+        HoverableRow(isSelected: selection == item.id) { isHovering in
+            let fill = selectionFill(for: item.id, isHovering: isHovering)
+            Button {
+                selection = item.id
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: item.systemImage)
+                        .foregroundStyle(item.iconStyle)
+                        .frame(width: 16, alignment: .center)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(item.title)
+                            .lineLimit(1)
+                            .foregroundStyle(.primary)
+                        if let subtitle = item.subtitle {
+                            Text(subtitle)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
+                    Spacer(minLength: 4)
+                    if hasDisclosure {
+                        // Dedicated tappable region so clicking the
+                        // chevron only toggles expansion — the rest of
+                        // the row still fires selection. Matches the
+                        // macOS convention where the row label and the
+                        // disclosure arrow are independent hit targets.
+                        Button {
+                            onToggleDisclosure?()
+                        } label: {
+                            Image(systemName: "chevron.right")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                                .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                                .frame(width: 12, height: 12)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 4)
+                .padding(.vertical, 4)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(fill)
+                )
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .focusEffectDisabled()
+        }
+    }
+
+    /// Renders a source with optional model breakdown. Multi-model
+    /// sources get a trailing disclosure chevron; the row itself still
+    /// selects the source-level filter, while the chevron expands the
+    /// per-model rows below. Model rows indent visually so they read
+    /// as children of the parent source.
+    @ViewBuilder
+    private func sourceBlock(_ source: DesignMockSource) -> some View {
         let item = DesignMockSidebarItem(
             id: "source-\(source.name)",
             title: source.name,
@@ -1396,20 +1557,21 @@ private struct DesignMockSidebar: View {
             kind: .source(source.name)
         )
         if source.models.count > 1 {
-            DisclosureGroup(
-                isExpanded: Binding(
-                    get: { expandedSources.contains(source.name) },
-                    set: { isExpanded in
-                        if isExpanded {
-                            expandedSources.insert(source.name)
-                        } else {
-                            expandedSources.remove(source.name)
-                        }
-                    }
-                )
+            let isExpanded = expandedSources.contains(source.name)
+            customRow(
+                item,
+                hasDisclosure: true,
+                isExpanded: isExpanded
             ) {
+                if expandedSources.contains(source.name) {
+                    expandedSources.remove(source.name)
+                } else {
+                    expandedSources.insert(source.name)
+                }
+            }
+            if isExpanded {
                 ForEach(source.models, id: \.name) { model in
-                    sidebarRow(
+                    customRow(
                         .init(
                             id: "model-\(source.name)-\(model.name)",
                             title: model.name,
@@ -1418,35 +1580,66 @@ private struct DesignMockSidebar: View {
                             kind: .model(source: source.name, model: model.name)
                         )
                     )
+                    .padding(.leading, 18)
                 }
-            } label: {
-                sidebarRow(item)
             }
         } else {
-            sidebarRow(item)
+            customRow(item)
         }
     }
 
-    private func sidebarRow(_ item: DesignMockSidebarItem) -> some View {
-        Label {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(item.title)
-                    .lineLimit(1)
-                if let subtitle = item.subtitle {
-                    Text(subtitle)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+    /// Wraps the existing `SavedFilterRow` / `RecentThreadRow`
+    /// components in the same horizontal inset as sibling sidebar
+    /// rows so the two row kinds share a common leading column.
+    @ViewBuilder
+    private func historyItemRow(_ item: HistoryItem) -> some View {
+        switch item {
+        case .filter(let entry):
+            SavedFilterRow(
+                entry: entry,
+                onSelect: { onSelectHistoryEntry(entry) },
+                onTogglePin: { libraryViewModel?.togglePinned(entry) },
+                onDelete: { libraryViewModel?.deleteFilterEntry(entry) }
+            )
+        case .thread(let entry):
+            RecentThreadRow(entry: entry)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    onSelectRecentThread(entry)
+                }
+                .contextMenu {
+                    Button("Remove from History", role: .destructive) {
+                        onRemoveRecentThread(entry)
+                    }
+                }
+        }
+    }
+
+}
+
+/// Per-row hover state. SwiftUI's `.onHover` on a Button label leaks
+/// into the button's own press feedback and flickers during scroll —
+/// hoisting the hover state into a dedicated container lets us apply
+/// the hover tint to the background fill without fighting the button
+/// style. Matches the transaction-based hover pattern used in
+/// `SavedFilterRow` so scrolling through the sidebar doesn't cascade
+/// animations across every visible row.
+private struct HoverableRow<Content: View>: View {
+    let isSelected: Bool
+    @ViewBuilder let content: (Bool) -> Content
+    @State private var isHovering: Bool = false
+
+    var body: some View {
+        content(isHovering)
+            .animation(nil, value: isHovering)
+            .onHover { hovering in
+                var tx = Transaction()
+                tx.disablesAnimations = true
+                withTransaction(tx) {
+                    isHovering = hovering
                 }
             }
-        } icon: {
-            Image(systemName: item.systemImage)
-                .foregroundStyle(item.iconStyle)
-                .frame(width: 17)
-        }
-        .tag(item.id)
     }
-
 }
 
 private struct DesignMockThreadListPane: View {
@@ -1634,21 +1827,52 @@ private struct DesignMockThreadListPane: View {
     }
 
     private func pinnedPromptView(for conversation: DesignMockConversation) -> some View {
+        // The expanded state is intentionally low-chrome: the card
+        // keeps the same selection pill treatment it had in the
+        // regular list (inset rounded rectangle at
+        // `Color.accentColor.opacity(0.14)`), and the prompt list
+        // just appears underneath it. An earlier draft wrapped the
+        // whole assembly in a full-width accent tint plus a leading
+        // rail to communicate "grouped unit", but that read as a
+        // heavy "this whole region is now blue" moment instead of
+        // the "card opened → prompts showed up below" affordance
+        // the user actually wanted. The only indicator that
+        // distinguishes expanded-and-selected from merely-selected
+        // is now the `chevron.up` glyph on the trailing edge of the
+        // card — same cue Finder / outline disclosures use.
         VStack(spacing: 0) {
-            Button {
+            HStack(alignment: .top, spacing: 10) {
+                DesignMockConversationListRow(conversation: conversation)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                // Chevron sits in the trailing padding so it lines up
+                // with the title row baseline. Secondary foreground
+                // keeps it quiet — a colored accent here would drag
+                // visual weight back toward the heavy treatment we
+                // just removed.
+                Image(systemName: "chevron.up")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 10)
+            }
+            .background(
+                // Same inset pill the list's selected row renders —
+                // `padding(.horizontal, 12)` below keeps the pill
+                // clear of the pane's leading edge so it doesn't
+                // bleed under the sidebar's vibrancy blur (same
+                // rationale documented on the card-list background).
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Color.accentColor.opacity(0.14))
+            )
+            .padding(.horizontal, 12)
+            .padding(.vertical, 2)
+            .contentShape(Rectangle())
+            .onTapGesture {
                 withAnimation(.easeOut(duration: 0.16)) {
                     expandedPromptConversationID = nil
                 }
-            } label: {
-                DesignMockConversationListRow(conversation: conversation)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.accentColor.opacity(0.14))
             }
-            .buttonStyle(.plain)
-
-            Divider()
+            .help("Collapse prompt list")
 
             ScrollView {
                 DesignMockExpandedPromptList(
@@ -1661,7 +1885,7 @@ private struct DesignMockThreadListPane: View {
             }
             .scrollContentBackground(.hidden)
         }
-        .background(.regularMaterial)
+        .background(Color(nsColor: .textBackgroundColor))
     }
 
     private var expandedConversation: DesignMockConversation? {
@@ -1901,7 +2125,7 @@ private struct DesignMockExpandedPromptList: View {
                 }
             }
         }
-        .padding(.leading, 22)
+        .padding(.leading, 6)
         .padding(.trailing, 2)
         .task(id: conversation.id) {
             // Re-fetch whenever the expanded card changes identity. Store
@@ -1920,11 +2144,19 @@ private struct DesignMockExpandedPromptList: View {
     @ViewBuilder
     private func promptRow(_ prompt: DesignMockPrompt) -> some View {
         let isPinned = store.isPromptBookmarked(prompt.id)
-        HStack(alignment: .firstTextBaseline, spacing: 10) {
-            Image(systemName: "text.bubble")
-                .font(.subheadline)
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            // Sequence number sits on the LEADING edge instead of
+            // the trailing edge, and the previous `text.bubble`
+            // glyph is retired — the number alone already
+            // identifies "which prompt", and the icon was just
+            // decorative chrome that stole horizontal budget at
+            // narrow widths. Right-aligned within a fixed-width
+            // gutter so single-, double- and triple-digit rows
+            // line up vertically (1 / 10 / 100).
+            Text("\(prompt.index + 1)")
+                .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
-                .frame(width: 18)
+                .frame(width: 20, alignment: .trailing)
 
             // Main click target — scroll-to-prompt. Kept as an explicit
             // Button so the row responds to keyboard focus and taps,
@@ -1939,20 +2171,21 @@ private struct DesignMockExpandedPromptList: View {
                 pendingPromptID = prompt.id
                 selectedPromptID = prompt.id
             } label: {
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Text(prompt.snippet)
-                        .font(.subheadline)
-                        .lineLimit(1)
-                        .foregroundStyle(.primary)
-
-                    Spacer(minLength: 8)
-
-                    Text("\(prompt.index + 1)")
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(Rectangle())
+                // `lineLimit(2)` instead of 1: at narrow center-pane
+                // widths (the user drags the pane down to ~180pt,
+                // per the split-view min), a single-line snippet
+                // truncates to one or two characters — effectively
+                // hiding the prompt text. Two lines give enough
+                // room for a Japanese title to survive truncation
+                // while keeping the row compact enough that a long
+                // outline still reads as a list.
+                Text(prompt.snippet)
+                    .font(.subheadline)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                    .foregroundStyle(.primary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
 
@@ -1963,7 +2196,7 @@ private struct DesignMockExpandedPromptList: View {
                 .opacity(isPinned || hoveredPromptID == prompt.id ? 1 : 0)
         }
         .padding(.vertical, 6)
-        .padding(.horizontal, 10)
+        .padding(.horizontal, 4)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             rowBackground(for: prompt),
@@ -1991,7 +2224,7 @@ private struct DesignMockExpandedPromptList: View {
             Image(systemName: isPinned ? "bookmark.fill" : "bookmark")
                 .font(.subheadline)
                 .foregroundStyle(isPinned ? Color.yellow : Color.secondary)
-                .frame(width: 18)
+                .frame(width: 14)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -2557,17 +2790,41 @@ private struct DesignMockConversationListRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(conversation.title)
-                    .font(.callout.weight(.medium))
-                    .lineLimit(1)
+            // Title + date layout switches based on available width.
+            // `ViewThatFits` picks the first candidate whose ideal
+            // size fits; the wide one carries an explicit
+            // `minWidth` so SwiftUI rejects it (and falls through to
+            // the vertical stack) once the center pane is narrow
+            // enough that the title would have to truncate
+            // aggressively to share the line with the date.
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(conversation.title)
+                        .font(.callout.weight(.medium))
+                        .lineLimit(1)
 
-                Spacer(minLength: 8)
+                    Spacer(minLength: 8)
 
-                Text(conversation.updated)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                    Text(conversation.updated)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .fixedSize()
+                }
+                .frame(minWidth: 260)
+
+                // Narrow fallback: title on top, date wraps underneath.
+                // Title gets a second line of headroom so the whole
+                // card is readable even when the pane is squeezed.
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(conversation.title)
+                        .font(.callout.weight(.medium))
+                        .lineLimit(2)
+                    Text(conversation.updated)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
             }
 
             if let snippet = conversation.snippet {
@@ -2579,13 +2836,37 @@ private struct DesignMockConversationListRow: View {
                     .lineLimit(2)
             }
 
-            HStack(spacing: 8) {
-                Label(conversation.model, systemImage: "cpu")
-                    .lineLimit(1)
-                Text("\(conversation.prompts) prompts")
-                    .monospacedDigit()
-                Text(conversation.source)
-                    .foregroundStyle(conversation.sourceColor)
+            HStack(spacing: 10) {
+                // Service chip: `cpu` glyph tinted by source color
+                // (chatgpt → green, claude → orange, gemini → blue,
+                // etc.) + the parsed model name when it exists.
+                // Dropping the separate "chatgpt" / "claude" / …
+                // text removes the redundancy — the glyph's color
+                // already carries the service identity that the
+                // text used to repeat, and the row gets a compact
+                // 1-glyph-plus-optional-model chip instead of a
+                // 3-item strip (icon + model + source). The model
+                // text is skipped outright when the parsed value
+                // is empty; no "unknown" placeholder.
+                HStack(spacing: 4) {
+                    Image(systemName: "cpu")
+                        .foregroundStyle(conversation.sourceColor)
+                    if !conversation.model.isEmpty {
+                        Text(conversation.model)
+                            .lineLimit(1)
+                    }
+                }
+
+                // Prompt count: speech-bubble glyph + number. The
+                // "prompts" suffix word was retired — the glyph
+                // already communicates "messages from the user"
+                // and the repeated word cost more horizontal
+                // budget than it earned in clarity.
+                HStack(spacing: 4) {
+                    Image(systemName: "text.bubble")
+                    Text("\(conversation.prompts)")
+                        .monospacedDigit()
+                }
             }
             .font(.caption)
             .foregroundStyle(.secondary)

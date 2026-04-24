@@ -188,24 +188,88 @@ struct MessageBubbleView: View, Equatable {
         //   in). A compact inline byline at the top carries the avatar +
         //   name; content flows out to the full pane width below it.
         if message.isUser {
-            // Leading Spacer + trailing-capped bubble = iMessage-style
-            // right-hugging layout. Short prompts sit compactly next to
-            // the avatar; long prompts wrap at `Layout.userBubbleMaxWidth`
-            // rather than stretching the full pane width, so the bubble
-            // always looks like it's anchored to the avatar instead of
-            // floating as a full-bleed banner.
-            HStack(alignment: .top, spacing: 10) {
-                Spacer(minLength: 0)
-
-                userMessageColumn
-                    .frame(maxWidth: Layout.userBubbleMaxWidth, alignment: .trailing)
-
-                avatarButton(size: Layout.avatarSize)
-                    .frame(width: Layout.avatarColumnWidth, alignment: .topTrailing)
+            // Two user-side layouts, chosen per-pane-width via
+            // `ViewThatFits`:
+            //
+            // - **Wide** (pane ≥ ~600pt): iMessage-style right-hug.
+            //   Leading Spacer, bubble capped at
+            //   `Layout.userBubbleMaxWidth`, dedicated avatar column
+            //   on the right. Short prompts sit compactly next to
+            //   the avatar; long prompts wrap at the cap rather than
+            //   stretching edge-to-edge, so the bubble reads as
+            //   anchored to the avatar instead of a full-bleed
+            //   banner.
+            //
+            // - **Narrow** (pane < ~600pt): avatar moves INLINE with
+            //   the byline above the bubble, and the bubble fills
+            //   the pane's full width. At narrow widths the trailing
+            //   avatar column costs 52pt of horizontal budget the
+            //   prompt text can't spare — the inline byline style
+            //   (same pattern the assistant side uses) gives the
+            //   bubble ~50pt more breathing room, which is enough to
+            //   keep a typical prompt line from wrapping awkwardly.
+            //
+            // The wide candidate carries an explicit `minWidth` so
+            // `ViewThatFits` has an honest rejection criterion —
+            // otherwise the HStack's ideal size (tiny Spacer + short
+            // bubble + fixed avatar) fits everywhere and the narrow
+            // fallback is unreachable.
+            ViewThatFits(in: .horizontal) {
+                wideUserLayout
+                    .frame(minWidth: 600)
+                narrowUserLayout
             }
         } else {
             assistantMessageColumn
                 .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    /// Wide layout for user messages — classic trailing-avatar speech
+    /// bubble. See `body` for the size-class rationale.
+    private var wideUserLayout: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Spacer(minLength: 0)
+
+            userMessageColumn
+                .frame(maxWidth: Layout.userBubbleMaxWidth, alignment: .trailing)
+
+            avatarButton(size: Layout.avatarSize)
+                .frame(width: Layout.avatarColumnWidth, alignment: .topTrailing)
+        }
+    }
+
+    /// Narrow layout for user messages — inline byline + full-width
+    /// bubble. Avatar sits in the byline row (same treatment as the
+    /// assistant side) rather than stealing a dedicated trailing
+    /// column, reclaiming ~50pt of horizontal budget for the prompt
+    /// text itself.
+    private var narrowUserLayout: some View {
+        VStack(alignment: .trailing, spacing: 4) {
+            HStack(alignment: .center, spacing: 8) {
+                Spacer(minLength: 0)
+
+                if let bridge = promptBookmarkBridge {
+                    pinToggle(bridge: bridge)
+                }
+                Text(identityPresentation.displayName)
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                    .foregroundStyle(identityPresentation.accentColor)
+
+                avatarButton(size: Layout.avatarSize)
+            }
+
+            attachmentImagesView(alignment: .trailing)
+
+            Text(highlightedVerbatim(message.content))
+                .font(.system(size: Layout.bodyFontSize))
+                .textSelection(.enabled)
+                .multilineTextAlignment(.leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(12)
+                .background(bubbleBackground)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
         }
     }
 
