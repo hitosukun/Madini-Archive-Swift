@@ -105,18 +105,18 @@ struct ShellCommandActions {
     /// model's supporting state. Bound to ⌘R (matches the universal
     /// "refresh" shortcut across Safari / Mail / Finder).
     let reloadLibrary: () -> Void
-    /// Move the shell's conversation selection forward by one row in the
-    /// currently-loaded list. Nil when the list is empty (SwiftUI greys
-    /// out the menu item). Wired through the shell rather than through
-    /// `LibraryViewModel.selectNext` because the middle pane reads the
-    /// shell's `selectedConversationIDs`, not the VM's
-    /// `selectedConversationId` — the two were never bridged, so the
-    /// previous "route through the VM" approach silently moved an
-    /// invisible cursor.
-    let selectNextConversation: (() -> Void)?
-    /// Symmetric predecessor of `selectNextConversation`. Same rationale
-    /// applies — the shell owns the visible selection.
-    let selectPreviousConversation: (() -> Void)?
+    /// Jump the shell's conversation selection to the first visible row
+    /// in the currently-loaded list. Bound to ⌘↑ (mirrors the
+    /// macOS-wide "top of document" gesture). Single-step up/down
+    /// navigation lives in the List/Table widget itself — plain ↑/↓
+    /// with keyboard focus on the middle pane steps one row at a time,
+    /// so we don't also bind a menu shortcut for it (doing so would
+    /// capture the arrows globally and break text-field navigation).
+    /// Nil when the list is empty.
+    let selectFirstConversation: (() -> Void)?
+    /// ⌘↓ counterpart of `selectFirstConversation` — jump to the last
+    /// visible row. Same rationale as above.
+    let selectLastConversation: (() -> Void)?
     /// ⌘→ "drill in" one level along the Thread list → Thread → Prompt
     /// hierarchy. In `.table`, switches to `.default`. In `.default` with
     /// no card expanded, opens the selected card (prompts list appears
@@ -216,32 +216,25 @@ struct AppCommands: Commands {
         // was getting misused as a catch-all. Mirrors how Mail keeps
         // "Message" as its own top-level menu.
         CommandMenu("Library") {
-            // Route through the shell (not through LibraryViewModel /
-            // BrowseViewModel) because only the shell owns the
-            // user-visible selection state. The legacy BrowseViewModel
-            // path stays as a fallback for the iOS-ish `MacOSRootView`
-            // code path, but on the shipping macOS shell the
-            // `shell?.selectNextConversation` branch is the one that
-            // actually moves the middle pane.
-            Button("Next Conversation") {
-                if let move = shell?.selectNextConversation {
-                    move()
-                } else {
-                    browseViewModel?.selectNext()
-                }
-            }
-            .keyboardShortcut(.downArrow, modifiers: .command)
-            .disabled(shell?.selectNextConversation == nil && browseViewModel == nil)
-
-            Button("Previous Conversation") {
-                if let move = shell?.selectPreviousConversation {
-                    move()
-                } else {
-                    browseViewModel?.selectPrevious()
-                }
+            // ⌘↑ / ⌘↓ jump to the first / last visible row. Single-
+            // step up/down is handled by the focused List/Table
+            // itself — plain ↑/↓ with the middle pane focused steps
+            // one row at a time, and binding that here would capture
+            // the arrow keys globally (breaking text-field cursor
+            // movement in the search box). Matches the macOS-wide
+            // "top of document / end of document" convention for ⌘↑
+            // and ⌘↓.
+            Button("First Conversation") {
+                shell?.selectFirstConversation?()
             }
             .keyboardShortcut(.upArrow, modifiers: .command)
-            .disabled(shell?.selectPreviousConversation == nil && browseViewModel == nil)
+            .disabled(shell?.selectFirstConversation == nil)
+
+            Button("Last Conversation") {
+                shell?.selectLastConversation?()
+            }
+            .keyboardShortcut(.downArrow, modifiers: .command)
+            .disabled(shell?.selectLastConversation == nil)
 
             Divider()
 

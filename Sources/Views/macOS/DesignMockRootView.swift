@@ -942,46 +942,40 @@ struct DesignMockRootView: View {
         let currentLayout = selectedLayoutMode
         let visibleConversations = store.conversations
 
-        // Next / Previous Conversation closures. Nil when the list is
-        // empty — SwiftUI disables the menu item in that case. We
-        // snapshot the current list + current selection *now* so the
-        // closure doesn't re-read a potentially-stale `self` at
-        // menu-click time (SwiftUI View values are snapshots; by the
-        // time a menu fires, our struct instance may be recycled).
-        // The closure itself writes through `selectionBinding` which
-        // is the live Binding, so state updates are propagated.
-        let moveByOne: (Int) -> (() -> Void)? = { delta in
+        // Jump-to-first / jump-to-last closures bound to ⌘↑ / ⌘↓.
+        // Single-step navigation is delegated to the focused List/
+        // Table widget (plain ↑/↓ when the middle pane is key) —
+        // reserving the menu binding for "jump to edge" matches the
+        // macOS-wide gesture and frees plain arrows for cursor
+        // movement inside text fields.
+        //
+        // We snapshot `visibleConversations` and `currentExpanded`
+        // now so the closure isn't re-reading a potentially-stale
+        // `self` when the menu fires.
+        let jumpToEdge: (Bool) -> (() -> Void)? = { toFirst in
             guard !visibleConversations.isEmpty else { return nil }
             return {
                 let ids = visibleConversations.map(\.id)
-                let currentIndex = ids.firstIndex(where: {
-                    currentSelection.contains($0)
-                })
-                let nextIndex: Int
-                if let currentIndex {
-                    nextIndex = min(max(currentIndex + delta, 0), ids.count - 1)
-                    guard nextIndex != currentIndex else { return }
-                } else {
-                    // Nothing selected yet — ⌘↓ picks the top of the
-                    // list, ⌘↑ picks the bottom. Matches Mail's
-                    // behaviour when the message list is unfocused.
-                    nextIndex = delta >= 0 ? 0 : ids.count - 1
+                guard let targetID = toFirst ? ids.first : ids.last else {
+                    return
                 }
-                let nextID = ids[nextIndex]
-                selectionBinding.wrappedValue = [nextID]
-                // If a card was expanded before the move, slide the
-                // expanded id to the newly-selected thread so state 3
-                // (prompt list visible in center pane) stays coherent
-                // with the selection. Otherwise the user would see
-                // prompts from the old thread while the reader on the
-                // right already switched to the new one.
+                // No-op when we're already there — avoids poking the
+                // selection binding and triggering downstream
+                // `.onChange` observers for nothing.
+                if currentSelection == [targetID] { return }
+                selectionBinding.wrappedValue = [targetID]
+                // If a card was expanded before the jump, keep state
+                // 3 coherent by sliding the expanded id to the edge
+                // we just landed on. Otherwise the center pane would
+                // still show prompts from whatever thread happened
+                // to be expanded before.
                 if currentExpanded != nil {
-                    expandedBinding.wrappedValue = nextID
+                    expandedBinding.wrappedValue = targetID
                 }
             }
         }
-        let nextClosure = moveByOne(1)
-        let previousClosure = moveByOne(-1)
+        let firstClosure = jumpToEdge(true)
+        let lastClosure = jumpToEdge(false)
 
         // Drill-in (⌘→) / drill-out (⌘←) along the Thread list →
         // Thread → Prompt hierarchy. Three canonical states:
@@ -1078,8 +1072,8 @@ struct DesignMockRootView: View {
                     Task { await libraryVM.reloadSupportingState() }
                 }
             },
-            selectNextConversation: nextClosure,
-            selectPreviousConversation: previousClosure,
+            selectFirstConversation: firstClosure,
+            selectLastConversation: lastClosure,
             drillInSelection: drillInClosure,
             drillOutSelection: drillOutClosure,
             openDropFolder: {
