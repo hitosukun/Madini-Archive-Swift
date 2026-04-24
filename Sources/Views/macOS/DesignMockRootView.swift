@@ -942,11 +942,7 @@ struct DesignMockRootView: View {
             NavigationSplitView {
                 sidebar
             } detail: {
-                if showingAutoIntake {
-                    AutoIntakePane()
-                } else {
-                    centerTable
-                }
+                centerTable
             }
         case .default:
             // Center pane is just the thread list now — no header strip,
@@ -967,63 +963,50 @@ struct DesignMockRootView: View {
             NavigationSplitView {
                 sidebar
             } content: {
-                if showingAutoIntake {
-                    AutoIntakePane()
-                        .navigationSplitViewColumnWidth(min: 180, ideal: currentCenterIdeal, max: 760)
-                } else {
-                    DesignMockThreadListPane(
-                        conversations: store.conversations,
-                        selection: $selectedConversationIDs,
-                        pendingPromptID: $pendingPromptID,
-                        expandedPromptConversationID: $expandedPromptConversationID,
-                        isLoadingMore: store.isLoadingMore,
-                        onReachEnd: {
-                            store.loadMoreIfNeeded(services: services)
-                        }
-                    )
-                    .background(centerWidthProbe)
-                    // Min drops from 320 → 240 so the user can squeeze
-                    // the center pane narrow enough to exercise the
-                    // vertical fall-through inside
-                    // `DesignMockConversationListRow` (switch point
-                    // ~260pt + 24pt of row padding ≈ 284pt of pane
-                    // width). Keeping the pane any wider than that
-                    // prevents the narrow layout from ever appearing,
-                    // which defeats the point of making the row
-                    // responsive.
-                    .navigationSplitViewColumnWidth(min: 180, ideal: currentCenterIdeal, max: 760)
-                }
+                DesignMockThreadListPane(
+                    conversations: store.conversations,
+                    selection: $selectedConversationIDs,
+                    pendingPromptID: $pendingPromptID,
+                    expandedPromptConversationID: $expandedPromptConversationID,
+                    isLoadingMore: store.isLoadingMore,
+                    onReachEnd: {
+                        store.loadMoreIfNeeded(services: services)
+                    }
+                )
+                .background(centerWidthProbe)
+                // Min drops from 320 → 240 so the user can squeeze
+                // the center pane narrow enough to exercise the
+                // vertical fall-through inside
+                // `DesignMockConversationListRow` (switch point
+                // ~260pt + 24pt of row padding ≈ 284pt of pane
+                // width). Keeping the pane any wider than that
+                // prevents the narrow layout from ever appearing,
+                // which defeats the point of making the row
+                // responsive.
+                .navigationSplitViewColumnWidth(min: 180, ideal: currentCenterIdeal, max: 760)
             } detail: {
-                if showingAutoIntake {
-                    AutoIntakeDetailPlaceholder()
-                } else {
-                    // Unified with viewer/focus mode: the toolbar search
-                    // field is an in-thread finder in default mode too.
-                    // User request: "デフォルトビューのときはフォーカス
-                    // ビューと同様にスレッド検索で統一して". Previously
-                    // default routed `searchText` into `composedQuery`
-                    // as a library-level keyword filter on the card
-                    // list; now both modes share the same reader-find
-                    // behavior, and library-scoped filtering happens
-                    // via the sidebar (Sources / Bookmarks / History)
-                    // and DSL directives (`source:` etc., which still
-                    // flow through `parsed.sortToken` + scope logic in
-                    // `composedQuery`). `.table` mode still uses the
-                    // field as a library keyword filter since a table
-                    // without the reader pane has no thread to search.
-                    readerPane(inThreadSearch: $searchText)
-                }
+                // Unified with viewer/focus mode: the toolbar search
+                // field is an in-thread finder in default mode too.
+                // User request: "デフォルトビューのときはフォーカス
+                // ビューと同様にスレッド検索で統一して". Previously
+                // default routed `searchText` into `composedQuery`
+                // as a library-level keyword filter on the card
+                // list; now both modes share the same reader-find
+                // behavior, and library-scoped filtering happens
+                // via the sidebar (Sources / Bookmarks / History)
+                // and DSL directives (`source:` etc., which still
+                // flow through `parsed.sortToken` + scope logic in
+                // `composedQuery`). `.table` mode still uses the
+                // field as a library keyword filter since a table
+                // without the reader pane has no thread to search.
+                readerPane(inThreadSearch: $searchText)
             }
             .id("default")
         case .viewer:
             NavigationSplitView {
                 sidebar
             } detail: {
-                if showingAutoIntake {
-                    AutoIntakePane()
-                } else {
-                    readerPane(inThreadSearch: $searchText)
-                }
+                readerPane(inThreadSearch: $searchText)
             }
         }
     }
@@ -1388,7 +1371,7 @@ struct DesignMockRootView: View {
         // still scopes the library without any typing.
         let kind = DesignMockSidebarItem.kind(for: selectedSidebarItemID, sources: store.sources)
         switch kind {
-        case .all, .archiveDB, .autoIntake, .unknown:
+        case .all, .archiveDB, .unknown:
             break
         case .source(let source):
             query.source = source
@@ -1454,12 +1437,6 @@ struct DesignMockRootView: View {
         case .default, .viewer:
             return "このスレッド内を検索"
         }
-    }
-
-    private var showingAutoIntake: Bool {
-        let kind = DesignMockSidebarItem.kind(for: selectedSidebarItemID, sources: store.sources)
-        if case .autoIntake = kind { return true }
-        return false
     }
 
     /// True when the sidebar points at archive.db. The consolidated
@@ -1585,7 +1562,6 @@ private struct DesignMockSidebar: View {
                     customRow(allItem)
                     customRow(bookmarksRow)
                     customRow(archiveRow)
-                    customRow(DesignMockSidebarItem.autoIntake)
                 }
 
                 sectionGroup("Sources") {
@@ -3385,7 +3361,6 @@ private struct DesignMockSidebarItem: Identifiable {
     enum Kind: Equatable {
         case all
         case archiveDB
-        case autoIntake
         case bookmarks
         case source(String)
         case model(source: String, model: String)
@@ -3407,14 +3382,6 @@ private struct DesignMockSidebarItem: Identifiable {
         kind: .all
     )
 
-    static let autoIntake = DesignMockSidebarItem(
-        id: "auto-intake",
-        title: "Auto Intake",
-        subtitle: "Drop exports to ingest",
-        systemImage: "tray.and.arrow.down.fill",
-        kind: .autoIntake
-    )
-
     static let bookmarks = DesignMockSidebarItem(
         id: "bookmarks",
         title: "Bookmarks",
@@ -3423,10 +3390,16 @@ private struct DesignMockSidebarItem: Identifiable {
         kind: .bookmarks
     )
 
+    /// Consolidated archive entry point. Clicking it surfaces the
+    /// Drop-folder configuration, the vault snapshot + intake timeline,
+    /// and the per-snapshot file list in a single three-pane layout.
+    /// The title stays at "archive.db" (not "Archive") because the
+    /// user's mental model is still "the database file on disk" — the
+    /// consolidation merges surfaces without renaming the concept.
     static let archiveDB = DesignMockSidebarItem(
         id: "archive-db",
         title: "archive.db",
-        subtitle: "Local SQLite archive",
+        subtitle: "Vault + auto intake",
         systemImage: "externaldrive",
         kind: .archiveDB
     )
@@ -3438,7 +3411,6 @@ private struct DesignMockSidebarItem: Identifiable {
     static func kind(for id: String?, sources: [DesignMockSource]) -> Kind {
         guard let id else { return .unknown }
         if id == allThreads.id { return .all }
-        if id == autoIntake.id { return .autoIntake }
         if id == bookmarks.id { return .bookmarks }
         if id == archiveDB.id { return .archiveDB }
         if id.hasPrefix("tag-") {
