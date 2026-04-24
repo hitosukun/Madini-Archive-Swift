@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 #if os(macOS)
 import AppKit
 #elseif canImport(UIKit)
@@ -1429,36 +1430,46 @@ enum LLMPromptClipboard {
 
 /// Menu contents shared by every toolbar "share" button in the app
 /// (reader detail, Viewer-Mode floating chip, Design Mock top
-/// toolbar). Centralising it here guarantees the three share
-/// affordances offer an identical set of export formats and identical
-/// labels — the previous per-site implementations had already drifted
-/// in subtle ways (different help text, different preview icons).
+/// toolbar). Centralising it here guarantees the three export
+/// affordances offer an identical set of formats and identical labels.
 ///
-/// Each caller owns its own `@State` for the two temp-file URLs and
-/// writes them in a `.task(id:)` via
-/// `prepareConversationShareURLs(for:)`, then hands them and the
-/// `ConversationDetail` to this builder.
+/// ## Why export (save panel) instead of share (sharing picker)
 ///
-/// ## Why `Button` on macOS instead of `ShareLink`
+/// We initially wrapped each format in a `ShareLink`, which routes
+/// the file to `NSSharingServicePicker`. That picker IS a menu — it
+/// lists AirDrop / Mail / Messages / Notes / Save to Files / third-
+/// party share extensions as popover rows — so presenting it from
+/// inside our own format menu gave a two-level nested-menu UX:
 ///
-/// `ShareLink` inside a `Menu` renders as a **hierarchical submenu**
-/// on macOS — clicking "Share as Markdown" expands a nested menu of
-/// share targets (AirDrop / Mail / Messages / Notes / …) at the same
-/// anchor as the parent menu. To the user this reads as "I picked a
-/// format and the menu reopened showing unrelated content" — a
-/// confusing UX (reported user-facing bug: `共有ボタンを押して、
-/// プルダウンから選択したら、また共有ボタンがひらいて元の内容が出た`).
+///     [ share button ▾ ]
+///         └ Markdown       ← user picks this
+///             └ AirDrop   ← another menu pops open
+///                Mail
+///                Messages
+///                ...
 ///
-/// Using a plain `Button` that manually presents
-/// `NSSharingServicePicker` gives the expected "click format → a
-/// sharing popover appears" flow: the format menu closes, then the
-/// sharing popover opens as a separate surface. The popover is the
-/// same native control `ShareLink` would have opened if it were a
-/// standalone toolbar button rather than a menu child.
+/// Two menus in a row, each asking the user to pick something, reads
+/// as "the share button just reopened with random content" — confusing
+/// even though it's the native flow. (User report: `共有ボタンを押して、
+/// プルダウンから選択したら、また共有ボタンがひらいて元の内容が出た`.)
 ///
-/// On iOS / iPadOS the nested-menu issue doesn't apply (`ShareLink`
-/// presents a full-screen activity sheet, not a submenu), so we keep
-/// `ShareLink` there.
+/// Drop the share picker entirely on macOS and use `NSSavePanel`:
+///
+///     [ share button ▾ ]
+///         └ Markdown として書き出し…
+///             → NSSavePanel sheet appears, user picks destination
+///
+/// One menu, one save sheet. AirDrop/Mail/etc. are still reachable —
+/// the user just drags the saved file from Finder into whatever app
+/// they want, or uses Finder's own share menu. That's the same flow
+/// users are already used to for any other "Export…" action in macOS.
+///
+/// On iOS / iPadOS we keep `ShareLink` — the iOS activity sheet is a
+/// full-screen modal, not a submenu, so the nesting issue doesn't
+/// apply, and `NSSavePanel` doesn't exist.
+///
+/// "LLM プロンプトとしてコピー" skips the file round-trip and writes
+/// the plain-text form straight to the pasteboard.
 @ViewBuilder
 func conversationShareMenuItems(
     detail: ConversationDetail?,
@@ -1466,20 +1477,53 @@ func conversationShareMenuItems(
     plainTextURL: URL?
 ) -> some View {
     if let detail {
-        ConversationShareMenuRow(
-            label: "Markdown (.md) として共有…",
-            inProgressLabel: "Markdown を書き出し中…",
-            systemImage: "doc.text",
-            url: markdownURL,
-            previewTitle: detail.summary.title ?? "Conversation"
-        )
-        ConversationShareMenuRow(
-            label: "プレーンテキスト (.txt) として共有… — LLM 向け",
-            inProgressLabel: "プレーンテキストを書き出し中…",
-            systemImage: "text.alignleft",
-            url: plainTextURL,
-            previewTitle: detail.summary.title ?? "Conversation"
-        )
+        #if os(macOS)
+        Button {
+            ConversationExportSavePanel.present(
+                text: MarkdownExporter.export(detail),
+                suggestedFilename: exportFilename(for: detail, extension: "md")
+            )
+        } label: {
+            Label("Markdown (.md) として書き出し…",
+                  systemImage: "doc.text")
+        }
+        Button {
+            ConversationExportSavePanel.present(
+                text: PlainTextExporter.export(detail),
+                suggestedFilename: exportFilename(for: detail, extension: "txt")
+            )
+        } label: {
+            Label("プレーンテキスト (.txt) として書き出し… — LLM 向け",
+                  systemImage: "text.alignleft")
+        }
+        #else
+        // iOS fallback: the pre-written temp URLs (if any) feed a
+        // `ShareLink` activity sheet. Keeps the macOS save-panel
+        // model from leaking into a platform that doesn't have one.
+        if let markdownURL {
+            ShareLink(
+                item: markdownURL,
+                preview: SharePreview(
+                    detail.summary.title ?? "Conversation",
+                    image: Image(systemName: "doc.text")
+                )
+            ) {
+                Label("Markdown (.md) として書き出し…", systemImage: "doc.text")
+            }
+        }
+        if let plainTextURL {
+            ShareLink(
+                item: plainTextURL,
+                preview: SharePreview(
+                    detail.summary.title ?? "Conversation",
+                    image: Image(systemName: "text.alignleft")
+                )
+            ) {
+                Label("プレーンテキスト (.txt) として書き出し… — LLM 向け",
+                      systemImage: "text.alignleft")
+            }
+        }
+        #endif
         Divider()
         Button {
             LLMPromptClipboard.copy(detail)
@@ -1497,88 +1541,83 @@ func conversationShareMenuItems(
     }
 }
 
-/// One row of the conversation share menu. macOS and iOS take
-/// different paths: macOS uses a plain `Button` that hand-drives
-/// `NSSharingServicePicker` (to avoid `ShareLink`'s nested-submenu
-/// behavior inside a `Menu`); iOS uses `ShareLink` directly (its
-/// activity sheet isn't a menu so there's no nesting issue). The
-/// "writing in progress" placeholder state is shared across both.
-private struct ConversationShareMenuRow: View {
-    let label: String
-    let inProgressLabel: String
-    let systemImage: String
-    let url: URL?
-    let previewTitle: String
-
-    var body: some View {
-        #if os(macOS)
-        if let url {
-            Button {
-                ConversationSharePresenter.present(url: url)
-            } label: {
-                Label(label, systemImage: systemImage)
-            }
-        } else {
-            Button {} label: {
-                Label(inProgressLabel, systemImage: systemImage)
-            }
-            .disabled(true)
-        }
-        #else
-        if let url {
-            ShareLink(
-                item: url,
-                preview: SharePreview(
-                    previewTitle,
-                    image: Image(systemName: systemImage)
-                )
-            ) {
-                Label(label, systemImage: systemImage)
-            }
-        } else {
-            Button {} label: {
-                Label(inProgressLabel, systemImage: systemImage)
-            }
-            .disabled(true)
-        }
-        #endif
-    }
+/// Suggested filename for the NSSavePanel, built from the
+/// conversation title (sanitised against path separators). Falls back
+/// to `conversation.<ext>` when the title is missing or resolves to
+/// an empty string after stripping illegal characters.
+private func exportFilename(
+    for detail: ConversationDetail,
+    extension ext: String
+) -> String {
+    let illegal = CharacterSet(charactersIn: "/:\\")
+    let cleaned = (detail.summary.title ?? "conversation")
+        .components(separatedBy: illegal)
+        .joined(separator: "_")
+    let base = cleaned.isEmpty ? "conversation" : cleaned
+    return "\(base).\(ext)"
 }
 
 #if os(macOS)
-/// macOS sharing-popover helper. Extracted so the menu-row code stays
-/// a declarative one-liner and the AppKit-specific key-window /
-/// content-view lookup is in one place.
+/// Present a standard macOS `NSSavePanel` and write the given text to
+/// the user-picked destination as UTF-8. Attached as a sheet to the
+/// current key window when one is available; falls through to a modal
+/// panel otherwise.
 ///
-/// We anchor the popover at `.zero` of the content view because
-/// SwiftUI's `Menu` doesn't expose the originating button's screen
-/// rect to its children. That's the same fallback the Apple sample
-/// code for `NSSharingServicePicker` uses for toolbar-initiated
-/// shares; the popover lands near the top-leading edge of the window
-/// rather than on the share button itself, which is a small UX cost
-/// but keeps the code simple and deterministic.
-enum ConversationSharePresenter {
+/// Uses `UTType(filenameExtension:)` to constrain the picker to the
+/// expected file type so the user can't accidentally lose the `.md` /
+/// `.txt` suffix by typing a different one — Finder will still show
+/// the file with its real extension regardless of `isExtensionHidden`.
+///
+/// Write failures currently log to stderr. Surfacing them in an
+/// `NSAlert` would be a small upgrade, but the common failure modes
+/// (disk full, permission denied in a user-picked directory) are
+/// already reported by the system — the save panel's own error
+/// handling catches most of them before we get here.
+enum ConversationExportSavePanel {
     @MainActor
-    static func present(url: URL) {
-        let picker = NSSharingServicePicker(items: [url])
-        guard let window = NSApp.keyWindow ?? NSApp.mainWindow,
-              let contentView = window.contentView else {
-            return
+    static func present(text: String, suggestedFilename: String) {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = suggestedFilename
+        panel.canCreateDirectories = true
+        panel.isExtensionHidden = false
+        if let ext = suggestedFilename.split(separator: ".").last,
+           let type = UTType(filenameExtension: String(ext)) {
+            panel.allowedContentTypes = [type]
         }
-        picker.show(relativeTo: .zero, of: contentView, preferredEdge: .minY)
+
+        let complete: (NSApplication.ModalResponse) -> Void = { response in
+            guard response == .OK, let destination = panel.url else { return }
+            do {
+                try text.write(to: destination, atomically: true, encoding: .utf8)
+            } catch {
+                NSLog("Madini: conversation export failed — %@", error.localizedDescription)
+            }
+        }
+
+        if let window = NSApp.keyWindow ?? NSApp.mainWindow {
+            panel.beginSheetModal(for: window, completionHandler: complete)
+        } else {
+            complete(panel.runModal())
+        }
     }
 }
 #endif
 
 /// Kick off markdown and plain-text exports in parallel for the given
-/// conversation and return both URLs. Used by every site that hosts
-/// the share menu — each one calls this inside a `.task(id:)` keyed
-/// on the conversation id so the exports re-run whenever the
-/// selection changes.
+/// conversation and return both URLs. Only meaningful on iOS, where
+/// `ShareLink` needs pre-written file URLs up front; on macOS we
+/// short-circuit and return nils because the save-panel path
+/// generates its content at click time from the live
+/// `ConversationDetail`, so keeping stale temp files around would
+/// just be wasted disk I/O every time the user changes selection.
 func prepareConversationShareURLs(
     for detail: ConversationDetail
 ) async -> (markdown: URL?, plainText: URL?) {
+    #if os(macOS)
+    return (nil, nil)
+    #else
     async let markdown = MarkdownExporter.writeTempShareFile(for: detail)
     async let plainText = PlainTextExporter.writeTempShareFile(for: detail)
     return await (markdown, plainText)
+    #endif
 }
