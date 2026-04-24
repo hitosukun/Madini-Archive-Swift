@@ -620,6 +620,14 @@ struct DesignMockRootView: View {
     /// modes) so the dropdown shows "what I searched for while
     /// reading" instead of "filters I applied to the library".
     @StateObject private var recentInThreadQueriesStore = RecentInThreadQueriesStore()
+    /// Backs the consolidated archive.db surface (middle pane = Drop-
+    /// folder header + intake timeline; right pane = file list). Lazily
+    /// materialized on first `.task` so mock-mode launches don't build
+    /// one before the user picks the archive row — and keeping it on
+    /// the shell instead of scoped to the panes means it survives
+    /// layout-mode switches without losing the current snapshot / file
+    /// selection.
+    @State private var archiveInspectorVM: ArchiveInspectorViewModel?
     /// Pending debounced `recordRecentSearch` call. Cancel-and-reschedule
     /// on every `composedQuery` change so typing "swift" doesn't write +
     /// re-read the saved-filters table five times in a row — the final
@@ -760,6 +768,12 @@ struct DesignMockRootView: View {
                     bookmarkRepository: services.bookmarks,
                     viewService: services.views,
                     tagRepository: services.tags
+                )
+            }
+            if archiveInspectorVM == nil {
+                archiveInspectorVM = ArchiveInspectorViewModel(
+                    vault: services.rawExportVault,
+                    intakeLog: services.intakeActivityLog
                 )
             }
             // Populate `unifiedFilters` up-front so the sidebar HISTORY
@@ -906,6 +920,23 @@ struct DesignMockRootView: View {
 
     @ViewBuilder
     private var rootSplitView: some View {
+        // archive.db short-circuits the layout switch. The Drop-folder
+        // header + intake timeline + file list trio has no reader pane
+        // to flip between, and threading an "archive mode" into each of
+        // the three reader layouts would duplicate the same 3-column
+        // arrangement three times. The VM nil-guard handles the first
+        // frame before `.task` materializes it — fall-through during
+        // that single frame is invisible because the user can't have
+        // clicked archive.db and landed here before the task fires.
+        if showingArchiveInspector, let archiveVM = archiveInspectorVM {
+            archiveInspectorSplit(vm: archiveVM)
+        } else {
+            readerLayoutSplit
+        }
+    }
+
+    @ViewBuilder
+    private var readerLayoutSplit: some View {
         switch selectedLayoutMode {
         case .table:
             NavigationSplitView {
@@ -1429,6 +1460,35 @@ struct DesignMockRootView: View {
         let kind = DesignMockSidebarItem.kind(for: selectedSidebarItemID, sources: store.sources)
         if case .autoIntake = kind { return true }
         return false
+    }
+
+    /// True when the sidebar points at archive.db. The consolidated
+    /// surface (Drop-folder header + intake timeline + file list)
+    /// takes over the whole split — we don't try to preserve the
+    /// user's selected outer layout mode because the three pane roles
+    /// are archive-specific and wouldn't map onto the `.table` /
+    /// `.default` / `.viewer` trio's reader-centric structure.
+    private var showingArchiveInspector: Bool {
+        let kind = DesignMockSidebarItem.kind(for: selectedSidebarItemID, sources: store.sources)
+        if case .archiveDB = kind { return true }
+        return false
+    }
+
+    /// Three-pane archive.db split. Renders identically regardless of
+    /// `selectedLayoutMode` — the outer layout picker stays on the
+    /// toolbar so the user can switch back by picking a thread row
+    /// elsewhere in the sidebar, but while archive.db is selected we
+    /// show the consolidated panes rather than the reader-family ones.
+    @ViewBuilder
+    private func archiveInspectorSplit(vm: ArchiveInspectorViewModel) -> some View {
+        NavigationSplitView {
+            sidebar
+        } content: {
+            ArchiveInspectorPane(viewModel: vm)
+                .navigationSplitViewColumnWidth(min: 280, ideal: 360, max: 620)
+        } detail: {
+            ArchiveInspectorFileListPane(viewModel: vm)
+        }
     }
 
 }
