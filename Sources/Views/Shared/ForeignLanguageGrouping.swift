@@ -86,6 +86,12 @@ enum ForeignLanguageGrouping {
             return (headers + rows.flatMap { $0 }).joined(separator: " ")
         case .code, .math, .horizontalRule:
             return nil
+        case .image:
+            // Image blocks don't contribute prose to language detection.
+            // The alt text is a short caption, often just "image" or
+            // a filename, which would skew per-message language stats
+            // if we mixed it in with actual body text.
+            return nil
         }
     }
 

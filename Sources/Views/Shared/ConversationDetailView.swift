@@ -44,6 +44,15 @@ struct ConversationDetailView: View {
     /// on others). Defaults to nil so call sites that don't use the
     /// in-thread finder see no behavioral change.
     private let searchHighlight: SearchHighlightSpec?
+    /// Optional. When present, the view pulls the raw transcript for
+    /// this conversation after the DB detail lands and publishes an
+    /// `MessageAssetContext` down the view tree so bubbles can render
+    /// user-uploaded images. `nil` is the honest state when the host
+    /// isn't running against a real vault (mock / preview) — bubbles
+    /// fall back to text-only rendering. Resolved via
+    /// `@EnvironmentObject` rather than a constructor arg so the
+    /// four existing call sites stay untouched.
+    @EnvironmentObject private var services: AppServices
 
     init(
         conversationId: String,
@@ -77,6 +86,16 @@ struct ConversationDetailView: View {
         contentView
             .task(id: viewModel.conversationId) {
                 await viewModel.load()
+                // Kick off the raw-transcript attachment pull in the
+                // SAME task so it cancels cleanly on conversation
+                // switch. Runs after `fetchDetail` so the alignment
+                // routine has DB messages to pair against. No-op
+                // when the services are mock-backed (loader is nil).
+                await viewModel.attachRawServices(
+                    loader: services.rawConversationLoader,
+                    vault: services.rawExportVault,
+                    resolver: services.rawAssetResolver
+                )
                 onDetailChanged?(viewModel.detail)
                 if let detail = viewModel.detail {
                     if Self.shouldPreferPlainDisplay(for: detail) {
@@ -108,6 +127,12 @@ struct ConversationDetailView: View {
                 showsSystemChrome: showsSystemChrome
             )
             .environment(\.searchHighlight, searchHighlight)
+            // Publish any resolved per-message attachments so
+            // `MessageBubbleView` can paint user-uploaded images above
+            // each message's text. `nil` while the second-stage raw
+            // transcript load is still running, which keeps the
+            // first-paint text-only fast path responsive.
+            .environment(\.messageAssetContext, viewModel.assetContext)
         } else if let errorText = viewModel.errorText {
             ContentUnavailableView(
                 "Couldn’t Load Conversation",

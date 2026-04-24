@@ -159,6 +159,15 @@ struct MessageBubbleView: View, Equatable {
     /// (legacy callers / previews that don't wire a bridge), the
     /// affordance is omitted entirely.
     @Environment(\.promptBookmarkBridge) private var promptBookmarkBridge
+    /// Per-conversation asset handles + per-message attachment index
+    /// published by `ConversationDetailView` after the raw transcript
+    /// load finishes. When present, any images attached to this
+    /// message (user-uploaded photos on ChatGPT, Claude image blocks)
+    /// render above the text via `RawTranscriptImageView`. When
+    /// `nil` — mock data, Gemini conversations, conversations whose
+    /// raw JSON isn't vaulted, or the brief window before extraction
+    /// resolves — bubbles render text-only, same as before.
+    @Environment(\.messageAssetContext) private var messageAssetContext
     #if os(macOS)
     @Environment(\.openSettings) private var openSettings
     #endif
@@ -296,6 +305,13 @@ struct MessageBubbleView: View, Equatable {
             // width (capped by the parent's max-width frame), not to
             // stretch to fill. That's what lets a short prompt produce
             // a short bubble.
+            // Attachments (images the user uploaded alongside this
+            // prompt) render above the text bubble, right-aligned so
+            // they visually belong to the user's column. Skipped when
+            // the environment has no resolved asset context — the
+            // normal text-only reader path.
+            attachmentImagesView(alignment: .trailing)
+
             Text(highlightedVerbatim(message.content))
                 .font(.system(size: Layout.bodyFontSize))
                 .textSelection(.enabled)
@@ -329,6 +345,12 @@ struct MessageBubbleView: View, Equatable {
             }
 
             VStack(alignment: .leading, spacing: 10) {
+                // Attachments — same rationale as the user-side
+                // column. Assistants can return image blocks too (for
+                // example, Claude's vision responses), so this isn't
+                // user-exclusive.
+                attachmentImagesView(alignment: .leading)
+
                 // Assistant replies render fully — their markdown is
                 // meaningful output (headings, lists, code blocks). The
                 // `.plain` display mode switches to verbatim text, same
@@ -396,6 +418,8 @@ struct MessageBubbleView: View, Equatable {
         case .horizontalRule:
             Divider()
                 .padding(.vertical, 4)
+        case .image(let url, let alt):
+            imageBlockView(url: url, alt: alt)
         }
     }
 
@@ -467,6 +491,191 @@ struct MessageBubbleView: View, Equatable {
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(.vertical, 2)
+    }
+
+    /// Render a markdown image block. Behaviour depends on the URL
+    /// scheme — transcripts end up carrying a mix of:
+    ///
+    ///   * **`http(s)://…`** — mostly external image hosts pasted by
+    ///     the user or retrieved by the assistant. These are the only
+    ///     URLs we can actually fetch from the reader, so we hand
+    ///     them to `AsyncImage`. While the image is in flight we
+    ///     reserve a small placeholder band so the message doesn't
+    ///     jump around during load.
+    ///   * **`sandbox:/mnt/data/…`** (ChatGPT-generated images) — the
+    ///     URL is meaningful only inside the ChatGPT sandbox. The
+    ///     primary reader can't resolve it from the DB row alone; the
+    ///     canonical rendering path for these lives in the raw
+    ///     transcript view, which has access to the export vault and
+    ///     asset resolver. We degrade gracefully: show a labelled
+    ///     placeholder with the alt text so the reader still sees
+    ///     "there was an image here" instead of a raw `![…](…)`
+    ///     fragment.
+    ///   * **Everything else** (bare filenames, `data:` URIs, etc.) —
+    ///     treat as unresolvable for now and render the same labelled
+    ///     placeholder.
+    ///
+    /// The alt caption, when present, renders in secondary foreground
+    /// under the image so the description is preserved regardless of
+    /// whether the image itself loaded.
+    @ViewBuilder
+    private func imageBlockView(url: String, alt: String) -> some View {
+        let parsed = URL(string: url)
+        let scheme = parsed?.scheme?.lowercased()
+        let isFetchable = scheme == "http" || scheme == "https"
+
+        VStack(alignment: .leading, spacing: 6) {
+            if isFetchable, let parsed {
+                AsyncImage(url: parsed) { phase in
+                    switch phase {
+                    case .empty:
+                        imageLoadingBand()
+                    case .success(let image):
+                        image
+                            .resizable()
+                            .scaledToFit()
+                            .frame(maxWidth: .infinity, maxHeight: 480, alignment: .leading)
+                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    case .failure:
+                        imageUnresolvedView(alt: alt, target: url, reason: .loadFailed)
+                    @unknown default:
+                        imageUnresolvedView(alt: alt, target: url, reason: .unknown)
+                    }
+                }
+            } else {
+                imageUnresolvedView(alt: alt, target: url, reason: .unfetchableScheme(scheme))
+            }
+
+            if !alt.isEmpty {
+                Text(alt)
+                    .font(.system(size: Layout.bodyFontSize - 2))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 4)
+    }
+
+    /// In-flight band shown while `AsyncImage` fetches a remote image.
+    /// Fixed height so the surrounding layout doesn't jump once the
+    /// real image lands; width is left flexible so the band spans the
+    /// reader column.
+    @ViewBuilder
+    private func imageLoadingBand() -> some View {
+        HStack(spacing: 8) {
+            ProgressView()
+                .controlSize(.small)
+            Text("画像を読み込み中…")
+                .font(.system(size: Layout.bodyFontSize - 2))
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, minHeight: 80, alignment: .leading)
+        .padding(.horizontal, 12)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.secondary.opacity(0.08))
+        )
+    }
+
+    /// Fallback presentation for image references the primary reader
+    /// can't fetch (sandbox paths, bare filenames, load failures).
+    /// Keeps the "an image was here" cue visible without spamming the
+    /// reader with raw `![…](…)` markdown. The URL text is selectable
+    /// so power users can copy it into the raw transcript view, which
+    /// DOES know how to resolve sandbox assets via
+    /// `RawTranscriptImageView`.
+    private enum ImageUnresolvedReason {
+        case unfetchableScheme(String?)
+        case loadFailed
+        case unknown
+    }
+
+    @ViewBuilder
+    private func imageUnresolvedView(
+        alt: String,
+        target: String,
+        reason: ImageUnresolvedReason
+    ) -> some View {
+        let caption: String = {
+            switch reason {
+            case .unfetchableScheme(let scheme):
+                if let scheme, scheme == "sandbox" {
+                    return "サンドボックス内の画像（生の書き出しビューでのみ表示）"
+                }
+                if let scheme {
+                    return "\(scheme): スキームの画像は表示できません"
+                }
+                return "画像の場所を解決できません"
+            case .loadFailed:
+                return "画像を読み込めませんでした"
+            case .unknown:
+                return "画像を表示できません"
+            }
+        }()
+
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "photo")
+                .font(.system(size: 18))
+                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(caption)
+                    .font(.system(size: Layout.bodyFontSize - 1))
+                    .foregroundStyle(.secondary)
+                Text(target)
+                    .font(.system(size: Layout.bodyFontSize - 3, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                    .textSelection(.enabled)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.secondary.opacity(0.08))
+        )
+    }
+
+    /// Render any images the raw transcript extractor attached to
+    /// this message. Returns `EmptyView` — not even a `Spacer` — when
+    /// the environment has no context or this message has no
+    /// attachments, so bubbles without pictures stay visually
+    /// identical to the pre-attachment layout.
+    ///
+    /// `alignment` controls which edge the image stack hugs inside
+    /// its parent VStack: `.trailing` on the user side (so photos
+    /// mirror the text bubble's right-hugging layout), `.leading` on
+    /// the assistant side (so they align with the inline byline and
+    /// the message body).
+    @ViewBuilder
+    private func attachmentImagesView(alignment: HorizontalAlignment) -> some View {
+        if let context = messageAssetContext,
+           let refs = context.attachmentsByMessageID[message.id],
+           !refs.isEmpty {
+            VStack(alignment: alignment, spacing: 8) {
+                ForEach(Array(refs.enumerated()), id: \.offset) { _, ref in
+                    RawTranscriptImageView(
+                        reference: ref,
+                        snapshotID: context.snapshotID,
+                        vault: context.vault,
+                        resolver: context.resolver
+                    )
+                }
+            }
+            .frame(
+                maxWidth: .infinity,
+                alignment: alignment == .trailing ? .trailing : .leading
+            )
+            // Small bottom gap so the image stack visually separates
+            // from the text bubble / prose body below it. `RawTranscriptImageView`
+            // already provides its own internal chrome, so no extra
+            // padding / background here.
+            .padding(.bottom, 2)
+        }
     }
 
     // MARK: - Identity / theme
@@ -1000,6 +1209,18 @@ enum ContentBlock {
     /// `:---:` = center, `---:` = trailing).
     case table(headers: [String], rows: [[String]], alignments: [TableAlignment])
     case horizontalRule
+    /// Standalone image reference parsed from markdown image syntax
+    /// (`![alt](url)` on its own line). The reader renders this inline
+    /// as a picture rather than surfacing the raw `![…](…)` source,
+    /// which is how assistants like ChatGPT / Claude deliver generated
+    /// or attached images back in their replies. `url` is the source
+    /// target as written in the message (may be an `http(s)` URL, a
+    /// `sandbox:` path for ChatGPT transcripts, or a bare filename);
+    /// the renderer decides per-scheme how (or whether) to resolve it.
+    /// `alt` is the bracketed caption — displayed as a subtitle below
+    /// the image so the textual description is preserved for
+    /// accessibility and for cases where the image can't load.
+    case image(url: String, alt: String)
 
     // MARK: - Parser
 
@@ -1146,6 +1367,25 @@ enum ContentBlock {
                     flushBlockquote()
                     flushPendingTable()
                     blocks.append(.horizontalRule)
+                    return
+                }
+
+                // Standalone image: `![alt](url)` on its own line.
+                // Extracted before list / heading detection so that an
+                // image isn't swallowed by the paragraph stream (where
+                // `canRenderMarkdown` would just surface `![alt](url)`
+                // as literal text — SwiftUI's attributed-markdown
+                // parser doesn't inflate image references on its own).
+                // Inline image syntax inside a prose paragraph is
+                // intentionally left untouched: assistants almost
+                // always emit image links on their own line, and
+                // extracting mid-sentence would fragment the
+                // surrounding paragraph into awkward pieces.
+                if let image = Self.parseStandaloneImage(trimmed) {
+                    flushParagraph()
+                    flushBlockquote()
+                    flushPendingTable()
+                    blocks.append(.image(url: image.url, alt: image.alt))
                     return
                 }
 
@@ -1362,6 +1602,94 @@ enum ContentBlock {
             let stripped = trimmed.filter { !$0.isWhitespace }
             guard let first = stripped.first, "-*_".contains(first) else { return false }
             return stripped.allSatisfy { $0 == first } && stripped.count >= 3
+        }
+
+        /// Recognize a standalone markdown image line: `![alt](url)`.
+        ///
+        /// Returns the bracketed alt text and the parenthesized target
+        /// if the entire trimmed line is exactly one image reference
+        /// with nothing trailing after the closing `)`. Anything else
+        /// (image followed by more prose, optional title strings
+        /// inside the parens, bracket-nesting past what a normal alt
+        /// string uses, etc.) falls through to paragraph text.
+        ///
+        /// The matcher is hand-rolled rather than `NSRegularExpression`
+        /// because:
+        ///   * the parser is on the message-body render hot path, and
+        ///     a string scan avoids the per-call regex compile cost;
+        ///   * alt strings can legitimately contain unbalanced
+        ///     brackets from pasted captions, so we only accept a
+        ///     simple (non-nested) `[…]` and let the regex-unfriendly
+        ///     edge cases remain paragraph text.
+        ///
+        /// An optional quoted title after the URL (`![alt](url "t")`)
+        /// is stripped — the reader surfaces `alt` as the caption and
+        /// doesn't expose link titles separately.
+        private static func parseStandaloneImage(_ trimmed: String) -> (url: String, alt: String)? {
+            // Fast reject: must start with `![` and end with `)`.
+            guard trimmed.hasPrefix("![") else { return nil }
+            guard trimmed.hasSuffix(")") else { return nil }
+
+            let chars = Array(trimmed)
+            var i = 2 // past `![`
+            var altChars: [Character] = []
+            while i < chars.count, chars[i] != "]" {
+                // No nested brackets inside alt — keep this simple so
+                // pathological inputs fall back to paragraph text
+                // rather than over-matching.
+                if chars[i] == "[" { return nil }
+                altChars.append(chars[i])
+                i += 1
+            }
+            guard i < chars.count, chars[i] == "]" else { return nil }
+            i += 1
+            guard i < chars.count, chars[i] == "(" else { return nil }
+            i += 1
+
+            // URL body: everything up to the final `)`. We allow
+            // parentheses inside the URL only via balancing, which
+            // matches CommonMark's image-URL rule for bare URLs. A
+            // trailing `"title"` is tolerated and stripped.
+            var urlChars: [Character] = []
+            var parenDepth = 1
+            while i < chars.count {
+                let c = chars[i]
+                if c == "(" {
+                    parenDepth += 1
+                    urlChars.append(c)
+                } else if c == ")" {
+                    parenDepth -= 1
+                    if parenDepth == 0 {
+                        i += 1
+                        break
+                    }
+                    urlChars.append(c)
+                } else {
+                    urlChars.append(c)
+                }
+                i += 1
+            }
+            // The whole line must end at the matching `)` — no trailing
+            // prose. `i == chars.count` ensures that.
+            guard i == chars.count, parenDepth == 0 else { return nil }
+
+            var body = String(urlChars).trimmingCharacters(in: .whitespaces)
+            // Strip optional title: `url "title"` or `url 'title'`.
+            if let lastSpace = body.lastIndex(of: " ") {
+                let tail = body[body.index(after: lastSpace)...]
+                    .trimmingCharacters(in: .whitespaces)
+                if (tail.hasPrefix("\"") && tail.hasSuffix("\"") && tail.count >= 2)
+                    || (tail.hasPrefix("'") && tail.hasSuffix("'") && tail.count >= 2) {
+                    body = String(body[..<lastSpace]).trimmingCharacters(in: .whitespaces)
+                }
+            }
+            // Angle-bracket wrapping: `<http://…>` is legal CommonMark.
+            if body.hasPrefix("<") && body.hasSuffix(">") && body.count >= 2 {
+                body = String(body.dropFirst().dropLast())
+            }
+
+            guard !body.isEmpty else { return nil }
+            return (url: body, alt: String(altChars))
         }
 
         private static func parseHeading(_ trimmed: String) -> (level: Int, text: String)? {

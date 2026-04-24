@@ -216,7 +216,11 @@ private struct TranslationControl: View {
             return .listItem(ordered: ordered, depth: depth, text: newText, marker: marker)
         case .blockquote:
             return .blockquote(newText)
-        case .table, .code, .math, .horizontalRule:
+        case .table, .code, .math, .horizontalRule, .image:
+            // Images have no user-visible prose to translate — the alt
+            // text is a caption, not body text, and swapping it with a
+            // translated paragraph body would mis-render the image's
+            // label. Leave untouched.
             return block
         }
     }
