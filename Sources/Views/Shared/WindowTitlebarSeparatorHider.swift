@@ -168,19 +168,23 @@ struct WindowTitlebarSeparatorHider: NSViewRepresentable {
             if window.titlebarSeparatorStyle != .none {
                 window.titlebarSeparatorStyle = .none
             }
-            // Merge the titlebar area into the content so the bottom
-            // edge of the titlebar chrome stops drawing a hairline.
-            // This DOES also bump the toolbar strip's translucency
-            // a notch above the system default — the scroll content
-            // shows through more than a stock `.toolbarBackground()`
-            // would. That's intentional here: the user specifically
-            // preferred this look over the default after trying
-            // both, because it makes the toolbar feel continuous
-            // with the underlying pane instead of like a separate
-            // chrome band.
-            if !window.titlebarAppearsTransparent {
-                window.titlebarAppearsTransparent = true
-            }
+            // We deliberately do NOT set `titlebarAppearsTransparent = true`
+            // here even though it further smooths the titlebar/content
+            // seam visually. That flag merges the titlebar area INTO the
+            // content view, which has a side effect AppKit gives us no
+            // API to undo: the top ~28pt of the window (overlapping the
+            // traffic-light strip) stays a draggable title bar region,
+            // and `NavigationSplitView` draws its column dividers all
+            // the way up to the window's top edge. The result was that
+            // grabbing the center-pane divider at the top inch of its
+            // length moved the whole window instead of resizing the
+            // pane (user report: "中央ペインの幅を調節しようとすると
+            // ウィンドウ自体が動いてしまう"). Leaving the titlebar opaque
+            // costs a small amount of visual continuity but restores
+            // correct drag-vs-resize behaviour along the divider's full
+            // height. The three remaining mechanisms below already
+            // cover the hairline the flag was originally added to hide.
+            //
             // Legacy toolbar baseline separator — the 1pt line that
             // AppKit draws under the toolbar when there's a toolbar
             // attached. Pre-dates `titlebarSeparatorStyle` and is
