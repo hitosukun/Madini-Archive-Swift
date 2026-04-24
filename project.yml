@@ -1,0 +1,76 @@
+# xcodegen spec — single source of truth for `Madini Archive.xcodeproj`.
+#
+# The project is SPM-first (`Package.swift` still builds and tests from
+# the CLI). This spec exists so we can also produce a proper `.app`
+# bundle through Xcode's build system without hand-wrapping an SPM
+# binary. The generated `.xcodeproj/` is git-ignored; regenerate with
+# `xcodegen generate` whenever this file changes.
+#
+# Notes on layout:
+#   * Swift sources live under `Sources/` and are shared verbatim with
+#     SPM.
+#   * `Sources/Resources/` (avatars, etc.) is processed as an SPM
+#     resource bundle in the SPM build and copied as a plain resource
+#     folder here.
+#   * App-only support files (Info.plist, .icns) live in `App/Support/`
+#     so SPM doesn't try to bundle them.
+
+name: Madini Archive
+
+options:
+  bundleIdPrefix: com.madini
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+  developmentLanguage: en
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MARKETING_VERSION: "0.2.0"
+    CURRENT_PROJECT_VERSION: "0.2.0"
+    CODE_SIGN_IDENTITY: "-"
+    CODE_SIGN_STYLE: Automatic
+    ENABLE_HARDENED_RUNTIME: NO
+    DEAD_CODE_STRIPPING: YES
+
+# Swift Package dependencies mirror `Package.swift`. Keep these versions
+# in sync with the SPM manifest or the two build systems will diverge.
+packages:
+  GRDB:
+    url: https://github.com/groue/GRDB.swift
+    from: 7.0.0
+  SwiftMath:
+    url: https://github.com/mgriebling/SwiftMath.git
+    from: 1.7.0
+
+targets:
+  Madini Archive:
+    type: application
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: Sources
+        excludes:
+          - "Resources/**"
+      - path: Sources/Resources
+        type: folder
+        buildPhase: resources
+      - path: App/Support/MadiniArchive.icns
+        buildPhase: resources
+    dependencies:
+      - package: GRDB
+        product: GRDB
+      - package: SwiftMath
+        product: SwiftMath
+    # Use the hand-authored Info.plist verbatim — DON'T let xcodegen
+    # generate a fresh one (which `info.path` would do and overwrite
+    # the authored version). `INFOPLIST_FILE` tells xcodebuild where
+    # to find the plist at build time; the file must already exist.
+    settings:
+      base:
+        PRODUCT_NAME: Madini Archive
+        PRODUCT_BUNDLE_IDENTIFIER: com.madini.archive
+        INFOPLIST_FILE: App/Support/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        MACOSX_DEPLOYMENT_TARGET: "14.0"

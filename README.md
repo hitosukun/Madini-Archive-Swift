@@ -54,12 +54,15 @@ Sources/
 
 ### CLI (Swift Package Manager)
 
+日常の開発・テスト用。
+
 ```sh
 swift build
+swift test
 open .build/debug/MadiniArchive
 ```
 
-### Xcode
+### Xcode (SPM を開く)
 
 1. Xcode で `Package.swift` を開く (File → Open)
 2. Scheme を `MadiniArchive` に設定
@@ -67,11 +70,42 @@ open .build/debug/MadiniArchive
 
 Xcode で開くと SwiftUI Preview (`#Preview`) も利用可能。
 
+### 配布用 `.app` をビルドする
+
+`xcodegen` で `project.yml` から `Madini Archive.xcodeproj` を生成し、
+`xcodebuild` で Release ビルドする。 `.xcodeproj` は git 管理外。
+`project.yml` を変更した時だけ再生成すれば OK。
+
+```sh
+brew install xcodegen                      # 初回のみ
+xcodegen generate                          # project.yml → .xcodeproj
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  xcodebuild -project "Madini Archive.xcodeproj" \
+             -scheme "Madini Archive" \
+             -configuration Release \
+             -derivedDataPath build/derived build
+```
+
+成果物:
+`build/derived/Build/Products/Release/Madini Archive.app`
+
+インストール:
+
+```sh
+rm -rf "/Applications/Madini Archive.app"
+cp -R "build/derived/Build/Products/Release/Madini Archive.app" /Applications/
+```
+
+SPM と Xcode で同じソースツリー (`Sources/`) を共有する。依存
+バージョンは `Package.swift` と `project.yml` の両方に書かれているので、
+どちらか片方を更新したら必ず両方を揃える。
+
 ### 動作要件
 
 - macOS 14 Sonoma+
-- Swift 5.9+ / Xcode 15+
-- GRDB.swift 7.0+ (Package.swift で自動取得)
+- Xcode 15+ (Swift 5.9+)
+- GRDB.swift 7.0+ / SwiftMath 1.7+ (どちらも自動取得)
+- xcodegen 2.40+ (`.app` ビルド時のみ)
 
 ## データソース
 
