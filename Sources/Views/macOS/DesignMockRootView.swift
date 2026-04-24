@@ -931,12 +931,15 @@ struct DesignMockRootView: View {
         // a menu click fires).
         let layoutBinding = $selectedLayoutMode
         let selectionBinding = $selectedConversationIDs
+        let expandedBinding = $expandedPromptConversationID
         let capturedServices = services
         let capturedStore = store
         let capturedLibraryVM = libraryViewModel
         let capturedArchiveVM = archiveInspectorVM
         let archiveFocused = showingArchiveInspector
         let currentSelection = selectedConversationIDs
+        let currentExpanded = expandedPromptConversationID
+        let currentLayout = selectedLayoutMode
         let visibleConversations = store.conversations
 
         // Next / Previous Conversation closures. Nil when the list is
@@ -964,11 +967,87 @@ struct DesignMockRootView: View {
                     // behaviour when the message list is unfocused.
                     nextIndex = delta >= 0 ? 0 : ids.count - 1
                 }
-                selectionBinding.wrappedValue = [ids[nextIndex]]
+                let nextID = ids[nextIndex]
+                selectionBinding.wrappedValue = [nextID]
+                // If a card was expanded before the move, slide the
+                // expanded id to the newly-selected thread so state 3
+                // (prompt list visible in center pane) stays coherent
+                // with the selection. Otherwise the user would see
+                // prompts from the old thread while the reader on the
+                // right already switched to the new one.
+                if currentExpanded != nil {
+                    expandedBinding.wrappedValue = nextID
+                }
             }
         }
         let nextClosure = moveByOne(1)
         let previousClosure = moveByOne(-1)
+
+        // Drill-in (⌘→) / drill-out (⌘←) along the Thread list →
+        // Thread → Prompt hierarchy. Three canonical states:
+        //
+        //   1. `.table`                            (Thread list)
+        //   2. `.default` + currentExpanded == nil (Thread)
+        //   3. `.default` + currentExpanded != nil (Prompt list)
+        //
+        // `.viewer` isn't part of the chain — it's an orthogonal
+        // "focus mode" the user enters via ⌘3. We treat ⌘← in
+        // `.viewer` as "escape back to `.default`" so the shortcut
+        // still has some sensible meaning there; ⌘→ in `.viewer` is
+        // a no-op (we're already maximally zoomed-in).
+        let drillInClosure: (() -> Void)?
+        let drillOutClosure: (() -> Void)?
+        switch currentLayout {
+        case .table:
+            // ⌘→ opens the selected thread in `.default`. If nothing
+            // is selected yet, auto-pick the top row so the shortcut
+            // still has an obvious effect instead of silently doing
+            // nothing (same convention as ⌘↓ on an unfocused list).
+            drillInClosure = visibleConversations.isEmpty ? nil : {
+                if currentSelection.isEmpty,
+                   let first = visibleConversations.first {
+                    selectionBinding.wrappedValue = [first.id]
+                }
+                layoutBinding.wrappedValue = .default
+            }
+            // Already at the leftmost level — nothing to collapse.
+            drillOutClosure = nil
+
+        case .default:
+            if currentExpanded == nil {
+                // State 2 → State 3: expand the currently-selected
+                // card. Only enabled when there actually is a
+                // selection; otherwise there's no card to expand.
+                drillInClosure = currentSelection.isEmpty ? nil : {
+                    if let selectedID = currentSelection.first {
+                        expandedBinding.wrappedValue = selectedID
+                    }
+                }
+                // State 2 → State 1: back to the table.
+                drillOutClosure = {
+                    layoutBinding.wrappedValue = .table
+                }
+            } else {
+                // State 3 is the drill-in terminus in the canonical
+                // chain. We deliberately do NOT bleed into `.viewer`
+                // here because the user described the 3-state model
+                // as terminating at "prompt list shown in center
+                // pane" — ⌘→ at the end of the chain just stops.
+                drillInClosure = nil
+                // State 3 → State 2: collapse the card.
+                drillOutClosure = {
+                    expandedBinding.wrappedValue = nil
+                }
+            }
+
+        case .viewer:
+            // Viewer is off-chain. Treat ⌘← as "go back to the
+            // default layout" so ⌘3 → ⌘← round-trips cleanly.
+            drillInClosure = nil
+            drillOutClosure = {
+                layoutBinding.wrappedValue = .default
+            }
+        }
 
         // Enable "Delete Snapshot…" only when:
         //   1. the sidebar is pointing at archive.db (so the
@@ -1001,6 +1080,8 @@ struct DesignMockRootView: View {
             },
             selectNextConversation: nextClosure,
             selectPreviousConversation: previousClosure,
+            drillInSelection: drillInClosure,
+            drillOutSelection: drillOutClosure,
             openDropFolder: {
                 #if os(macOS)
                 NSWorkspace.shared.open(capturedServices.intakeDirURL)

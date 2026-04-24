@@ -117,6 +117,18 @@ struct ShellCommandActions {
     /// Symmetric predecessor of `selectNextConversation`. Same rationale
     /// applies — the shell owns the visible selection.
     let selectPreviousConversation: (() -> Void)?
+    /// ⌘→ "drill in" one level along the Thread list → Thread → Prompt
+    /// hierarchy. In `.table`, switches to `.default`. In `.default` with
+    /// no card expanded, opens the selected card (prompts list appears
+    /// in center pane). In `.default` with a card already open, no-op.
+    /// Nil means the drill is impossible from the current state (e.g.
+    /// `.table` with no selection and no rows to auto-pick).
+    let drillInSelection: (() -> Void)?
+    /// ⌘← counterpart of `drillInSelection`. In `.default` with a card
+    /// open, closes the card. In `.default` with no card open, switches
+    /// back to `.table`. In `.viewer`, escapes to `.default`. Nil when
+    /// already at the leftmost level (`.table`).
+    let drillOutSelection: (() -> Void)?
     /// Open the intake drop folder in Finder. Works whether the user is
     /// using the default location or has pointed the app at a custom
     /// folder via the Archive Inspector's header buttons.
@@ -230,6 +242,32 @@ struct AppCommands: Commands {
             }
             .keyboardShortcut(.upArrow, modifiers: .command)
             .disabled(shell?.selectPreviousConversation == nil && browseViewModel == nil)
+
+            Divider()
+
+            // ⌘→ / ⌘← drill the user along the
+            // Thread list → Thread → Prompt hierarchy. The shell owns
+            // the state machine (layout mode × card-expanded flag), so
+            // the menu just forwards the gesture — when the user is
+            // already at an edge (⌘← in `.table`, ⌘→ in `.default`
+            // with card open), the shell ships nil and SwiftUI greys
+            // the item out.
+            //
+            // Labels are deliberately plain — "Open Selection" /
+            // "Close Selection" reads for someone who has never seen
+            // the drill model before but can infer "open" = "dig
+            // deeper into what I've selected" from Finder's ⌘O.
+            Button("Open Selection") {
+                shell?.drillInSelection?()
+            }
+            .keyboardShortcut(.rightArrow, modifiers: .command)
+            .disabled(shell?.drillInSelection == nil)
+
+            Button("Close Selection") {
+                shell?.drillOutSelection?()
+            }
+            .keyboardShortcut(.leftArrow, modifiers: .command)
+            .disabled(shell?.drillOutSelection == nil)
 
             Divider()
 
