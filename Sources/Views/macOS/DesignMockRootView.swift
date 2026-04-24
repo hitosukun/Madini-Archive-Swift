@@ -2170,6 +2170,19 @@ private struct DesignMockThreadListPane: View {
         .onAppear {
             isFocused = true
         }
+        // When a card collapses (state 3 → state 2), the expanded
+        // prompt list disappears and with it whatever view held
+        // keyboard focus (typically the prompt list itself, which
+        // pulled focus on appear). Without this watcher, ↑/↓ would
+        // route to nowhere until the user clicked somewhere — the
+        // exact "上下移動ができなくなる" regression the user
+        // reported. Pulling focus back to the thread pane here
+        // keeps the keyboard flow unbroken across drill-out.
+        .onChange(of: expandedPromptConversationID) { _, newValue in
+            if newValue == nil {
+                isFocused = true
+            }
+        }
     }
 
     private var cardList: some View {
@@ -2634,6 +2647,12 @@ private struct DesignMockExpandedPromptList: View {
     /// highlight immediately if we reused it.
     @State private var selectedPromptID: String?
     @State private var hoveredPromptID: String?
+    /// Focus flag for the prompt list's keyboard handler. Set to true
+    /// on appear so ⌘→ (drill-in from state 2 to state 3) lands the
+    /// user directly in a prompt-navigable surface — they don't have
+    /// to click anywhere to "enter" the list. Yielded to text fields
+    /// etc. via the normal first-responder chain.
+    @FocusState private var isPromptListFocused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -2654,6 +2673,25 @@ private struct DesignMockExpandedPromptList: View {
         }
         .padding(.leading, 6)
         .padding(.trailing, 2)
+        // Focus + keyboard handling. The prompt list is the state-3
+        // drill-in target, so plain ↑/↓ here walks the prompt list
+        // (and auto-fires `pendingPromptID` so the reader scrolls to
+        // each prompt in lockstep). The outer thread-list pane's
+        // matching `.onKeyPress` also exists; SwiftUI routes key
+        // events to the deepest focused view first, so the prompt
+        // list's handler preempts the outer one whenever state 3 is
+        // active.
+        .focusable()
+        .focusEffectDisabled()
+        .focused($isPromptListFocused)
+        .onKeyPress(.upArrow) {
+            movePromptSelection(by: -1)
+            return .handled
+        }
+        .onKeyPress(.downArrow) {
+            movePromptSelection(by: 1)
+            return .handled
+        }
         .task(id: conversation.id) {
             // Re-fetch whenever the expanded card changes identity. Store
             // caches the outline, so flipping back to a previously-expanded
@@ -2665,7 +2703,37 @@ private struct DesignMockExpandedPromptList: View {
             // otherwise a prompt from the previous card would stay tinted.
             selectedPromptID = nil
             hoveredPromptID = nil
+            // Pull focus so the user can start driving prompts with
+            // ↑/↓ the instant a card expands. If they click away
+            // (into the search field, onto the reader), focus
+            // relocates naturally via the first-responder chain.
+            isPromptListFocused = true
         }
+    }
+
+    /// Move `selectedPromptID` one row up (-1) or down (+1). Fires
+    /// `pendingPromptID` as a side effect so the reader scrolls to
+    /// the newly-selected prompt — same behaviour as tapping a row.
+    /// No-op when the outline is empty or we're already at the
+    /// target edge.
+    private func movePromptSelection(by delta: Int) {
+        guard !prompts.isEmpty else { return }
+        let currentIndex = selectedPromptID.flatMap { id in
+            prompts.firstIndex { $0.id == id }
+        }
+        let nextIndex: Int
+        if let currentIndex {
+            nextIndex = min(max(currentIndex + delta, 0), prompts.count - 1)
+            guard nextIndex != currentIndex else { return }
+        } else {
+            // No prompt selected yet — ↓ picks first, ↑ picks last.
+            // Matches the thread-list convention for unfocused
+            // lists so the two levels behave consistently.
+            nextIndex = delta >= 0 ? 0 : prompts.count - 1
+        }
+        let next = prompts[nextIndex]
+        selectedPromptID = next.id
+        pendingPromptID = next.id
     }
 
     @ViewBuilder
