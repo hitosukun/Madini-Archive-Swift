@@ -1085,6 +1085,37 @@ struct DesignMockRootView: View {
         )
     }
 
+    /// Step the selection one row up (delta = -1) or down (delta = +1).
+    /// Used by the middle pane's `onKeyPress` handlers — single-step
+    /// navigation lives here rather than in `ShellCommandActions`
+    /// because the key binding is a first-responder affair (plain ↑/↓
+    /// without a menu shortcut), not something the menu bar routes.
+    ///
+    /// Expanded-id sync matches the jump-to-edge behaviour: if a card
+    /// is open (state 3), the expanded id slides to the newly-
+    /// selected thread so the center pane's prompt list stays in
+    /// sync with whichever row we landed on.
+    private func moveSelection(by delta: Int) {
+        let ids = store.conversations.map(\.id)
+        guard !ids.isEmpty else { return }
+        let currentIndex = ids.firstIndex { selectedConversationIDs.contains($0) }
+        let nextIndex: Int
+        if let currentIndex {
+            nextIndex = min(max(currentIndex + delta, 0), ids.count - 1)
+            guard nextIndex != currentIndex else { return }
+        } else {
+            // No selection yet — ↓ picks the top, ↑ picks the
+            // bottom. Mirrors Mail's behaviour for an unfocused
+            // message list.
+            nextIndex = delta >= 0 ? 0 : ids.count - 1
+        }
+        let nextID = ids[nextIndex]
+        selectedConversationIDs = [nextID]
+        if expandedPromptConversationID != nil {
+            expandedPromptConversationID = nextID
+        }
+    }
+
     /// Shared entry point for "the reader is now showing this
     /// thread". Reads the currently-displayed `DesignMockConversation`
     /// and forwards its snapshot into `RecentThreadsStore`. No-op when
@@ -1185,6 +1216,9 @@ struct DesignMockRootView: View {
                     isLoadingMore: store.isLoadingMore,
                     onReachEnd: {
                         store.loadMoreIfNeeded(services: services)
+                    },
+                    onMoveSelection: { delta in
+                        moveSelection(by: delta)
                     }
                 )
                 .background(centerWidthProbe)
@@ -2074,12 +2108,67 @@ private struct DesignMockThreadListPane: View {
     @Binding var expandedPromptConversationID: DesignMockConversation.ID?
     let isLoadingMore: Bool
     let onReachEnd: () -> Void
+    /// Step the selection up (-1) or down (+1). Published by the shell
+    /// because moving the selection also has to sync
+    /// `expandedPromptConversationID` to preserve state 3's center-
+    /// pane / reader-pane coherence, which the pane itself can't do
+    /// without reaching back into shell-owned state.
+    ///
+    /// We wire this up as an `onKeyPress` handler on `.upArrow` /
+    /// `.downArrow` because the pane renders as a `ScrollView` +
+    /// `LazyVStack` rather than a `List(selection:)` — SwiftUI's
+    /// built-in arrow-key navigation doesn't apply to the raw stack,
+    /// so the pane is responsible for publishing its own focus and
+    /// translating arrow presses into selection moves.
+    let onMoveSelection: (Int) -> Void
+
+    /// Local focus flag for the `.focusable()` modifier on the pane
+    /// root. Without a bound FocusState, `.onKeyPress` on a focusable
+    /// view doesn't get an unambiguous hook into the focus system —
+    /// the binding makes the focus state observable, which is what
+    /// SwiftUI uses to decide whether key events route here.
+    @FocusState private var isFocused: Bool
 
     var body: some View {
-        if let expandedConversation {
-            pinnedPromptView(for: expandedConversation)
-        } else {
-            cardList
+        Group {
+            if let expandedConversation {
+                pinnedPromptView(for: expandedConversation)
+            } else {
+                cardList
+            }
+        }
+        // `.focusable()` is necessary to participate in the focus
+        // chain at all; without it the view can't receive key
+        // events. `.focusEffectDisabled()` suppresses the default
+        // blue focus ring around the whole pane, which looked
+        // jarring on the paper-white card list — the existing
+        // selection pill is already visual-focus enough.
+        .focusable()
+        .focusEffectDisabled()
+        .focused($isFocused)
+        // Plain ↑ / ↓ step selection by one row in either branch of
+        // the body (closed card list or expanded state 3 prompt
+        // view). Intercepting at this level rather than inside
+        // `cardList` / `pinnedPromptView` means the key binding
+        // survives across the open/close toggle without having to
+        // be re-installed per branch. `.handled` tells SwiftUI to
+        // stop the event from bubbling up to any enclosing
+        // container that might otherwise scroll.
+        .onKeyPress(.upArrow) {
+            onMoveSelection(-1)
+            return .handled
+        }
+        .onKeyPress(.downArrow) {
+            onMoveSelection(1)
+            return .handled
+        }
+        // Auto-focus on first appearance so ↑/↓ work without the
+        // user having to click into the pane first. Users who
+        // click the search field get focus moved there naturally
+        // (first-responder chain), and clicking back on a card
+        // re-pulls focus via `selectOrToggle` below.
+        .onAppear {
+            isFocused = true
         }
     }
 
@@ -2256,6 +2345,12 @@ private struct DesignMockThreadListPane: View {
             selection = [conversation.id]
             expandedPromptConversationID = nil
         }
+        // Clicking a card should leave keyboard focus on the pane
+        // so the user can immediately reach for ↑/↓ to keep
+        // navigating. Without this the user would have to
+        // tab-cycle back into the pane every time they picked
+        // something with the mouse.
+        isFocused = true
     }
 
     private func pinnedPromptView(for conversation: DesignMockConversation) -> some View {
