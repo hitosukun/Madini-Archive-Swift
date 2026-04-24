@@ -589,18 +589,24 @@ private struct LoadedConversationDetailView: View {
         }
     }
 
-    /// Animated programmatic scroll that holds `programmaticScrollLock`
-    /// for the duration, suppressing the scroll-position observer so
-    /// it can't overwrite `selectedPromptID` with transient
-    /// mid-animation prompts. Callers just pass the target id — nil
-    /// short-circuits cleanly.
+    /// Instant programmatic jump to the requested id. Holds
+    /// `programmaticScrollLock` for ~150ms to swallow the burst of
+    /// `PromptTopYPreferenceKey` emissions the layout cascade fires
+    /// right after the content reflows — without the lock the scroll-
+    /// position observer would see transient offsets mid-reflow and
+    /// overwrite `selectedPromptID`, which cascades into the middle-
+    /// pane highlight chattering.
     ///
-    /// Lock release is done on a dispatched Task sleeping ~0.45s
-    /// (animation length + a cushion for the final `PromptTopYPreferenceKey`
-    /// emission to arrive). The lock is keyed by a fresh UUID so if
-    /// another programmatic scroll starts before the sleep completes,
-    /// the older task's release is a no-op — the newer scroll's lock
-    /// stays in force for its own window.
+    /// Previously this used `withAnimation(.easeInOut(duration: 0.2))`
+    /// so the reader smoothly scrolled to the new position, but the
+    /// user asked for a lighter, snappier response: "スクロールより、
+    /// ジャンプして欲しい。動作が軽い方がいいので" — the animation added
+    /// no useful spatial cue for a prompt-list click (where the user
+    /// just picked a specific target) and made the UI feel heavy on
+    /// long conversations where the scroll distance could be several
+    /// screens. Dropping the animation also shrinks the lock window
+    /// from 450ms to 150ms, since there's no animation curve to wait
+    /// out anymore — just the layout settle.
     private func performProgrammaticScroll(
         to id: String?,
         using proxy: ScrollViewProxy
@@ -608,11 +614,9 @@ private struct LoadedConversationDetailView: View {
         guard let id else { return }
         let token = UUID()
         programmaticScrollLock = token
-        withAnimation(.easeInOut(duration: 0.2)) {
-            proxy.scrollTo(id, anchor: .top)
-        }
+        proxy.scrollTo(id, anchor: .top)
         Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 450_000_000)
+            try? await Task.sleep(nanoseconds: 150_000_000)
             if programmaticScrollLock == token {
                 programmaticScrollLock = nil
             }
@@ -633,11 +637,15 @@ private struct LoadedConversationDetailView: View {
         programmaticScrollLock = token
         scrollDrivenSelection = nil
         selectedPromptID = nil
-        withAnimation(.easeInOut(duration: 0.2)) {
-            proxy.scrollTo(Self.topAnchorID, anchor: .top)
-        }
+        // Jump rather than animated scroll — matches the lighter,
+        // snappier feel the user asked for on prompt navigation
+        // ("スクロールより、ジャンプして欲しい。動作が軽い方がいい"). On
+        // long conversations a 0.2s animated scroll back to the top
+        // could traverse several screens of content and read as
+        // laggy.
+        proxy.scrollTo(Self.topAnchorID, anchor: .top)
         Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 450_000_000)
+            try? await Task.sleep(nanoseconds: 150_000_000)
             if programmaticScrollLock == token {
                 programmaticScrollLock = nil
             }
