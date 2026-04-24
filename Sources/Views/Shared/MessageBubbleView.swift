@@ -837,26 +837,51 @@ struct MessageBubbleView: View, Equatable {
            let refs = context.attachmentsByMessageID[message.id],
            !refs.isEmpty {
             let baseOffset = context.startOffsetByMessageID[message.id] ?? 0
-            VStack(alignment: alignment, spacing: 8) {
-                ForEach(Array(refs.enumerated()), id: \.offset) { localIndex, ref in
-                    RawTranscriptImageView(
-                        reference: ref,
-                        snapshotID: context.snapshotID,
-                        vault: context.vault,
-                        resolver: context.resolver,
-                        globalIndex: baseOffset + localIndex,
-                        orderedReferences: context.orderedReferences
+            // Horizontal strip: each `RawTranscriptImageView` sizes its
+            // width from the decoded bitmap's aspect ratio (height is
+            // pinned at `reservedHeight`), so the row naturally matches
+            // the pane width when a handful of images fit and overflows
+            // into horizontal scroll when they don't. Replaces the
+            // prior `VStack`, which stacked portraits into a tall column
+            // that forced the reader to scroll past the attachments
+            // before the assistant's reply appeared underneath.
+            //
+            // `GeometryReader` hands the available width into the inner
+            // HStack so the row can be right-hugged on the user side
+            // when the images fit without scrolling. Without the
+            // `minWidth`, an HStack of narrow attachments inside
+            // `ScrollView(.horizontal)` collapses to its intrinsic
+            // width and always sits at the leading edge — which on the
+            // user side breaks the "user messages hug the right" shape
+            // of the bubble column.
+            GeometryReader { proxy in
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(alignment: .top, spacing: 8) {
+                        ForEach(Array(refs.enumerated()), id: \.offset) { localIndex, ref in
+                            RawTranscriptImageView(
+                                reference: ref,
+                                snapshotID: context.snapshotID,
+                                vault: context.vault,
+                                resolver: context.resolver,
+                                globalIndex: baseOffset + localIndex,
+                                orderedReferences: context.orderedReferences
+                            )
+                        }
+                    }
+                    .frame(
+                        minWidth: proxy.size.width,
+                        alignment: alignment == .trailing ? .trailing : .leading
                     )
                 }
             }
-            .frame(
-                maxWidth: .infinity,
-                alignment: alignment == .trailing ? .trailing : .leading
-            )
-            // Small bottom gap so the image stack visually separates
-            // from the text bubble / prose body below it. `RawTranscriptImageView`
-            // already provides its own internal chrome, so no extra
-            // padding / background here.
+            // `GeometryReader` is flex-height, so the outer layout
+            // needs a concrete band. `RawTranscriptImageView` reserves
+            // `reservedHeight` (320pt) for each cell, and the row
+            // itself has no surrounding chrome, so pinning the same
+            // height here keeps the bubble layout stable during load.
+            .frame(height: RawTranscriptImageView.reservedHeight)
+            // Small bottom gap so the image row visually separates
+            // from the text bubble / prose body below it.
             .padding(.bottom, 2)
         }
     }

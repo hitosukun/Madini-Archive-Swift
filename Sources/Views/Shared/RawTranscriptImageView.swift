@@ -86,7 +86,16 @@ struct RawTranscriptImageView: View {
     /// Sized to be tall enough that most images don't get clamped below
     /// their natural aspect, and short enough that a conversation with
     /// many attachments doesn't feel like wading through giant hero shots.
-    private static let reservedHeight: CGFloat = 320
+    /// Not `private` because the enclosing attachment row (in
+    /// `MessageBubbleView`) pins its own frame to this value so the
+    /// horizontal strip keeps a stable height during async load.
+    static let reservedHeight: CGFloat = 320
+
+    /// Fixed width used by the placeholder band before the real image
+    /// resolves. Chosen to feel like a rough 3:4 portrait against
+    /// `reservedHeight` so the placeholder doesn't look oversized next
+    /// to the loaded neighbours (square / landscape photos).
+    private static let placeholderWidth: CGFloat = 240
 
     var body: some View {
         Group {
@@ -155,43 +164,54 @@ struct RawTranscriptImageView: View {
         // portrait image would grow from ~40pt placeholder → 480pt,
         // pushing content around and destabilizing upward scrolling in
         // the enclosing LazyVStack.
+        //
+        // Width is intentionally NOT pinned: `scaledToFit` + fixed
+        // height lets SwiftUI size the cell by the bitmap's aspect
+        // ratio, so a row of mixed portraits / landscapes in the
+        // attachment carousel packs tightly side-by-side without
+        // stretching any single image to fill the pane.
         #if os(macOS)
         Image(nsImage: image)
             .resizable()
             .scaledToFit()
-            .frame(maxWidth: .infinity)
             .frame(height: Self.reservedHeight)
             .clipShape(RoundedRectangle(cornerRadius: 8))
         #else
         Image(uiImage: image)
             .resizable()
             .scaledToFit()
-            .frame(maxWidth: .infinity)
             .frame(height: Self.reservedHeight)
             .clipShape(RoundedRectangle(cornerRadius: 8))
         #endif
     }
 
     private func placeholder(systemImage: String, label: String) -> some View {
-        HStack(spacing: 8) {
+        VStack(spacing: 6) {
             Image(systemName: systemImage)
+                .font(.title3)
                 .foregroundStyle(.secondary)
             Text(label)
                 .font(.caption)
                 .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
             Text(reference.reference)
                 .font(.caption2.monospaced())
                 .foregroundStyle(.tertiary)
-                .lineLimit(1)
+                .lineLimit(2)
                 .truncationMode(.middle)
+                .multilineTextAlignment(.center)
         }
         .padding(10)
-        // Reserve the same vertical band as the loaded image so the
-        // cell doesn't resize on load-complete. `maxWidth: .infinity`
-        // lets the card span the bubble width; `height` (not min/max)
-        // pins the band exactly.
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .frame(height: Self.reservedHeight)
+        // Reserve a fixed card footprint so:
+        //  - the cell's vertical band matches the loaded image's
+        //    (no height jump on resolve), and
+        //  - the horizontal attachment carousel can pack cells
+        //    side-by-side without one placeholder eating the full row.
+        // The loaded image sizes its width from the bitmap's aspect
+        // ratio, so a slight width reflow on load-complete is expected
+        // and intentional — it lets landscape photos expand beyond
+        // this placeholder while portraits stay near it.
+        .frame(width: Self.placeholderWidth, height: Self.reservedHeight)
         .background(
             RoundedRectangle(cornerRadius: 6)
                 .fill(Color.primary.opacity(0.04))
