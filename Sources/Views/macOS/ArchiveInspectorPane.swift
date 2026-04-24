@@ -38,6 +38,94 @@ struct ArchiveInspectorPane: View {
                 await viewModel.loadMoreSnapshots()
             }
         }
+        // Confirmation alert for destructive snapshot delete. Bound to
+        // `pendingDeleteSnapshot` so the existence of a staged summary
+        // both triggers the alert and gives the message body something
+        // to describe (provider, file count, byte size). Reset to nil on
+        // either action so the alert can re-fire for the next request.
+        .alert(
+            "Delete this snapshot?",
+            isPresented: Binding(
+                get: { viewModel.pendingDeleteSnapshot != nil },
+                set: { presented in
+                    if !presented { viewModel.cancelPendingDelete() }
+                }
+            ),
+            presenting: viewModel.pendingDeleteSnapshot
+        ) { snapshot in
+            Button("Delete", role: .destructive) {
+                Task { await viewModel.confirmPendingDelete() }
+            }
+            Button("Cancel", role: .cancel) {
+                viewModel.cancelPendingDelete()
+            }
+        } message: { snapshot in
+            // Body lists what's being removed (snapshot metadata,
+            // file count, original size) and what's safe (blobs still
+            // referenced by other snapshots stay). Short on purpose —
+            // the alert is in the user's face, not a manual page.
+            Text(deleteAlertMessage(for: snapshot))
+        }
+        // Toast-style banner for the most recent delete. Auto-dismisses
+        // after a few seconds so it doesn't linger in the user's
+        // peripheral vision. The banner reads from `lastDeleteResult`,
+        // and tapping it (or the timer) clears that field.
+        .overlay(alignment: .bottom) {
+            if let result = viewModel.lastDeleteResult {
+                deleteResultBanner(result)
+                    .padding(.bottom, 12)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .task(id: result.snapshotID) {
+                        try? await Task.sleep(nanoseconds: 4_000_000_000)
+                        viewModel.clearLastDeleteResult()
+                    }
+            }
+        }
+    }
+
+    /// Format the body text shown inside the delete confirmation alert.
+    /// Lists provider + file count + size so the user knows the scale of
+    /// what they're nuking. The "blobs shared with other snapshots stay"
+    /// hint is important because otherwise users assume bytes equal to
+    /// `originalBytes` will be reclaimed, when in fact CAS dedup means
+    /// the actual reclaim might be much smaller.
+    private func deleteAlertMessage(for snapshot: RawExportSnapshotSummary) -> String {
+        let size = ByteCountFormatter.string(
+            fromByteCount: snapshot.originalBytes,
+            countStyle: .file
+        )
+        let provider = snapshot.provider == .unknown
+            ? snapshot.provider.rawValue
+            : snapshot.provider.rawValue.capitalized
+        return """
+            \(provider) snapshot · \(snapshot.fileCount) files · \(size)
+
+            Removes the snapshot's metadata, file rows, and any blobs that no other snapshot still references. Blobs shared with other snapshots are kept.
+            """
+    }
+
+    /// Bottom-anchored banner that appears briefly after a delete
+    /// completes. Reports the actually-reclaimed disk size (not the
+    /// snapshot's logical size) plus the GC blob count, since CAS dedup
+    /// often means the on-disk reclaim is smaller than users expect.
+    private func deleteResultBanner(_ result: RawExportVaultDeleteResult) -> some View {
+        let freed = ByteCountFormatter.string(
+            fromByteCount: result.bytesFreed,
+            countStyle: .file
+        )
+        let blobNoun = result.blobsGarbageCollected == 1 ? "blob" : "blobs"
+        return HStack(spacing: 8) {
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+            Text("Snapshot deleted · freed \(freed) · \(result.blobsGarbageCollected) \(blobNoun) GC'd")
+                .font(.callout)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(.regularMaterial, in: Capsule())
+        .overlay(Capsule().stroke(.quaternary))
+        .shadow(radius: 4, y: 2)
+        .onTapGesture { viewModel.clearLastDeleteResult() }
     }
 
     // MARK: - Drop folder header
@@ -110,36 +198,73 @@ struct ArchiveInspectorPane: View {
 
     @ViewBuilder
     private var timelineBody: some View {
-        // Deferred-write selection binding. Writing through `@Bindable`'s
-        // projection synchronously inside SwiftUI's update cycle
-        // triggered the same re-entrant @Observable cascade that blanked
-        // columns in the old Vault Browser (documented on
-        // `VaultBrowserView`). The `Task { @MainActor in ... }` hop
-        // moves the mutation to the next main-actor turn so the List's
-        // redraw and the per-snapshot reset don't race.
-        let snapshotSelection = Binding<Int64?>(
-            get: { viewModel.selectedSnapshotID },
-            set: { newValue in
-                Task { @MainActor in
-                    viewModel.selectedSnapshotID = newValue
-                }
-            }
-        )
-
         let items = viewModel.timeline
 
         if items.isEmpty && viewModel.snapshotsState == .loaded {
             emptyState
         } else {
-            List(selection: snapshotSelection) {
+            // Click handling via an explicit `Button` per snapshot row
+            // rather than `List(selection:)`. The native selection
+            // binding refused to register clicks here — same symptom and
+            // same workaround as `ArchiveInspectorFileListPane`. Earlier
+            // attempts (tag-type fixes, deferred-write bindings) all
+            // failed to make `List(selection:)` register clicks in this
+            // NavigationSplitView setup. A plain-style `Button` with an
+            // explicit write to `selectedSnapshotID` is bulletproof.
+            //
+            // The visual selection is painted via `.listRowBackground`
+            // so the selected row reads the same as a native List
+            // selection would (accent-tinted band) without relying on
+            // List's own selection machinery. Event rows are rendered
+            // as plain rows (no button) since they aren't selectable.
+            //
+            // Direct write to `selectedSnapshotID` from a Button action
+            // is safe — Button actions run outside SwiftUI's update
+            // cycle, so they don't trigger the re-entrant @Observable
+            // cascade that the old `didSet`-style selection plumbing hit.
+            List {
                 ForEach(items) { item in
-                    row(for: item)
-                        // Tag only snapshot rows with a selectable value.
-                        // Intake events are informational and shouldn't
-                        // move the right pane's file list — leaving them
-                        // without a tag keeps the List's selection from
-                        // binding to a meaningless id.
-                        .tag(tag(for: item))
+                    switch item {
+                    case .snapshot(let summary):
+                        Button {
+                            viewModel.selectedSnapshotID = summary.id
+                        } label: {
+                            // Stretch the label to fill the full row
+                            // width and make the entire rect hit-
+                            // testable, so clicks on the empty area
+                            // between the icon and the trailing edge of
+                            // the row register as a row click. Without
+                            // this the Button only responds where text /
+                            // icon is actually painted, which feels
+                            // broken on dense rows.
+                            ArchiveInspectorSnapshotRow(summary: summary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .listRowBackground(
+                            viewModel.selectedSnapshotID == summary.id
+                                ? Color.accentColor.opacity(0.18)
+                                : Color.clear
+                        )
+                        // Context menu (right-click) for destructive
+                        // ops. Kept off the main row chrome so a stray
+                        // left-click never deletes anything; the user
+                        // has to deliberately right-click and then
+                        // confirm an alert. The actual deletion runs
+                        // through the view model's pending-delete
+                        // pipeline so the alert wording can show file
+                        // count / size pulled from the staged summary.
+                        .contextMenu {
+                            Button(role: .destructive) {
+                                viewModel.requestDelete(snapshot: summary)
+                            } label: {
+                                Label("Delete snapshot…", systemImage: "trash")
+                            }
+                        }
+                    case .event(let event):
+                        ArchiveInspectorEventRow(event: event)
+                    }
                 }
                 if viewModel.hasMoreSnapshots {
                     loadMoreSnapshotsFooter
@@ -151,30 +276,6 @@ struct ArchiveInspectorPane: View {
                     errorBanner(message: message)
                 }
             }
-        }
-    }
-
-    /// Binds a timeline row to the `selectedSnapshotID` column only when
-    /// the row is a snapshot. Event rows get `nil` so the List knows
-    /// they're non-selectable. Using `Int64??` (double-optional) is
-    /// intentional: the outer optional is the tag value; the inner is
-    /// `selectedSnapshotID`'s own Optional.
-    private func tag(for item: ArchiveInspectorViewModel.TimelineItem) -> Int64?? {
-        switch item {
-        case .snapshot(let summary):
-            return .some(.some(summary.id))
-        case .event:
-            return nil
-        }
-    }
-
-    @ViewBuilder
-    private func row(for item: ArchiveInspectorViewModel.TimelineItem) -> some View {
-        switch item {
-        case .snapshot(let summary):
-            ArchiveInspectorSnapshotRow(summary: summary)
-        case .event(let event):
-            ArchiveInspectorEventRow(event: event)
         }
     }
 

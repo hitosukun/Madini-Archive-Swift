@@ -57,6 +57,14 @@ struct NoOpRawExportVault: RawExportVault {
             relativePath: relativePath
         )
     }
+
+    func deleteSnapshot(id: Int64) async throws -> RawExportVaultDeleteResult {
+        // The no-op vault holds no snapshots, so a delete request can only
+        // reference an unknown id. Match the read APIs' loud-failure stance
+        // (rather than silently returning a zero-result struct) so a caller
+        // who reaches the no-op path by mistake hears about it.
+        throw RawExportVaultError.snapshotNotFound(snapshotID: id)
+    }
 }
 
 struct NoOpRawAssetResolver: RawAssetResolver {

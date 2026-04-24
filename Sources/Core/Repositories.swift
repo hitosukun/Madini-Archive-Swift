@@ -580,6 +580,24 @@ struct RawExportVaultResult: Hashable, Sendable {
     let wasDuplicate: Bool
 }
 
+/// Summary of a `deleteSnapshot` call. Reports the metadata rows that went
+/// away plus the actually-orphaned blobs that were garbage-collected from
+/// disk. `bytesFreed` is the on-disk (compressed) size of the GC'd blobs —
+/// useful for "freed N MB" UI feedback.
+struct RawExportVaultDeleteResult: Hashable, Sendable {
+    let snapshotID: Int64
+    /// Number of `raw_export_files` rows removed.
+    let filesRemoved: Int
+    /// Number of blobs whose last reference was this snapshot, and which
+    /// were deleted from both the blobs table and the on-disk store.
+    let blobsGarbageCollected: Int
+    /// On-disk bytes reclaimed by the blob GC. Excludes metadata rows
+    /// (which are tiny) and the SQLite page-level overhead — i.e., this
+    /// is the number `du blobs/` will go down by, not the number
+    /// `du archive.db` will.
+    let bytesFreed: Int64
+}
+
 struct RawExportSnapshotSummary: Identifiable, Hashable, Sendable {
     let id: Int64
     let provider: RawExportProvider
@@ -775,6 +793,23 @@ protocol RawExportVault: Sendable {
         snapshotID: Int64,
         relativePath: String
     ) async throws -> RawExportFilePayload
+
+    // MARK: Delete
+
+    /// Remove a snapshot, its file/asset/search-index rows, and any blobs
+    /// that the snapshot was the *only* referrer of. Blobs still
+    /// referenced by other snapshots are left alone — that's the point of
+    /// content-addressed storage. The on-disk blob files are removed too,
+    /// not just the rows.
+    ///
+    /// Throws `RawExportVaultError.snapshotNotFound` if the id is unknown.
+    /// The DB mutation runs in a single transaction; filesystem cleanup
+    /// runs after the transaction commits, on a best-effort basis (a
+    /// failed `removeItem` on one orphan blob doesn't fail the whole
+    /// call). Returns counts so the caller can tell the user how much
+    /// space was reclaimed.
+    @discardableResult
+    func deleteSnapshot(id: Int64) async throws -> RawExportVaultDeleteResult
 }
 
 protocol RawAssetResolver: Sendable {

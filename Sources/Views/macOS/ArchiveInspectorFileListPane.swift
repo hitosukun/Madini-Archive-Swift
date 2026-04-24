@@ -99,7 +99,18 @@ struct ArchiveInspectorFileListPane: View {
                 Button {
                     viewModel.selectedFileID = entry.id
                 } label: {
+                    // `.frame(maxWidth: .infinity, alignment: .leading)`
+                    // stretches the label to fill the full row width so
+                    // the hit area covers the trailing whitespace, not
+                    // just the text + icon. `.contentShape(Rectangle())`
+                    // then makes that whole rect respond to clicks —
+                    // without it, the Spacer area in the row is
+                    // technically empty and SwiftUI's hit-testing skips
+                    // over it. Together they give a Mail.app-style
+                    // "click anywhere on the row" feel.
                     ArchiveInspectorFileRow(entry: entry)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .listRowBackground(

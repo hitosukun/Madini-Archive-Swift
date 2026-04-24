@@ -137,6 +137,19 @@ final class ArchiveInspectorViewModel {
         return files.first(where: { $0.id == id })
     }
 
+    // MARK: Delete confirmation state
+
+    /// The snapshot the user has clicked "Delete…" on but not yet
+    /// confirmed. The view watches this to drive an `.alert(...)`. We
+    /// keep the full summary (rather than just the id) so the
+    /// confirmation dialog can show provider / file count / size without
+    /// re-fetching from the DB after the row is gone from the timeline.
+    var pendingDeleteSnapshot: RawExportSnapshotSummary?
+
+    /// Last-completed delete result. The view shows it briefly as a
+    /// toast-style banner ("Freed N MB"), then it's cleared.
+    var lastDeleteResult: RawExportVaultDeleteResult?
+
     // MARK: Intake activity
 
     /// Observable handle to the rolling intake log. `nil` in mock mode —
@@ -260,6 +273,55 @@ final class ArchiveInspectorViewModel {
             guard selectedSnapshotID == pinnedSelection else { return }
             filesState = .failed(message: Self.message(for: error))
         }
+    }
+
+    // MARK: - Delete
+
+    /// Stage a snapshot for deletion. The view's confirmation alert
+    /// triggers on `pendingDeleteSnapshot`; this is just the "user clicked
+    /// Delete…" entry point. Actual deletion happens in
+    /// `confirmPendingDelete()` after the user accepts the alert.
+    func requestDelete(snapshot: RawExportSnapshotSummary) {
+        pendingDeleteSnapshot = snapshot
+    }
+
+    /// Cancel a staged delete (user clicked Cancel in the alert).
+    func cancelPendingDelete() {
+        pendingDeleteSnapshot = nil
+    }
+
+    /// Run the actual deletion, scrub local state, and reload the
+    /// snapshot list so anything pushed in between is reflected. The
+    /// reload is the cheapest way to keep `snapshots`, `hasMoreSnapshots`,
+    /// and `snapshotsOffset` in sync without trying to surgically remove
+    /// the row in two places.
+    ///
+    /// On success, sets `lastDeleteResult` so the view can flash the
+    /// "Freed X MB" banner. On failure, surfaces a `.failed` state on
+    /// `snapshotsState` with a localized message.
+    func confirmPendingDelete() async {
+        guard let pending = pendingDeleteSnapshot else { return }
+        pendingDeleteSnapshot = nil
+        do {
+            let result = try await vault.deleteSnapshot(id: pending.id)
+            // If the deleted snapshot was selected, clear the right pane
+            // before reloading so the file list / preview don't briefly
+            // render against a now-gone snapshot id.
+            if selectedSnapshotID == pending.id {
+                selectedSnapshotID = nil
+                handleSnapshotSelectionChanged()
+            }
+            lastDeleteResult = result
+            await reloadSnapshots()
+        } catch {
+            snapshotsState = .failed(message: Self.message(for: error))
+        }
+    }
+
+    /// Clear the "Freed X MB" banner. Called by the view after the toast
+    /// timer expires or the user dismisses it.
+    func clearLastDeleteResult() {
+        lastDeleteResult = nil
     }
 
     // MARK: - Helpers

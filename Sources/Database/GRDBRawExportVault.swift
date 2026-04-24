@@ -606,6 +606,139 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
         return RawExportFilePayload(entry: entry, data: data)
     }
 
+    // MARK: - Delete API
+
+    /// One blob whose last reference is the snapshot being deleted, so it
+    /// becomes orphan and is eligible for filesystem GC.
+    private struct OrphanBlob {
+        let hash: String
+        let storedPath: String
+        let storedBytes: Int64
+    }
+
+    @discardableResult
+    func deleteSnapshot(id: Int64) async throws -> RawExportVaultDeleteResult {
+        // Step 1 (read-only): Verify the snapshot exists, capture which blobs
+        // are referenced ONLY by this snapshot (those become orphan after
+        // deletion), and grab the manifest path so we can clean its directory
+        // up afterward. Done in a separate read tx so the write tx below can
+        // use the GC list without re-querying.
+        let prefetch: (orphans: [OrphanBlob], manifestPath: String?, fileCount: Int) =
+            try await GRDBAsync.read(from: dbQueue) { db in
+                guard try Self.snapshotExists(snapshotID: id, in: db) else {
+                    throw RawExportVaultError.snapshotNotFound(snapshotID: id)
+                }
+                // Blobs referenced by this snapshot AND by no other snapshot.
+                // The double-NOT-IN keeps this index-friendly: the inner query
+                // hits idx_raw_export_files_blob, the outer scans only files
+                // belonging to the target snapshot.
+                let orphanRows = try Row.fetchAll(
+                    db,
+                    sql: """
+                        SELECT b.hash, b.stored_path, b.stored_size_bytes
+                        FROM raw_export_blobs b
+                        WHERE b.hash IN (
+                            SELECT DISTINCT blob_hash FROM raw_export_files WHERE snapshot_id = ?
+                        )
+                        AND b.hash NOT IN (
+                            SELECT DISTINCT blob_hash FROM raw_export_files WHERE snapshot_id != ?
+                        )
+                        """,
+                    arguments: [id, id]
+                )
+                let orphans: [OrphanBlob] = orphanRows.map { row in
+                    OrphanBlob(
+                        hash: row["hash"],
+                        storedPath: row["stored_path"] ?? "",
+                        storedBytes: row["stored_size_bytes"] ?? 0
+                    )
+                }
+                let fileCount = try Int.fetchOne(
+                    db,
+                    sql: "SELECT COUNT(*) FROM raw_export_files WHERE snapshot_id = ?",
+                    arguments: [id]
+                ) ?? 0
+                let manifestPath = try String.fetchOne(
+                    db,
+                    sql: "SELECT manifest_path FROM raw_export_snapshots WHERE id = ?",
+                    arguments: [id]
+                )
+                return (orphans, manifestPath, fileCount)
+            }
+
+        // Step 2 (write tx): Delete metadata rows. Children are deleted
+        // explicitly rather than relying on `ON DELETE CASCADE` because we
+        // can't assume `PRAGMA foreign_keys = ON` is set on this connection
+        // (GRDB doesn't enforce it by default), and `raw_export_search_idx`
+        // is a virtual FTS5 table that has no FK in the first place.
+        // `conversation_raw_refs` belongs to the normalize layer (not
+        // installed by this file's `installSchema`); it may not exist in
+        // every database, hence the `try?`.
+        try await GRDBAsync.write(to: dbQueue) { db in
+            try db.execute(
+                sql: "DELETE FROM raw_export_search_idx WHERE snapshot_id = ?",
+                arguments: [id]
+            )
+            try db.execute(
+                sql: "DELETE FROM raw_export_files WHERE snapshot_id = ?",
+                arguments: [id]
+            )
+            try db.execute(
+                sql: "DELETE FROM raw_export_asset_links WHERE snapshot_id = ?",
+                arguments: [id]
+            )
+            try? db.execute(
+                sql: "DELETE FROM conversation_raw_refs WHERE snapshot_id = ?",
+                arguments: [id]
+            )
+            try db.execute(
+                sql: "DELETE FROM raw_export_snapshots WHERE id = ?",
+                arguments: [id]
+            )
+            for orphan in prefetch.orphans {
+                try db.execute(
+                    sql: "DELETE FROM raw_export_blobs WHERE hash = ?",
+                    arguments: [orphan.hash]
+                )
+            }
+        }
+
+        // Step 3 (filesystem): Remove orphan blob files and the snapshot's
+        // manifest directory. Best-effort — a missing or already-deleted file
+        // shouldn't fail the whole operation. We sum bytes only for files we
+        // actually removed, so the reported `bytesFreed` matches what the
+        // user will see in `du`.
+        var bytesFreed: Int64 = 0
+        var blobsRemoved = 0
+        for orphan in prefetch.orphans {
+            guard !orphan.storedPath.isEmpty else { continue }
+            let url = URL(fileURLWithPath: orphan.storedPath)
+            if fileManager.fileExists(atPath: url.path) {
+                do {
+                    try fileManager.removeItem(at: url)
+                    bytesFreed += orphan.storedBytes
+                    blobsRemoved += 1
+                } catch {
+                    // Swallow — the row is already gone, so leaving the file
+                    // behind is at most a small disk leak that a future
+                    // sweep can catch. Surfacing this would block deletion
+                    // for a transient FS hiccup, which the user can't act on.
+                }
+            }
+        }
+        if let manifestPath = prefetch.manifestPath, !manifestPath.isEmpty {
+            let manifestDir = URL(fileURLWithPath: manifestPath).deletingLastPathComponent()
+            try? fileManager.removeItem(at: manifestDir)
+        }
+
+        return RawExportVaultDeleteResult(
+            snapshotID: id,
+            filesRemoved: prefetch.fileCount,
+            blobsGarbageCollected: blobsRemoved,
+            bytesFreed: bytesFreed
+        )
+    }
+
     // MARK: - Restore helpers
 
     private struct BlobRecord {
@@ -1189,10 +1322,21 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
     /// column. Reads each snapshot's file list (provider + sorted
     /// relative_path/blob_hash tuples), computes the stable digest, and
     /// writes it back. Runs only on rows where `content_hash` is still empty
-    /// — once filled, the row is skipped on subsequent boots. If two legacy
-    /// snapshots collapse to the same hash, keep only the oldest and leave
-    /// the rest with an empty hash (unique index tolerates that); a future
-    /// GC pass can prune them.
+    /// — once filled, the row is skipped on subsequent boots.
+    ///
+    /// When two legacy snapshots collapse to the same hash, the older one
+    /// (lowest `id`) is kept and the newer duplicates are **deleted
+    /// outright** along with their `raw_export_files` / `raw_export_search_idx`
+    /// / `raw_export_asset_links` / `conversation_raw_refs` rows. Earlier
+    /// versions of this method left duplicates with an empty `content_hash`
+    /// for "a future GC pass to prune"; that pass is now this code.
+    ///
+    /// No blob GC is needed here — by definition a duplicate snapshot
+    /// references the same `blob_hash` set as the kept one, so every blob
+    /// still has a referrer after the duplicate row goes away. (Plan A's
+    /// `deleteSnapshot` is the right tool when the snapshot has unique
+    /// blobs; this fast path is safe specifically because content_hash
+    /// equality guarantees blob-set equality.)
     private static func backfillContentHashes(in db: Database) throws {
         let pendingRows = try Row.fetchAll(
             db,
@@ -1233,8 +1377,32 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
             let pairs: [(String, String)] = fileRows.map { ($0["relative_path"], $0["blob_hash"]) }
             let contentHash = Self.computeContentHash(provider: provider, files: pairs)
             if seenHashes.contains(contentHash) {
-                // Duplicate among legacy rows — leave empty so the unique
-                // index (partial, excludes '') accepts it.
+                // Duplicate of a kept snapshot (either pre-backfilled with
+                // a non-empty content_hash, or an earlier iteration of this
+                // loop). Drop the metadata rows; blobs are still safe
+                // because the kept snapshot references the same hashes.
+                try db.execute(
+                    sql: "DELETE FROM raw_export_search_idx WHERE snapshot_id = ?",
+                    arguments: [snapshotID]
+                )
+                try db.execute(
+                    sql: "DELETE FROM raw_export_files WHERE snapshot_id = ?",
+                    arguments: [snapshotID]
+                )
+                try db.execute(
+                    sql: "DELETE FROM raw_export_asset_links WHERE snapshot_id = ?",
+                    arguments: [snapshotID]
+                )
+                // `conversation_raw_refs` lives in the normalize layer; on
+                // databases that don't carry that table, this is a no-op.
+                try? db.execute(
+                    sql: "DELETE FROM conversation_raw_refs WHERE snapshot_id = ?",
+                    arguments: [snapshotID]
+                )
+                try db.execute(
+                    sql: "DELETE FROM raw_export_snapshots WHERE id = ?",
+                    arguments: [snapshotID]
+                )
                 continue
             }
             seenHashes.insert(contentHash)
