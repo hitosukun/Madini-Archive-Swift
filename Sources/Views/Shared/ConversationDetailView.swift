@@ -1,6 +1,8 @@
 import SwiftUI
 #if os(macOS)
 import AppKit
+#elseif canImport(UIKit)
+import UIKit
 #endif
 
 struct ConversationDetailView: View {
@@ -1177,49 +1179,45 @@ private struct DetailExportToolbar: ToolbarContent {
     }
 }
 
-/// Toolbar share button that materializes the conversation as a Markdown
-/// file in the temp directory and hands the URL to `ShareLink`. Using a
-/// file URL (instead of a raw String) lets AppKit/UIKit present the full
-/// `NSSharingServicePicker` menu — AirDrop, Mail, Messages, Notes, Save
-/// to Files / Finder, Copy, and any third-party share extensions the
-/// user has installed — matching the Finder / Safari share affordance.
+/// Toolbar share control. Presents a `Menu` with three export paths —
+/// Markdown share, LLM-friendly plain-text share, and a clipboard
+/// shortcut — all driven by the shared `conversationShareMenuItems`
+/// builder so the reader-detail, Viewer-Mode, and Design Mock
+/// toolbars offer the same set of options.
 ///
-/// The file is regenerated whenever the bound conversation changes
-/// (`.task(id: detail.summary.id)`) so stale content is never shared.
-/// We write under a per-conversation subdirectory keyed by ID, keeping
-/// the filename readable (title-based) so share-sheet previews and any
-/// destination that keeps the filename (Files.app, Finder drop) show a
-/// human-meaningful name rather than a UUID.
+/// Each `ShareLink` inside the menu hands a file URL (under
+/// `<tmp>/madini-share/<conversation-id>/`) to the native share
+/// sheet — AirDrop, Mail, Messages, Notes, Save to Files / Finder,
+/// Copy, and any third-party share extensions. Using file URLs
+/// (instead of raw strings) is what unlocks the full
+/// `NSSharingServicePicker` menu on macOS / `UIActivityViewController`
+/// on iOS, and also gives each destination a title-based filename.
+///
+/// Both export files are regenerated whenever the bound conversation
+/// changes (`.task(id: detail.summary.id)`) so stale content is
+/// never shared.
 private struct ConversationShareButton: View {
     let detail: ConversationDetail
 
-    @State private var shareURL: URL?
+    @State private var markdownURL: URL?
+    @State private var plainTextURL: URL?
 
     var body: some View {
-        Group {
-            if let shareURL {
-                ShareLink(
-                    item: shareURL,
-                    preview: SharePreview(
-                        detail.summary.title ?? "Conversation",
-                        image: Image(systemName: "doc.text")
-                    )
-                ) {
-                    Image(systemName: "square.and.arrow.up")
-                }
-                .help("Share conversation")
-            } else {
-                // Placeholder keeps toolbar layout stable while the
-                // markdown file is being written on first appearance.
-                Button {} label: {
-                    Image(systemName: "square.and.arrow.up")
-                }
-                .disabled(true)
-                .help("Preparing…")
-            }
+        Menu {
+            conversationShareMenuItems(
+                detail: detail,
+                markdownURL: markdownURL,
+                plainTextURL: plainTextURL
+            )
+        } label: {
+            Image(systemName: "square.and.arrow.up")
         }
+        .menuIndicator(.hidden)
+        .help("Share conversation")
         .task(id: detail.summary.id) {
-            shareURL = await MarkdownExporter.writeTempShareFile(for: detail)
+            let urls = await prepareConversationShareURLs(for: detail)
+            markdownURL = urls.markdown
+            plainTextURL = urls.plainText
         }
     }
 }
@@ -1287,4 +1285,238 @@ enum MarkdownExporter {
         let cleaned = name.components(separatedBy: illegal).joined(separator: "_")
         return cleaned.isEmpty ? "conversation" : cleaned
     }
+
+    /// Shared with the LLM-oriented plain-text exporter so the two
+    /// share paths produce identically-named sibling files inside the
+    /// per-conversation temp directory.
+    fileprivate static func shareTempDirectory(for detail: ConversationDetail) -> URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("madini-share", isDirectory: true)
+            .appendingPathComponent(detail.summary.id, isDirectory: true)
+    }
+
+    fileprivate static func sanitizedBaseName(for detail: ConversationDetail) -> String {
+        sanitizeShareFilename(detail.summary.title ?? "conversation")
+    }
+}
+
+/// LLM-oriented plain-text export.
+///
+/// The markdown exporter is optimized for humans reading the file in
+/// Notes / Mail — it uses `###` headings and `**bold**` for role
+/// labels. That decoration gets in the way when the file is pasted
+/// into an LLM prompt: some models re-interpret the `**` emphasis or
+/// blend the role label into the user's actual message content.
+///
+/// This exporter strips those conventions and produces a format tuned
+/// for pasting into a ChatGPT/Claude/etc. chat box:
+///
+/// ```
+/// Title: ...
+/// Source: ChatGPT | Model: gpt-5 | Date: 2026-01-15
+///
+/// ===== User =====
+///
+/// <message body, verbatim>
+///
+/// ===== Assistant =====
+///
+/// <message body, verbatim>
+/// ```
+///
+/// Rules:
+///   * Role delimiter is a distinctive `===== Role =====` line with
+///     blank lines on both sides. Easy for a model to recognize as a
+///     turn boundary without eating the surrounding content.
+///   * Message bodies are left completely untouched — in particular
+///     fenced code blocks (``` ... ```) stay intact, so the LLM still
+///     sees the original syntactic structure.
+///   * No leading/trailing role-label decoration characters (`#`,
+///     `**`, etc.) — the model reads the label as plain English.
+///
+/// This is used both by the `.txt`-file share option and by the
+/// "Copy as LLM Prompt" menu item (`LLMPromptClipboard`), which
+/// re-uses `export(_:)` to fill the pasteboard.
+enum PlainTextExporter {
+    static func export(_ detail: ConversationDetail) -> String {
+        var lines: [String] = []
+
+        if let title = detail.summary.title {
+            lines.append("Title: \(title)")
+        }
+
+        var metadata: [String] = []
+        if let source = detail.summary.source {
+            metadata.append("Source: \(source)")
+        }
+        if let model = detail.summary.model {
+            metadata.append("Model: \(model)")
+        }
+        if let time = detail.summary.primaryTime {
+            metadata.append("Date: \(time)")
+        }
+        if !metadata.isEmpty {
+            lines.append(metadata.joined(separator: " | "))
+        }
+
+        // Separator between the header block and the first message.
+        // `joined(separator: "\n")` at the end collapses adjacent
+        // empty strings into the blank lines we want.
+        if !lines.isEmpty {
+            lines.append("")
+        }
+
+        for message in detail.messages {
+            let roleLabel = message.isUser
+                ? "User"
+                : message.role.rawValue.capitalized
+            lines.append("===== \(roleLabel) =====")
+            lines.append("")
+            lines.append(message.content)
+            lines.append("")
+        }
+
+        // Trim trailing blank line so there's no dangling newline at
+        // end-of-file — cleaner paste target.
+        while lines.last == "" {
+            lines.removeLast()
+        }
+
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    /// Sibling to `MarkdownExporter.writeTempShareFile(for:)`. Writes
+    /// the LLM-oriented plain-text form under the same per-
+    /// conversation temp directory with a `.txt` extension so the
+    /// share sheet's file picker shows a sensible filename.
+    static func writeTempShareFile(for detail: ConversationDetail) async -> URL? {
+        let text = export(detail)
+        let base = MarkdownExporter.shareTempDirectory(for: detail)
+        let filename = MarkdownExporter.sanitizedBaseName(for: detail) + ".txt"
+        let url = base.appendingPathComponent(filename)
+        do {
+            try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+            try text.write(to: url, atomically: true, encoding: .utf8)
+            return url
+        } catch {
+            return nil
+        }
+    }
+}
+
+/// Puts the LLM-oriented plain-text form of a conversation on the
+/// system clipboard so the user can paste it straight into a chat
+/// box without a file-sharing round-trip.
+///
+/// Kept as its own namespace (rather than a method on
+/// `PlainTextExporter`) because the platform pasteboard APIs differ
+/// between macOS (`NSPasteboard`) and iOS (`UIPasteboard`) and we
+/// don't want the exporter — which is pure, testable string work —
+/// to carry a UIKit/AppKit dependency.
+enum LLMPromptClipboard {
+    @MainActor
+    static func copy(_ detail: ConversationDetail) {
+        let text = PlainTextExporter.export(detail)
+        #if os(macOS)
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+        #elseif canImport(UIKit)
+        UIPasteboard.general.string = text
+        #endif
+    }
+}
+
+/// Menu contents shared by every toolbar "share" button in the app
+/// (reader detail, Viewer-Mode floating chip, Design Mock top
+/// toolbar). Centralising it here guarantees the three share
+/// affordances offer an identical set of export formats and identical
+/// labels — the previous per-site implementations had already drifted
+/// in subtle ways (different help text, different preview icons).
+///
+/// Each caller owns its own `@State` for the two temp-file URLs and
+/// writes them in a `.task(id:)` via
+/// `prepareConversationShareURLs(for:)`, then hands them and the
+/// `ConversationDetail` to this builder. The builder renders:
+///
+///   1. `ShareLink` for the Markdown export (human-friendly, retains
+///      `###` role headings and metadata block).
+///   2. `ShareLink` for the plain-text export (LLM-friendly; see
+///      `PlainTextExporter` docs).
+///   3. A `Button` that copies the plain-text form to the clipboard
+///      — for the common case of pasting straight into a chat box.
+///
+/// Each `ShareLink` gracefully degrades to a disabled placeholder
+/// while its temp file is being written, keeping the menu present
+/// (so the surrounding button layout doesn't jump) but preventing a
+/// click on an incomplete export.
+@ViewBuilder
+func conversationShareMenuItems(
+    detail: ConversationDetail?,
+    markdownURL: URL?,
+    plainTextURL: URL?
+) -> some View {
+    if let detail {
+        let previewTitle = detail.summary.title ?? "Conversation"
+        if let markdownURL {
+            ShareLink(
+                item: markdownURL,
+                preview: SharePreview(
+                    previewTitle,
+                    image: Image(systemName: "doc.text")
+                )
+            ) {
+                Label("Markdown (.md) として共有…", systemImage: "doc.text")
+            }
+        } else {
+            Button {} label: {
+                Label("Markdown を書き出し中…", systemImage: "doc.text")
+            }
+            .disabled(true)
+        }
+        if let plainTextURL {
+            ShareLink(
+                item: plainTextURL,
+                preview: SharePreview(
+                    previewTitle,
+                    image: Image(systemName: "text.alignleft")
+                )
+            ) {
+                Label("プレーンテキスト (.txt) として共有… — LLM 向け",
+                      systemImage: "text.alignleft")
+            }
+        } else {
+            Button {} label: {
+                Label("プレーンテキストを書き出し中…", systemImage: "text.alignleft")
+            }
+            .disabled(true)
+        }
+        Divider()
+        Button {
+            LLMPromptClipboard.copy(detail)
+        } label: {
+            Label("LLM プロンプトとしてコピー",
+                  systemImage: "doc.on.clipboard")
+        }
+    } else {
+        // No conversation selected — show a single disabled row so
+        // the menu isn't empty when the user opens it by accident.
+        Button {} label: {
+            Label("会話が選択されていません", systemImage: "square.and.arrow.up")
+        }
+        .disabled(true)
+    }
+}
+
+/// Kick off markdown and plain-text exports in parallel for the given
+/// conversation and return both URLs. Used by every site that hosts
+/// the share menu — each one calls this inside a `.task(id:)` keyed
+/// on the conversation id so the exports re-run whenever the
+/// selection changes.
+func prepareConversationShareURLs(
+    for detail: ConversationDetail
+) async -> (markdown: URL?, plainText: URL?) {
+    async let markdown = MarkdownExporter.writeTempShareFile(for: detail)
+    async let plainText = PlainTextExporter.writeTempShareFile(for: detail)
+    return await (markdown, plainText)
 }

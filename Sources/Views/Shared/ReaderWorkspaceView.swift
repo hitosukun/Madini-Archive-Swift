@@ -618,40 +618,32 @@ private struct PromptOutlineRow: View {
 struct WorkspaceFloatingExportButton: View {
     let detail: ConversationDetail?
 
-    @State private var shareURL: URL?
+    @State private var markdownURL: URL?
+    @State private var plainTextURL: URL?
 
     var body: some View {
-        Group {
-            if let detail, let shareURL {
-                ShareLink(
-                    item: shareURL,
-                    preview: SharePreview(
-                        detail.summary.title ?? "Conversation",
-                        image: Image(systemName: "doc.text")
-                    )
-                ) {
-                    chipLabel
-                }
-                .help("Share conversation")
-            } else {
-                // Disabled-looking placeholder while the markdown temp
-                // file is being written, or when there's no conversation
-                // loaded. Same geometry as the live button so the
-                // toolbar doesn't jump on first render.
-                Button {} label: {
-                    chipLabel
-                }
-                .disabled(true)
-                .opacity(detail == nil ? 0.4 : 0.6)
-                .help(detail == nil ? "Export as Markdown" : "Preparing…")
-            }
+        Menu {
+            conversationShareMenuItems(
+                detail: detail,
+                markdownURL: markdownURL,
+                plainTextURL: plainTextURL
+            )
+        } label: {
+            chipLabel
         }
+        .menuIndicator(.hidden)
+        .disabled(detail == nil)
+        .opacity(detail == nil ? 0.4 : 1.0)
+        .help(detail == nil ? "Share conversation" : "Share conversation")
         .task(id: detail?.summary.id) {
             guard let detail else {
-                shareURL = nil
+                markdownURL = nil
+                plainTextURL = nil
                 return
             }
-            shareURL = await MarkdownExporter.writeTempShareFile(for: detail)
+            let urls = await prepareConversationShareURLs(for: detail)
+            markdownURL = urls.markdown
+            plainTextURL = urls.plainText
         }
     }
 

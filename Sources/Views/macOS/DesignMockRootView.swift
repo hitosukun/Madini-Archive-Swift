@@ -3782,78 +3782,75 @@ private enum DesignMockToolbarMetrics {
 private struct DesignMockShareButton: View {
     let conversation: DesignMockConversation?
     let services: AppServices
-    /// Rendered share URL. Nil while the markdown export is being
-    /// written, or when no conversation is selected. `ShareLink`
-    /// appears only when non-nil; the disabled placeholder keeps the
-    /// toolbar row stable on first mount.
-    @State private var shareURL: URL?
-    /// Guard against a stale fetch overwriting `shareURL` when the user
-    /// switches conversations mid-export. Compared at write time —
-    /// if the id changed while the async chain was in flight, the
-    /// result is discarded.
+    /// Fetched `ConversationDetail` for the current selection. Drives
+    /// the share menu — the two temp-file URLs below and the
+    /// "Copy as LLM Prompt" item all need the full detail, so we
+    /// fetch it once and retain it until the selection changes.
+    @State private var detail: ConversationDetail?
+    /// Rendered export URLs. Nil while the files are being written,
+    /// or when no conversation is selected. Each `ShareLink` inside
+    /// the menu gates itself on its own URL being non-nil, so the
+    /// menu stays open and partially populated during the gap.
+    @State private var markdownURL: URL?
+    @State private var plainTextURL: URL?
+    /// Guard against stale fetches overwriting the state when the user
+    /// switches conversations mid-export. Compared at write time — if
+    /// the id changed while the async chain was in flight, the result
+    /// is discarded.
     @State private var pendingExportID: String?
 
     var body: some View {
-        Group {
-            if let shareURL, let conversation {
-                ShareLink(
-                    item: shareURL,
-                    preview: SharePreview(
-                        conversation.title,
-                        image: Image(systemName: "doc.text")
-                    )
-                ) {
-                    Image(systemName: "square.and.arrow.up")
-                        .font(DesignMockToolbarMetrics.iconFont)
-                        .foregroundStyle(.primary)
-                }
-                .help("Share selected conversation")
-            } else {
-                // Placeholder keeps the toolbar column width stable
-                // while the markdown file is being written (first
-                // mount, or after switching to a different thread).
-                // Disabled so clicks don't accidentally open a stale
-                // picker.
-                Button {} label: {
-                    Image(systemName: "square.and.arrow.up")
-                        .font(DesignMockToolbarMetrics.iconFont)
-                        .foregroundStyle(.primary)
-                }
-                .disabled(true)
-                .help(conversation == nil ? "No conversation selected" : "Preparing share…")
-            }
+        Menu {
+            conversationShareMenuItems(
+                detail: detail,
+                markdownURL: markdownURL,
+                plainTextURL: plainTextURL
+            )
+        } label: {
+            Image(systemName: "square.and.arrow.up")
+                .font(DesignMockToolbarMetrics.iconFont)
+                .foregroundStyle(.primary)
         }
+        .menuIndicator(.hidden)
+        .disabled(conversation == nil)
+        .help(conversation == nil ? "No conversation selected" : "Share selected conversation")
         // Re-export whenever the selected thread changes. Keying on
         // the conversation id (or nil) means switching between
         // conversations triggers a fresh export; switching layout
         // modes without changing the selection reuses the current
-        // file. `nil` identity cleanly resets the URL so the
-        // placeholder returns when the user deselects everything.
+        // files. `nil` identity cleanly resets all state so the
+        // disabled menu returns when the user deselects everything.
         .task(id: conversation?.id) {
-            await refreshShareURL(for: conversation)
+            await refreshShareState(for: conversation)
         }
     }
 
-    private func refreshShareURL(for conversation: DesignMockConversation?) async {
+    private func refreshShareState(for conversation: DesignMockConversation?) async {
         guard let conversation else {
-            shareURL = nil
+            detail = nil
+            markdownURL = nil
+            plainTextURL = nil
             pendingExportID = nil
             return
         }
         pendingExportID = conversation.id
-        shareURL = nil
+        detail = nil
+        markdownURL = nil
+        plainTextURL = nil
         do {
-            guard let detail = try await services.conversations
+            guard let fetched = try await services.conversations
                 .fetchDetail(id: conversation.id) else {
                 return
             }
-            // Bail if the user has since moved on to another thread —
-            // writing the file would be wasted work, and assigning
-            // `shareURL` would briefly flash a stale file's preview.
+            // Bail if the user has since moved on to another thread.
+            // Writing the files would be wasted work, and surfacing
+            // them in the menu would briefly show a stale export.
             guard pendingExportID == conversation.id else { return }
-            let url = await MarkdownExporter.writeTempShareFile(for: detail)
+            detail = fetched
+            let urls = await prepareConversationShareURLs(for: fetched)
             guard pendingExportID == conversation.id else { return }
-            shareURL = url
+            markdownURL = urls.markdown
+            plainTextURL = urls.plainText
         } catch {
             // Silent — the disabled placeholder is an acceptable
             // fallback, and a real failure is rare enough (temp dir
