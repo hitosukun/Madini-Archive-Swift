@@ -105,6 +105,18 @@ struct ShellCommandActions {
     /// model's supporting state. Bound to ⌘R (matches the universal
     /// "refresh" shortcut across Safari / Mail / Finder).
     let reloadLibrary: () -> Void
+    /// Move the shell's conversation selection forward by one row in the
+    /// currently-loaded list. Nil when the list is empty (SwiftUI greys
+    /// out the menu item). Wired through the shell rather than through
+    /// `LibraryViewModel.selectNext` because the middle pane reads the
+    /// shell's `selectedConversationIDs`, not the VM's
+    /// `selectedConversationId` — the two were never bridged, so the
+    /// previous "route through the VM" approach silently moved an
+    /// invisible cursor.
+    let selectNextConversation: (() -> Void)?
+    /// Symmetric predecessor of `selectNextConversation`. Same rationale
+    /// applies — the shell owns the visible selection.
+    let selectPreviousConversation: (() -> Void)?
     /// Open the intake drop folder in Finder. Works whether the user is
     /// using the default location or has pointed the app at a custom
     /// folder via the Archive Inspector's header buttons.
@@ -192,17 +204,32 @@ struct AppCommands: Commands {
         // was getting misused as a catch-all. Mirrors how Mail keeps
         // "Message" as its own top-level menu.
         CommandMenu("Library") {
+            // Route through the shell (not through LibraryViewModel /
+            // BrowseViewModel) because only the shell owns the
+            // user-visible selection state. The legacy BrowseViewModel
+            // path stays as a fallback for the iOS-ish `MacOSRootView`
+            // code path, but on the shipping macOS shell the
+            // `shell?.selectNextConversation` branch is the one that
+            // actually moves the middle pane.
             Button("Next Conversation") {
-                libraryViewModel?.selectNext() ?? browseViewModel?.selectNext()
+                if let move = shell?.selectNextConversation {
+                    move()
+                } else {
+                    browseViewModel?.selectNext()
+                }
             }
             .keyboardShortcut(.downArrow, modifiers: .command)
-            .disabled(libraryViewModel == nil && browseViewModel == nil)
+            .disabled(shell?.selectNextConversation == nil && browseViewModel == nil)
 
             Button("Previous Conversation") {
-                libraryViewModel?.selectPrevious() ?? browseViewModel?.selectPrevious()
+                if let move = shell?.selectPreviousConversation {
+                    move()
+                } else {
+                    browseViewModel?.selectPrevious()
+                }
             }
             .keyboardShortcut(.upArrow, modifiers: .command)
-            .disabled(libraryViewModel == nil && browseViewModel == nil)
+            .disabled(shell?.selectPreviousConversation == nil && browseViewModel == nil)
 
             Divider()
 

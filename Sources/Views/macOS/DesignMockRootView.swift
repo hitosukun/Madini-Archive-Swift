@@ -913,11 +913,45 @@ struct DesignMockRootView: View {
         // SwiftUI View value-type snapshot, can be stale by the time
         // a menu click fires).
         let layoutBinding = $selectedLayoutMode
+        let selectionBinding = $selectedConversationIDs
         let capturedServices = services
         let capturedStore = store
         let capturedLibraryVM = libraryViewModel
         let capturedArchiveVM = archiveInspectorVM
         let archiveFocused = showingArchiveInspector
+        let currentSelection = selectedConversationIDs
+        let visibleConversations = store.conversations
+
+        // Next / Previous Conversation closures. Nil when the list is
+        // empty — SwiftUI disables the menu item in that case. We
+        // snapshot the current list + current selection *now* so the
+        // closure doesn't re-read a potentially-stale `self` at
+        // menu-click time (SwiftUI View values are snapshots; by the
+        // time a menu fires, our struct instance may be recycled).
+        // The closure itself writes through `selectionBinding` which
+        // is the live Binding, so state updates are propagated.
+        let moveByOne: (Int) -> (() -> Void)? = { delta in
+            guard !visibleConversations.isEmpty else { return nil }
+            return {
+                let ids = visibleConversations.map(\.id)
+                let currentIndex = ids.firstIndex(where: {
+                    currentSelection.contains($0)
+                })
+                let nextIndex: Int
+                if let currentIndex {
+                    nextIndex = min(max(currentIndex + delta, 0), ids.count - 1)
+                    guard nextIndex != currentIndex else { return }
+                } else {
+                    // Nothing selected yet — ⌘↓ picks the top of the
+                    // list, ⌘↑ picks the bottom. Matches Mail's
+                    // behaviour when the message list is unfocused.
+                    nextIndex = delta >= 0 ? 0 : ids.count - 1
+                }
+                selectionBinding.wrappedValue = [ids[nextIndex]]
+            }
+        }
+        let nextClosure = moveByOne(1)
+        let previousClosure = moveByOne(-1)
 
         // Enable "Delete Snapshot…" only when:
         //   1. the sidebar is pointing at archive.db (so the
@@ -948,6 +982,8 @@ struct DesignMockRootView: View {
                     Task { await libraryVM.reloadSupportingState() }
                 }
             },
+            selectNextConversation: nextClosure,
+            selectPreviousConversation: previousClosure,
             openDropFolder: {
                 #if os(macOS)
                 NSWorkspace.shared.open(capturedServices.intakeDirURL)
