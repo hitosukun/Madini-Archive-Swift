@@ -3,9 +3,8 @@ import SwiftUI
 
 /// Rolling history of free-text queries the user ran as find-in-page
 /// searches inside an open thread (reader / viewer mode). Companion to
-/// `LibraryViewModel.unifiedFilters` (library searches) and
-/// `RecentThreadsStore` (recently-opened threads) — three disjoint
-/// streams that together let the shell offer context-appropriate
+/// `LibraryViewModel.unifiedFilters` (library searches) — the two
+/// streams together let the shell offer context-appropriate
 /// suggestions in one place.
 ///
 /// Why a separate store (not reuse `saved_filters`): an in-thread
@@ -21,8 +20,8 @@ import SwiftUI
 /// the fourth thread's suggestion list to include it. Per-thread
 /// scoping would shrink each list to a single entry in typical use.
 ///
-/// Cap: 20 entries. Matches `RecentThreadsStore` so the two surfaces
-/// have predictable footprints regardless of the mix.
+/// Cap: 20 entries. Matches the unified-filters cap so the sidebar
+/// has a predictable footprint regardless of the mix.
 @MainActor
 final class RecentInThreadQueriesStore: ObservableObject {
     @Published private(set) var queries: [String] = []

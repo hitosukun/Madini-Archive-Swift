@@ -83,10 +83,10 @@ struct SavedFilterRow: View {
         .font(.body)
         .padding(.horizontal, 6)
         // 4pt vertical — previously 7pt, which read as too airy once
-        // the History section started interleaving filter rows with
-        // thread rows (the user asked to "行間を詰めて"). Keep in sync
-        // with `RecentThreadRow`'s vertical padding so the two row
-        // kinds share identical row heights.
+        // the sidebar started interleaving multiple row kinds (the
+        // user asked to "行間を詰めて"). Left at 4pt even after the
+        // History section was removed because the tighter rhythm still
+        // reads better at typical sidebar widths.
         .padding(.vertical, 4)
         // Apply contentShape BEFORE `.onHover` so the whole padded
         // rectangle counts as hoverable, not just the visible glyph /
