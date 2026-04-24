@@ -597,6 +597,31 @@ struct DesignMockRootView: View {
     @State private var selectedLayoutMode: DesignMockLayoutMode = .default
     @State private var searchText = ""
     @State private var expandedPromptConversationID: DesignMockConversation.ID?
+    /// Rotates on every keyboard-driven selection change (plain ↑/↓
+    /// step via `moveSelection`, ⌘↑/⌘↓ jump-to-edge via the menu).
+    /// The thread-list / table panes observe this token and scroll
+    /// the current selection into view. We don't key off
+    /// `selectedConversationIDs` directly because mouse clicks also
+    /// mutate it, and the user deliberately rejected click-driven
+    /// auto-scroll ("テーブルでも、選択するだけでは自動で上にスクロール
+    /// せず") — a dedicated pulse lets keyboard navigation follow
+    /// the cursor without regressing that behaviour.
+    @State private var keyboardSelectionPulse: UUID?
+    /// Prompt outline for `.viewer` mode's ⌘↑ / ⌘↓ navigation.
+    /// In viewer mode there's no visible prompt list, so the menu
+    /// shortcut steps through user messages directly in the
+    /// transcript: each press fires `pendingPromptID` with the
+    /// anchor of the prev / next prompt. Cached at the shell so
+    /// re-entering viewer on the same thread is instant. Empty
+    /// outside viewer mode.
+    @State private var viewerPromptOutline: [DesignMockPrompt] = []
+    /// Id of the prompt ⌘↑ / ⌘↓ is currently anchored on in viewer
+    /// mode. Separate from `pendingPromptID` because that binding
+    /// gets cleared by the reader once the scroll lands (it's a
+    /// one-shot signal), whereas the step-walk needs a persistent
+    /// cursor to decide what "next prompt" means. Reset whenever
+    /// the viewer outline reloads for a different conversation.
+    @State private var viewerActivePromptID: String?
     /// One-shot signal that bounces through `selectedPromptID` on the
     /// reader side. Rotating a fresh UUID on tap re-fires the reader's
     /// `requestedPromptID` binding even when the user taps the same
@@ -609,11 +634,6 @@ struct DesignMockRootView: View {
     /// because it still drives viewer-mode data, saved filters, and
     /// the (upcoming) prompt-level bookmark surface.
     @State private var libraryViewModel: LibraryViewModel?
-    /// Rolling list of recently-opened thread ids. Paired with the
-    /// filter history in the sidebar HISTORY section so "what did I
-    /// look at" is one surface, not two. Persisted to UserDefaults —
-    /// see `RecentThreadsStore` for cap / eviction rules.
-    @StateObject private var recentThreadsStore = RecentThreadsStore()
     /// Rolling list of find-in-page queries the user ran inside an
     /// open thread. Feeds `.searchSuggestions` when the search field
     /// is acting as a thread-scoped finder (`.default` / `.viewer`
@@ -875,30 +895,8 @@ struct DesignMockRootView: View {
         .onChange(of: store.conversations.map(\.id)) { _, newIDs in
             repairSelectionIfNeeded(currentIDs: newIDs)
         }
-        // Record the "currently displayed" thread into the recent-
-        // threads store whenever it changes. We key the observer on
-        // the single-conversation id (not the whole selection set) so
-        // multi-select lassoes don't spam the history list — only
-        // "which thread is the reader showing" counts as an open.
-        // Debouncing isn't needed here because each id transition
-        // corresponds to a deliberate user pick; back-to-back writes
-        // only happen when the user is actively clicking, and the
-        // store's move-to-top semantics collapse same-id re-records.
-        .onChange(of: selectedConversation?.id) { _, _ in
-            recordCurrentThreadInHistory()
-        }
         .onAppear {
             repairSelectionIfNeeded(currentIDs: store.conversations.map(\.id))
-            // If a selection survived from a previous session (or a
-            // state restoration) and it happens to intersect the
-            // current fetch page, record it into History immediately
-            // so the user sees their last-viewed thread at the top
-            // of the list without having to click it again. When
-            // nothing is selected on launch — the common first-run
-            // case since we stopped auto-seeding the top thread —
-            // this is a no-op; `recordCurrentThreadInHistory`
-            // guards on `selectedConversation != nil`.
-            recordCurrentThreadInHistory()
         }
         // Publish shell-scoped actions for the main menu. The struct
         // is rebuilt on every body recompute so `currentLayout`,
@@ -917,6 +915,140 @@ struct DesignMockRootView: View {
         // SwiftUI drops the publish when nil so the menu item
         // correctly disables until the VM is ready.
         .focusedSceneValue(\.libraryViewModel, libraryViewModel)
+        // Viewer mode publishes ⌘↑ / ⌘↓ as "step prev / next
+        // prompt" via scene-scoped focus value. State 3 publishes
+        // the same key via `.focusedValue` on the prompt list,
+        // which SwiftUI routes as a focused-subtree publication —
+        // those take precedence over `.focusedSceneValue`, so the
+        // state-3 semantics (jump-to-edge) shadow the scene-wide
+        // viewer closures whenever the prompt list is actually in
+        // tree. Outside viewer and state 3, both closures are nil
+        // and `AppCommands` falls through to the shell's thread-
+        // level jump closures.
+        .focusedSceneValue(\.promptNavigation, viewerPromptNavigationActions)
+        // Load the prompt outline for the currently-selected
+        // conversation whenever we're in viewer mode. Re-fires on
+        // conversation change via the task id. The store caches
+        // outlines so repeat loads are cheap; guarding on layout
+        // mode avoids paying the fetch cost when the user never
+        // enters viewer.
+        .task(id: viewerOutlineLoadToken) {
+            await loadViewerPromptOutlineIfNeeded()
+        }
+    }
+
+    /// Composite key for the viewer-outline loader task. Changes
+    /// whenever either the selected conversation id OR the layout
+    /// mode transitions flips — both need the outline re-fetched
+    /// (mode flip may have landed us in viewer for the first time
+    /// with a stale empty outline; conversation change obviously
+    /// invalidates the old one). String encoding is fine because
+    /// `.task(id:)` only needs Equatable.
+    private var viewerOutlineLoadToken: String {
+        let convID = selectedConversation?.id ?? ""
+        let inViewer = selectedLayoutMode == .viewer
+        return "\(inViewer ? "v" : "x"):\(convID)"
+    }
+
+    /// Populate `viewerPromptOutline` + reset the step cursor when
+    /// the current viewer target changes. No-op outside viewer mode
+    /// so non-viewer states don't pay the fetch cost, and clears
+    /// the cache when the user leaves viewer so ⌘↑ / ⌘↓ in
+    /// unrelated modes don't see stale prompts.
+    private func loadViewerPromptOutlineIfNeeded() async {
+        guard selectedLayoutMode == .viewer,
+              let conv = selectedConversation else {
+            viewerPromptOutline = []
+            viewerActivePromptID = nil
+            return
+        }
+        let outline = await store.promptOutline(for: conv.id, services: services)
+        await MainActor.run {
+            viewerPromptOutline = outline
+            // Keep the cursor if it still resolves against the
+            // freshly-loaded outline (e.g. re-entering viewer on
+            // the same thread). Otherwise reset — it belonged to
+            // a different conversation.
+            if let cursor = viewerActivePromptID,
+               outline.contains(where: { $0.id == cursor }) == false {
+                viewerActivePromptID = nil
+            }
+        }
+    }
+
+    /// Build the `PromptNavigationActions` the shell publishes
+    /// while in `.viewer`. Supplies all four closures:
+    ///
+    /// - `stepPrev` / `stepNext` (⌘↑ / ⌘↓) — walk the cursor one
+    ///   prompt at a time. In viewer mode plain ↑ / ↓ scroll the
+    ///   reader and there's no list UI to arrow through, so the
+    ///   menu shortcut is the only step affordance.
+    /// - `jumpFirst` / `jumpLast` (⌘⇧↑ / ⌘⇧↓) — land the cursor
+    ///   at the outline's first / last prompt. Same gesture that
+    ///   state 3 binds, so edge-jump is consistent across surfaces.
+    ///
+    /// Outside viewer mode (or while the outline is still empty)
+    /// all four fields are nil, which drops `AppCommands` back to
+    /// the shell's thread-level `selectFirst/LastConversation`
+    /// for the jump pair and greys out the step pair.
+    private var viewerPromptNavigationActions: PromptNavigationActions {
+        guard selectedLayoutMode == .viewer, !viewerPromptOutline.isEmpty else {
+            return PromptNavigationActions(
+                stepPrev: nil,
+                stepNext: nil,
+                jumpFirst: nil,
+                jumpLast: nil
+            )
+        }
+        let outline = viewerPromptOutline
+        let cursor = viewerActivePromptID
+        let pendingBinding = $pendingPromptID
+        let cursorBinding = $viewerActivePromptID
+        // Step by ±1 through the outline. First press when no
+        // cursor exists seeds the edge: ⌘↓ → first, ⌘↑ → last
+        // (matches the "unfocused list" convention used elsewhere).
+        let step: (Int) -> Void = { delta in
+            let ids = outline.map(\.id)
+            let currentIndex = cursor.flatMap { id in
+                ids.firstIndex(of: id)
+            }
+            let nextIndex: Int
+            if let currentIndex {
+                // Clamp at the edges so the cursor stops at the
+                // ends rather than wrapping around — wrapping
+                // would silently teleport the reader across the
+                // whole transcript on a single keypress, which is
+                // more disorienting than useful.
+                nextIndex = min(max(currentIndex + delta, 0), ids.count - 1)
+                if nextIndex == currentIndex { return }
+            } else {
+                nextIndex = delta >= 0 ? 0 : ids.count - 1
+            }
+            let nextID = ids[nextIndex]
+            cursorBinding.wrappedValue = nextID
+            // Rotating the anchor through `pendingPromptID`
+            // re-fires the reader's scroll even if the same id
+            // gets re-sent (pending is a one-shot that the reader
+            // clears after consuming).
+            pendingBinding.wrappedValue = nextID
+        }
+        // Jump-to-edge shares the same cursor + pending wiring as
+        // step so the reader reacts identically; only the target
+        // index differs (fixed first / last instead of cursor ± 1).
+        let jump: (Bool) -> Void = { toFirst in
+            guard let targetID = toFirst ? outline.first?.id : outline.last?.id else {
+                return
+            }
+            if cursorBinding.wrappedValue == targetID { return }
+            cursorBinding.wrappedValue = targetID
+            pendingBinding.wrappedValue = targetID
+        }
+        return PromptNavigationActions(
+            stepPrev: { step(-1) },
+            stepNext: { step(1) },
+            jumpFirst: { jump(true) },
+            jumpLast: { jump(false) }
+        )
     }
 
     /// Build the `ShellCommandActions` bundle that `AppCommands`
@@ -932,6 +1064,7 @@ struct DesignMockRootView: View {
         let layoutBinding = $selectedLayoutMode
         let selectionBinding = $selectedConversationIDs
         let expandedBinding = $expandedPromptConversationID
+        let scrollPulseBinding = $keyboardSelectionPulse
         let capturedServices = services
         let capturedStore = store
         let capturedLibraryVM = libraryViewModel
@@ -972,6 +1105,10 @@ struct DesignMockRootView: View {
                 if currentExpanded != nil {
                     expandedBinding.wrappedValue = targetID
                 }
+                // Same pulse the step-by-one path uses — jump-to-
+                // edge is a keyboard gesture too, so the pane should
+                // scroll to show the new selection.
+                scrollPulseBinding.wrappedValue = UUID()
             }
         }
         let firstClosure = jumpToEdge(true)
@@ -1022,12 +1159,19 @@ struct DesignMockRootView: View {
                     layoutBinding.wrappedValue = .table
                 }
             } else {
-                // State 3 is the drill-in terminus in the canonical
-                // chain. We deliberately do NOT bleed into `.viewer`
-                // here because the user described the 3-state model
-                // as terminating at "prompt list shown in center
-                // pane" — ⌘→ at the end of the chain just stops.
-                drillInClosure = nil
+                // State 3 → Viewer: ⌘→ at the end of the canonical
+                // drill chain slides the user into focus/viewer
+                // mode. The user asked for this extension on top
+                // of the original 3-state model — "さらに cmd+左右
+                // で、フォーカスモードに切り替えることはできる？" —
+                // so ⌘→ now reads as "keep drilling toward the
+                // content: list → card → prompts → reader-only".
+                // ⌘← in `.viewer` already symmetrically hops back
+                // to `.default` (see the `.viewer` case below), so
+                // the gesture round-trips cleanly.
+                drillInClosure = {
+                    layoutBinding.wrappedValue = .viewer
+                }
                 // State 3 → State 2: collapse the card.
                 drillOutClosure = {
                     expandedBinding.wrappedValue = nil
@@ -1114,23 +1258,11 @@ struct DesignMockRootView: View {
         if expandedPromptConversationID != nil {
             expandedPromptConversationID = nextID
         }
-    }
-
-    /// Shared entry point for "the reader is now showing this
-    /// thread". Reads the currently-displayed `DesignMockConversation`
-    /// and forwards its snapshot into `RecentThreadsStore`. No-op when
-    /// no thread is displayed (empty archive / stale selection
-    /// between fetches) so the history list doesn't develop phantom
-    /// rows.
-    private func recordCurrentThreadInHistory() {
-        guard let conv = selectedConversation else { return }
-        recentThreadsStore.record(
-            id: conv.id,
-            title: conv.title,
-            source: conv.source,
-            model: conv.model,
-            primaryTime: conv.updated
-        )
+        // Pulse the scroll-follow token so the card/table pane
+        // scrolls the newly-selected row into view. Keyboard-driven
+        // only — clicks don't fire this path, matching the user's
+        // "click-select shouldn't auto-scroll" preference.
+        keyboardSelectionPulse = UUID()
     }
 
     /// Prune the selection set to only ids that actually exist in the
@@ -1142,11 +1274,10 @@ struct DesignMockRootView: View {
     /// query edit guaranteed the reader had something to show. The
     /// user found that actively harmful: "サイドバーから選んだ瞬間に
     /// トップのスレッドが勝手に開かれて履歴がごちゃごちゃになって
-    /// しまう" — each sidebar click re-seeded a new "current thread",
-    /// which immediately fired `recordCurrentThreadInHistory` and
-    /// polluted History with threads the user never actually opened.
-    /// Now we only prune; when nothing survives, the reader shows
-    /// empty state and the user picks explicitly.
+    /// しまう" — each sidebar click re-seeded a new "current thread"
+    /// which pulled something random into the reader. Now we only
+    /// prune; when nothing survives, the reader shows empty state
+    /// and the user picks explicitly.
     ///
     /// The stale-id tolerance is intentional: if the user navigates
     /// away to a narrower scope and then back, keeping the prior
@@ -1219,7 +1350,8 @@ struct DesignMockRootView: View {
                     },
                     onMoveSelection: { delta in
                         moveSelection(by: delta)
-                    }
+                    },
+                    scrollPulse: $keyboardSelectionPulse
                 )
                 .background(centerWidthProbe)
                 // Min drops from 320 → 240 so the user can squeeze
@@ -1412,45 +1544,12 @@ struct DesignMockRootView: View {
             promptBookmarks: store.promptBookmarks,
             databaseInfo: store.databaseInfo,
             totalCount: store.totalCount,
-            libraryViewModel: libraryViewModel,
-            recentThreads: recentThreadsStore.entries,
-            onSelectHistoryEntry: { entry in
-                // Push the entry's filter back onto the toolbar field.
-                // The `.onChange(of: composedQuery)` wiring then re-runs
-                // the store fetch through the exact same path as
-                // hand-typed DSL, so HISTORY and typing share a single
-                // code path downstream. Sidebar selection is cleared
-                // so a matching sidebar pick (e.g. Bookmarks) from a
-                // previous tap doesn't compound with the restored
-                // filter and over-narrow the list.
-                searchText = DesignMockQueryLanguage.searchText(from: entry.filters)
-                selectedSidebarItemID = DesignMockSidebarItem.allThreads.id
-            },
-            onSelectRecentThread: { entry in
-                // Clicking a recent-thread history row = "open this
-                // thread again". We clear every filter surface so the
-                // target is guaranteed to be in the fetch page
-                // (sidebar narrowing or a stale search could otherwise
-                // filter it out and the click would silently land on
-                // whichever thread happens to be first in the
-                // narrowed list), then select it. Layout is forced to
-                // `.default` so the reader pane is visible — picking a
-                // thread from history should always show the thread,
-                // even when the user is currently in table mode.
-                searchText = ""
-                selectedSidebarItemID = DesignMockSidebarItem.allThreads.id
-                selectedConversationIDs = [entry.id]
-                selectedLayoutMode = .default
-            },
-            onRemoveRecentThread: { entry in
-                recentThreadsStore.remove(id: entry.id)
-            }
+            libraryViewModel: libraryViewModel
         )
         // Finder-parity minimum (~150pt). All sidebar row kinds —
-        // `sidebarRow` (icon + title + optional subtitle),
-        // `sourceRow` disclosure groups, and the History stream's
-        // `SavedFilterRow` / `RecentThreadRow` — cap at `lineLimit(1)`
-        // so they truncate cleanly when the column is squeezed below
+        // `sidebarRow` (icon + title + optional subtitle) and the
+        // `sourceRow` disclosure groups — cap at `lineLimit(1)` so
+        // they truncate cleanly when the column is squeezed below
         // the text's natural width.
         //
         // `ideal` reads from `@AppStorage` via `currentSidebarIdeal`
@@ -1486,7 +1585,8 @@ struct DesignMockRootView: View {
             onOpen: onOpen,
             onMoveSelection: { delta in
                 moveSelection(by: delta)
-            }
+            },
+            scrollPulse: $keyboardSelectionPulse
         )
         .id("center-table")
     }
@@ -1733,26 +1833,13 @@ private struct DesignMockSidebar: View {
     let databaseInfo: DesignMockDataStore.DatabaseInfo?
     let totalCount: Int
     /// Shared library VM. Kept optional because it's built lazily in
-    /// the shell; the HISTORY section below reads its `unifiedFilters`
-    /// array, and Phase-4 prompt-bookmark surfaces will too.
+    /// the shell; Phase-4 prompt-bookmark surfaces and other sidebar-
+    /// adjacent features read from it. Previously also fed a HISTORY
+    /// section listing recently-opened threads + saved filter
+    /// entries; that surface was retired on user request ("サイドバー
+    /// の History は消そうかな"), so the VM is kept only for the
+    /// non-History consumers now.
     let libraryViewModel: LibraryViewModel?
-    /// Rolling list of recently-opened threads, rendered in the same
-    /// HISTORY section as filter history so the user sees "what I
-    /// searched" and "what I opened" in one surface.
-    let recentThreads: [RecentThreadsStore.Entry]
-    /// Callback for when the user picks a history entry. The parent
-    /// translates the entry's `ArchiveSearchFilter` back into the
-    /// toolbar search field, which then flows through `composedQuery`
-    /// → store fetch via the normal typing path.
-    let onSelectHistoryEntry: (SavedFilterEntry) -> Void
-    /// Called when the user clicks a recent-thread row. Parent is
-    /// responsible for clearing filters and selecting the thread so
-    /// the reader pane updates.
-    let onSelectRecentThread: (RecentThreadsStore.Entry) -> Void
-    /// Called from the recent-thread row's context menu ("Remove from
-    /// history"). Lets users prune the list without affecting the
-    /// underlying thread.
-    let onRemoveRecentThread: (RecentThreadsStore.Entry) -> Void
     /// Which sources are currently expanded. We seed from `sources` on
     /// first appear *and* whenever the source list changes shape (e.g. a
     /// real-data fetch finally lands), so newly-visible multi-model
@@ -1828,22 +1915,13 @@ private struct DesignMockSidebar: View {
                     }
                 }
 
-                // HISTORY — a single chronological stream. Filter entries
-                // (from `LibraryViewModel.unifiedFilters`) and opened-thread
-                // entries (from `RecentThreadsStore`) are interleaved and
-                // ordered strictly by their most-recent-use timestamp, so
-                // "what I searched" and "what I opened" appear in the same
-                // order the user actually performed the actions. Pinned
-                // filters keep their star affordance and their pin/unpin
-                // action, but no longer jump to the top — the unified order
-                // is purely time-based.
-                if !historyItems.isEmpty {
-                    sectionGroup("History") {
-                        ForEach(historyItems) { item in
-                            historyItemRow(item)
-                        }
-                    }
-                }
+                // HISTORY section removed on user request ("サイドバー
+                // の History は消そうかな"). Previously listed recently-
+                // opened threads + saved filter entries interleaved by
+                // timestamp; with it gone the sidebar is strictly a
+                // library-scope narrower (Library → Sources) and the
+                // thread-reopening + filter-recall flows live elsewhere
+                // (toolbar search recall, ⌘⇧↑/↓ jump navigation, etc.).
             }
             .padding(.horizontal, 6)
             .padding(.top, 10)
@@ -1887,21 +1965,6 @@ private struct DesignMockSidebar: View {
         if selection == id { return Color.primary.opacity(0.10) }
         if isHovering { return Color.primary.opacity(0.05) }
         return .clear
-    }
-
-    /// Chronologically-sorted history stream of threads the user has
-    /// opened. Empty when the store is empty, which lets the "History"
-    /// section header hide entirely so the sidebar doesn't draw a
-    /// collapsible above nothing on a fresh DB.
-    ///
-    /// Previously this stream also interleaved saved-filter entries
-    /// (recent text queries), but those moved into the search field's
-    /// `.searchSuggestions` dropdown so the sidebar stays focused on
-    /// "threads I've visited" as a single surface.
-    private var historyItems: [HistoryItem] {
-        recentThreads
-            .map(HistoryItem.thread)
-            .sorted { $0.timestamp > $1.timestamp }
     }
 
     private var databaseSubtitle: String? {
@@ -2041,33 +2104,6 @@ private struct DesignMockSidebar: View {
         }
     }
 
-    /// Wraps the existing `SavedFilterRow` / `RecentThreadRow`
-    /// components in the same horizontal inset as sibling sidebar
-    /// rows so the two row kinds share a common leading column.
-    @ViewBuilder
-    private func historyItemRow(_ item: HistoryItem) -> some View {
-        switch item {
-        case .filter(let entry):
-            SavedFilterRow(
-                entry: entry,
-                onSelect: { onSelectHistoryEntry(entry) },
-                onTogglePin: { libraryViewModel?.togglePinned(entry) },
-                onDelete: { libraryViewModel?.deleteFilterEntry(entry) }
-            )
-        case .thread(let entry):
-            RecentThreadRow(entry: entry)
-                .contentShape(Rectangle())
-                .onTapGesture {
-                    onSelectRecentThread(entry)
-                }
-                .contextMenu {
-                    Button("Remove from History", role: .destructive) {
-                        onRemoveRecentThread(entry)
-                    }
-                }
-        }
-    }
-
 }
 
 /// Per-row hover state. SwiftUI's `.onHover` on a Button label leaks
@@ -2125,85 +2161,60 @@ private struct DesignMockThreadListPane: View {
     /// translating arrow presses into selection moves.
     let onMoveSelection: (Int) -> Void
 
-    /// Local focus flag for the `.focusable()` modifier on the pane
-    /// root. Without a bound FocusState, `.onKeyPress` on a focusable
-    /// view doesn't get an unambiguous hook into the focus system —
-    /// the binding makes the focus state observable, which is what
-    /// SwiftUI uses to decide whether key events route here.
+    /// One-shot pulse the shell bumps on every keyboard-driven
+    /// selection change (plain ↑/↓ and menu-bar ⌘↑/⌘↓). We observe
+    /// via `.onChange` and scroll the current selection into view so
+    /// arrow navigation never leaves the user stranded with the
+    /// highlighted row offscreen. Keeping this as a separate signal
+    /// (rather than `onChange(of: selection)`) preserves the
+    /// user's "clicks don't auto-scroll" preference.
+    @Binding var scrollPulse: UUID?
+
+    /// Local focus flag for the `.focusable()` modifier on the card-
+    /// list branch (state 2). The pinned-prompt branch (state 3)
+    /// deliberately does NOT carry a focusable wrapper at this level
+    /// — focus ownership is handed entirely to the inner
+    /// `DesignMockExpandedPromptList` so there's only one focus
+    /// target in the chain when a card is open. An earlier version
+    /// kept a shared `.focusable()` on the outer Group; nesting it
+    /// with the prompt list's own focusable created ambiguous
+    /// routing where the outer sometimes retained focus even after
+    /// the inner's `.onAppear` set its own FocusState, and ↑/↓
+    /// silently switched threads instead of stepping prompts.
     @FocusState private var isFocused: Bool
 
     var body: some View {
-        Group {
-            if let expandedConversation {
-                pinnedPromptView(for: expandedConversation)
-            } else {
-                cardList
-            }
-        }
-        // `.focusable()` is necessary to participate in the focus
-        // chain at all; without it the view can't receive key
-        // events. `.focusEffectDisabled()` suppresses the default
-        // blue focus ring around the whole pane, which looked
-        // jarring on the paper-white card list — the existing
-        // selection pill is already visual-focus enough.
-        .focusable()
-        .focusEffectDisabled()
-        .focused($isFocused)
-        // Plain ↑ / ↓ step selection by one row when the pane is
-        // showing the closed card list (state 2). In state 3 we
-        // delegate to the inner prompt list — guarding on
-        // `expandedPromptConversationID` here is belt-and-
-        // suspenders in case a focus race leaves the outer pane
-        // still focused while the card is open: the worst case
-        // becomes "nothing happens" instead of "threads
-        // silently switch out from under the user".
-        //
-        // We return `.handled` even in the guarded branch so the
-        // event doesn't bubble up to any enclosing scroll view
-        // (which would otherwise scroll the content and obscure
-        // the "arrows do nothing" surprise).
-        .onKeyPress(.upArrow) {
-            guard expandedPromptConversationID == nil else {
-                return .handled
-            }
-            onMoveSelection(-1)
-            return .handled
-        }
-        .onKeyPress(.downArrow) {
-            guard expandedPromptConversationID == nil else {
-                return .handled
-            }
-            onMoveSelection(1)
-            return .handled
-        }
-        // Auto-focus on first appearance so ↑/↓ work without the
-        // user having to click into the pane first. Users who
-        // click the search field get focus moved there naturally
-        // (first-responder chain), and clicking back on a card
-        // re-pulls focus via `selectOrToggle` below.
-        .onAppear {
-            isFocused = true
-        }
-        // Coordinate focus with the inner prompt list across
-        // state-2 ↔ state-3 transitions:
-        //
-        //   newValue == nil (state 3 → state 2)  — prompt list just
-        //   disappeared; nothing owns focus. Pull it back to the
-        //   thread pane so ↑/↓ keep working without a click.
-        //
-        //   newValue != nil (state 2 → state 3)  — prompt list is
-        //   about to appear and will claim focus via its own
-        //   .onAppear. Explicitly yield ours so both FocusState
-        //   instances don't briefly claim focus at once, which
-        //   made outer's `.onKeyPress` fire alongside the inner's
-        //   (user report: ↑/↓ was switching threads instead of
-        //   stepping prompts).
-        .onChange(of: expandedPromptConversationID) { _, newValue in
-            if newValue == nil {
-                isFocused = true
-            } else {
-                isFocused = false
-            }
+        // Each branch owns its own focus wiring so there's never
+        // more than one `.focusable()` view in the subtree at once
+        // — avoids the nested-focus routing ambiguity that broke
+        // state-3 prompt navigation.
+        if let expandedConversation {
+            pinnedPromptView(for: expandedConversation)
+        } else {
+            cardList
+                .focusable()
+                .focusEffectDisabled()
+                .focused($isFocused)
+                .onKeyPress(.upArrow) {
+                    onMoveSelection(-1)
+                    return .handled
+                }
+                .onKeyPress(.downArrow) {
+                    onMoveSelection(1)
+                    return .handled
+                }
+                // Defer focus claim to the next runloop turn so
+                // the pane has fully mounted before we request
+                // key routing. Synchronous `.onAppear` assignment
+                // raced the previous view's focus teardown during
+                // drill transitions (⌘← from .default → .table,
+                // card collapse from state 3 → state 2) and
+                // silently lost the claim.
+                .onAppear {
+                    Task { @MainActor in
+                        isFocused = true
+                    }
+                }
         }
     }
 
@@ -2362,6 +2373,18 @@ private struct DesignMockThreadListPane: View {
             try? await Task.sleep(nanoseconds: 80_000_000)
             proxy.scrollTo(id, anchor: .top)
         }
+        // Scroll-follow for keyboard navigation. Each ⌘↑/⌘↓ / plain
+        // ↑/↓ press bumps `scrollPulse`; we react by scrolling the
+        // newly-selected row into view. `.center` keeps the row
+        // vertically inside the visible band without snapping to an
+        // edge — mimics how Mail scrolls the message list when you
+        // arrow-navigate past the fold.
+        .onChange(of: scrollPulse) { _, newValue in
+            guard newValue != nil, let id = selection.first else { return }
+            withAnimation(.easeOut(duration: 0.18)) {
+                proxy.scrollTo(id, anchor: .center)
+            }
+        }
         } // ScrollViewReader
     }
 
@@ -2436,16 +2459,22 @@ private struct DesignMockThreadListPane: View {
             }
             .help("Collapse prompt list")
 
-            ScrollView {
-                DesignMockExpandedPromptList(
-                    conversation: conversation,
-                    pendingPromptID: $pendingPromptID
-                )
-                .padding(.horizontal, 12)
-                .padding(.vertical, 10)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .scrollContentBackground(.hidden)
+            // `DesignMockExpandedPromptList` owns its own `ScrollView`
+            // + `ScrollViewReader` internally so keyboard navigation
+            // can call `proxy.scrollTo` on the newly-selected prompt.
+            // Nesting a second ScrollView here would double-scroll
+            // (inner scroll working correctly, outer eating the gesture
+            // at the edge) and also hide the inner ScrollView's proxy
+            // from the keyboard handler. Content padding migrates
+            // inside the inner scroll so it still reads as inset from
+            // the pane edge.
+            DesignMockExpandedPromptList(
+                conversation: conversation,
+                pendingPromptID: $pendingPromptID
+            )
+            .padding(.horizontal, 12)
+            .padding(.top, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .background(Color(nsColor: .textBackgroundColor))
     }
@@ -2486,6 +2515,14 @@ private struct DesignMockThreadTablePane: View {
     /// shortcut works the moment the pane appears, without relying
     /// on the user clicking into the table first.
     let onMoveSelection: (Int) -> Void
+
+    /// Shell-bumped pulse for keyboard-driven scroll-follow —
+    /// identical semantics to the card-list pane. SwiftUI Table's
+    /// own native arrow handling would scroll the selection into
+    /// view for free, but that path only fires when the underlying
+    /// NSTableView is first responder; keyboard nav via our wrapper
+    /// handlers bypasses it, so we re-emit the scroll ourselves.
+    @Binding var scrollPulse: UUID?
 
     @FocusState private var isFocused: Bool
 
@@ -2680,8 +2717,29 @@ private struct DesignMockThreadTablePane: View {
             onMoveSelection(1)
             return .handled
         }
+        // Defer the focus claim to the next main-actor turn. A
+        // synchronous `isFocused = true` inside `.onAppear` fires
+        // while the outgoing view (the card list we drilled back
+        // from) is still tearing down its own focus state; SwiftUI
+        // was treating our claim as redundant and silently dropping
+        // it, so the wrapper never became the key target and ↑/↓
+        // bubbled to nothing. Hopping through `Task { @MainActor }`
+        // lets the prior view's teardown settle first, then our
+        // claim lands on a clean focus slot.
         .onAppear {
-            isFocused = true
+            Task { @MainActor in
+                isFocused = true
+            }
+        }
+        // Keyboard-driven scroll-follow, twin of the card-list
+        // pane's handler. Click-driven selection stays silent
+        // because the shell only pulses this token from the
+        // arrow-key paths.
+        .onChange(of: scrollPulse) { _, newValue in
+            guard newValue != nil, let id = selection.first else { return }
+            withAnimation(.easeOut(duration: 0.18)) {
+                proxy.scrollTo(id, anchor: .center)
+            }
         }
         } // ScrollViewReader
     }
@@ -2713,24 +2771,41 @@ private struct DesignMockExpandedPromptList: View {
     @FocusState private var isPromptListFocused: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            if isLoading && prompts.isEmpty {
-                ProgressView()
-                    .controlSize(.small)
-                    .padding(.vertical, 8)
-            } else if prompts.isEmpty {
-                Text("No user prompts in this conversation.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .padding(.vertical, 8)
-            } else {
-                ForEach(prompts) { prompt in
-                    promptRow(prompt)
+        // ScrollViewReader so keyboard navigation (plain ↑/↓ and
+        // menu ⌘↑/⌘↓) can pull the newly-selected prompt into view
+        // even when it's offscreen. The parent `pinnedPromptView`
+        // in `DesignMockThreadListPane` used to wrap this view in
+        // its own `ScrollView`; we now own scroll here so the
+        // proxy is reachable from `movePromptSelection` / the
+        // jump-to-edge helpers. The parent drops its ScrollView to
+        // avoid nested scrolling.
+        ScrollViewReader { proxy in
+        ScrollView {
+            VStack(alignment: .leading, spacing: 2) {
+                if isLoading && prompts.isEmpty {
+                    ProgressView()
+                        .controlSize(.small)
+                        .padding(.vertical, 8)
+                } else if prompts.isEmpty {
+                    Text("No user prompts in this conversation.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .padding(.vertical, 8)
+                } else {
+                    ForEach(prompts) { prompt in
+                        promptRow(prompt)
+                            // `.id(prompt.id)` wires each row into
+                            // `ScrollViewReader` so `proxy.scrollTo`
+                            // can land on the exact prompt when
+                            // keyboard navigation walks past the
+                            // viewport edge.
+                            .id(prompt.id)
+                    }
                 }
             }
+            .padding(.leading, 6)
+            .padding(.trailing, 2)
         }
-        .padding(.leading, 6)
-        .padding(.trailing, 2)
         // Focus + keyboard handling. The prompt list is the state-3
         // drill-in target, so plain ↑/↓ here walks the prompt list
         // (and auto-fires `pendingPromptID` so the reader scrolls to
@@ -2743,25 +2818,38 @@ private struct DesignMockExpandedPromptList: View {
         .focusEffectDisabled()
         .focused($isPromptListFocused)
         .onKeyPress(.upArrow) {
-            movePromptSelection(by: -1)
+            movePromptSelection(by: -1, proxy: proxy)
             return .handled
         }
         .onKeyPress(.downArrow) {
-            movePromptSelection(by: 1)
+            movePromptSelection(by: 1, proxy: proxy)
             return .handled
         }
-        // Pull focus synchronously on appear — NOT inside the
-        // `.task` below. The task runs async and can take tens to
-        // hundreds of ms to finish loading the outline, and during
-        // that window the outer thread-list pane still owned
-        // focus. ↑/↓ presses landed there and switched threads
-        // (user report: "カードが開かれると、cmdなしで上下すると
-        // カード自体が切り替わってしまう"). onAppear fires
-        // synchronously as the view mounts, so focus transfer
-        // beats any key press the user can physically issue.
+        // Defer the focus claim to the next main-actor turn. The
+        // outer thread-list pane is tearing down its own focus
+        // wrapper as this view mounts (the card-list branch is
+        // leaving the tree); a synchronous claim here raced that
+        // teardown and SwiftUI sometimes dropped our bid, leaving
+        // no focused view at all (user report: ↑/↓ don't move
+        // prompts even after clicking into the list). Bouncing
+        // through `Task { @MainActor }` lets the tree settle on
+        // the pinned-prompt branch first, then our claim lands
+        // cleanly as the sole focusable in the subtree.
         .onAppear {
-            isPromptListFocused = true
+            Task { @MainActor in
+                isPromptListFocused = true
+            }
         }
+        // Publish jump-to-edge closures so the main menu's
+        // ⌘↑ / ⌘↓ items can retarget prompts when this list is
+        // focused. `focusedValue` scopes the publication to
+        // whichever view in the subtree currently owns focus, so
+        // state 2 (card list focused, prompt list not in tree)
+        // reads `nil` and falls back to the shell's thread-level
+        // closures; state 3 sees these values and jumps prompts
+        // instead. Rebuilt each pass so the closure captures the
+        // current `prompts` snapshot rather than a stale one.
+        .focusedValue(\.promptNavigation, promptNavigationActions(proxy: proxy))
         .task(id: conversation.id) {
             // Re-fetch whenever the expanded card changes identity. Store
             // caches the outline, so flipping back to a previously-expanded
@@ -2774,14 +2862,79 @@ private struct DesignMockExpandedPromptList: View {
             selectedPromptID = nil
             hoveredPromptID = nil
         }
+        } // ScrollViewReader
+    }
+
+    /// Build the `PromptNavigationActions` bundle for
+    /// `focusedValue(\.promptNavigation, ...)`. Closures are nil
+    /// when the outline is empty so the menu items disable
+    /// themselves rather than fire a no-op. `proxy` is captured so
+    /// the edge jump can scroll the target row into view — the
+    /// shell-level jump-to-edge for threads uses the same pattern.
+    private func promptNavigationActions(proxy: ScrollViewProxy) -> PromptNavigationActions {
+        let promptsSnapshot = prompts
+        let currentSelected = selectedPromptID
+        let isEmpty = promptsSnapshot.isEmpty
+        let firstClosure: (() -> Void)? = isEmpty ? nil : {
+            jumpPromptToEdge(
+                prompts: promptsSnapshot,
+                currentSelected: currentSelected,
+                toFirst: true,
+                proxy: proxy
+            )
+        }
+        let lastClosure: (() -> Void)? = isEmpty ? nil : {
+            jumpPromptToEdge(
+                prompts: promptsSnapshot,
+                currentSelected: currentSelected,
+                toFirst: false,
+                proxy: proxy
+            )
+        }
+        // State 3 maps ⌘⇧↑ / ⌘⇧↓ to "jump to first / last
+        // prompt". Step semantics (⌘↑ / ⌘↓) are left nil on
+        // purpose — the prompt list has focus in state 3, so
+        // plain ↑ / ↓ already walks rows; a menu duplicate
+        // would be dead weight. In `.viewer`, where plain ↑ /
+        // ↓ scroll the reader instead of stepping prompts, the
+        // shell publishes its own step closures.
+        return PromptNavigationActions(
+            stepPrev: nil,
+            stepNext: nil,
+            jumpFirst: firstClosure,
+            jumpLast: lastClosure
+        )
+    }
+
+    /// Shared implementation for ⌘↑ / ⌘↓ on the prompt list.
+    /// Separated from `movePromptSelection` so the menu closures
+    /// can carry a captured `prompts` snapshot instead of reaching
+    /// back into the view (which is a value type and can be stale
+    /// by the time a menu click fires).
+    private func jumpPromptToEdge(
+        prompts: [DesignMockPrompt],
+        currentSelected: String?,
+        toFirst: Bool,
+        proxy: ScrollViewProxy
+    ) {
+        guard let target = toFirst ? prompts.first : prompts.last else {
+            return
+        }
+        if currentSelected == target.id { return }
+        selectedPromptID = target.id
+        pendingPromptID = target.id
+        withAnimation(.easeOut(duration: 0.18)) {
+            proxy.scrollTo(target.id, anchor: .center)
+        }
     }
 
     /// Move `selectedPromptID` one row up (-1) or down (+1). Fires
     /// `pendingPromptID` as a side effect so the reader scrolls to
     /// the newly-selected prompt — same behaviour as tapping a row.
     /// No-op when the outline is empty or we're already at the
-    /// target edge.
-    private func movePromptSelection(by delta: Int) {
+    /// target edge. `proxy` lets the move scroll the new row into
+    /// view when it's past the viewport edge.
+    private func movePromptSelection(by delta: Int, proxy: ScrollViewProxy) {
         guard !prompts.isEmpty else { return }
         let currentIndex = selectedPromptID.flatMap { id in
             prompts.firstIndex { $0.id == id }
@@ -2799,6 +2952,13 @@ private struct DesignMockExpandedPromptList: View {
         let next = prompts[nextIndex]
         selectedPromptID = next.id
         pendingPromptID = next.id
+        // Keep the highlighted row visible as we walk off the
+        // top/bottom edges of the viewport. `.center` matches the
+        // card-list / table behaviour for consistency across
+        // levels.
+        withAnimation(.easeOut(duration: 0.18)) {
+            proxy.scrollTo(next.id, anchor: .center)
+        }
     }
 
     @ViewBuilder
@@ -2830,6 +2990,14 @@ private struct DesignMockExpandedPromptList: View {
                 // id later still triggers a fresh scroll.
                 pendingPromptID = prompt.id
                 selectedPromptID = prompt.id
+                // Clicking a prompt row should leave keyboard
+                // focus on the prompt list so the user can
+                // immediately hit ↑/↓ to step through. Without
+                // this explicit re-claim, the Button's tap would
+                // transfer first-responder to the Button itself
+                // and our `@FocusState` wrapper would lose its
+                // key routing.
+                isPromptListFocused = true
             } label: {
                 // `lineLimit(2)` instead of 1: at narrow center-pane
                 // widths (the user drags the pane down to ~180pt,
@@ -3422,119 +3590,6 @@ private struct FindInPageNavStrip: View {
         .shadow(color: .black.opacity(0.15), radius: 6, y: 3)
         .animation(.easeInOut(duration: 0.15), value: matchCount)
         .animation(.easeInOut(duration: 0.15), value: currentIndex)
-    }
-}
-
-/// Sidebar row for one `RecentThreadsStore.Entry`. Visually lighter
-/// than the main card list row — no snippet, no prompts count,
-/// just "title · model" — so the sidebar stays scannable even when
-/// the list fills up to its 20-entry cap. The model text takes the
-/// service's brand color (same as `ConversationRowView`) so the
-/// user can tell chatgpt vs claude vs gemini threads apart without
-/// reading the model string.
-/// Unified sidebar-history item: wraps either a saved-filter entry
-/// (click re-runs the filter) or a recent-thread entry (click re-opens
-/// the thread). A single enum lets the sidebar interleave the two
-/// kinds in one chronologically-sorted list while keeping each row's
-/// per-kind rendering distinct.
-private enum HistoryItem: Identifiable {
-    case filter(SavedFilterEntry)
-    case thread(RecentThreadsStore.Entry)
-
-    /// Stable id that's unique across the two namespaces — the raw
-    /// integer id of a `SavedFilterEntry` could collide with a
-    /// conversation id (also a string) in edge cases, so we prefix
-    /// both with the kind.
-    var id: String {
-        switch self {
-        case .filter(let entry): return "filter-\(entry.id)"
-        case .thread(let entry): return "thread-\(entry.id)"
-        }
-    }
-
-    /// Comparable timestamp for sort. `SavedFilterEntry.lastUsedAt` is
-    /// stored as `"YYYY-MM-DD HH:MM:SS"` (see `TimestampFormatter`), so
-    /// we parse with the same format. A missing / malformed timestamp
-    /// falls back to `.distantPast` so the row sinks to the bottom
-    /// rather than silently vanishing.
-    var timestamp: Date {
-        switch self {
-        case .filter(let entry):
-            return HistoryItem.timestampFormatter.date(from: entry.lastUsedAt) ?? .distantPast
-        case .thread(let entry):
-            return entry.openedAt
-        }
-    }
-
-    private static let timestampFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        return formatter
-    }()
-}
-
-private struct RecentThreadRow: View {
-    let entry: RecentThreadsStore.Entry
-
-    /// Mirrors `SavedFilterRow.isHovering`. Both row kinds live side-by-
-    /// side in the unified History section, so they share the exact
-    /// same hover feedback — otherwise filter rows light up and thread
-    /// rows stay dead under the same cursor gesture, which reads as a
-    /// bug ("混在してる" per the user's report).
-    @State private var isHovering = false
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "clock.arrow.circlepath")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                // Matches `SavedFilterRow`'s leading-icon column so the
-                // text gutter lines up vertically between the two row
-                // kinds in the interleaved History list.
-                .frame(width: 14, alignment: .center)
-
-            VStack(alignment: .leading, spacing: 1) {
-                Text(entry.title)
-                    .lineLimit(1)
-                if let model = entry.model {
-                    Text(model)
-                        .font(.caption2)
-                        .lineLimit(1)
-                        .foregroundStyle(SourceAppearance.color(forModel: model))
-                } else if let source = entry.source {
-                    Text(source)
-                        .font(.caption2)
-                        .lineLimit(1)
-                        .foregroundStyle(SourceAppearance.color(for: source))
-                }
-            }
-            Spacer(minLength: 0)
-        }
-        .font(.body)
-        .padding(.horizontal, 6)
-        // Vertical padding matches `SavedFilterRow` (tightened from the
-        // prior 7pt to 4pt) so the two row kinds share identical row
-        // heights and the History list reads as one tidy column.
-        .padding(.vertical, 4)
-        .contentShape(Rectangle())
-        .background(
-            RoundedRectangle(cornerRadius: 5, style: .continuous)
-                .fill(isHovering ? Color.secondary.opacity(0.08) : Color.clear)
-        )
-        // Same no-animation hover toggle as `SavedFilterRow` — see the
-        // extended rationale there. Summary: during a sidebar scroll
-        // with the cursor parked over History, rows slide under the
-        // pointer rapidly and any fade animation per row cascades into
-        // visible scroll jitter.
-        .animation(nil, value: isHovering)
-        .onHover { hovering in
-            var tx = Transaction()
-            tx.disablesAnimations = true
-            withTransaction(tx) {
-                isHovering = hovering
-            }
-        }
     }
 }
 

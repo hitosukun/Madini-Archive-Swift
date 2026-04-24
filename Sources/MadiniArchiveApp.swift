@@ -144,6 +144,48 @@ struct ShellCommandsKey: FocusedValueKey {
     typealias Value = ShellCommandActions
 }
 
+/// Prompt-level navigation actions, published by whichever
+/// surface in the scene is best-suited to interpret the gesture.
+/// Four independent closures so the menu can bind distinct
+/// shortcuts for step-walk vs jump-to-edge:
+///
+/// - `stepPrev` / `stepNext` → ⌘↑ / ⌘↓ — walk one prompt in the
+///   transcript. Useful in `.viewer` where plain ↑/↓ scrolls the
+///   reader and there's no list UI to arrow through. State 3's
+///   prompt list deliberately leaves these nil (plain ↑/↓ on the
+///   focused list already does the job, so a menu duplicate would
+///   be redundant) — the menu item greys out and the shell
+///   doesn't fall through since step semantics don't translate to
+///   thread-level.
+/// - `jumpFirst` / `jumpLast` → ⌘⇧↑ / ⌘⇧↓ — jump to the first /
+///   last prompt. Both state 3 (visible list) and viewer publish
+///   these. Outside viewer / state 3 the menu falls through to
+///   `ShellCommandActions.selectFirst/LastConversation` so the
+///   ⌘⇧↑/↓ shortcut still jumps thread edges in state 1/2.
+///
+/// `focusedValue` from a focused subtree takes precedence over
+/// `focusedSceneValue`, so state 3's publication (via
+/// `focusedValue` on the prompt list) shadows the shell's scene-
+/// wide one whenever the prompt list is in tree — preventing the
+/// "two publishers, one wins ambiguously" pitfall.
+struct PromptNavigationActions {
+    /// ⌘↑ action. Nil disables the menu item. Currently only
+    /// viewer mode populates this — state 3 relies on plain ↑/↓
+    /// which is already wired through the prompt list's focus.
+    let stepPrev: (() -> Void)?
+    /// ⌘↓ counterpart of `stepPrev`.
+    let stepNext: (() -> Void)?
+    /// ⌘⇧↑ action: jump to the first prompt of the active outline.
+    /// Nil when the outline is empty.
+    let jumpFirst: (() -> Void)?
+    /// ⌘⇧↓ counterpart of `jumpFirst`.
+    let jumpLast: (() -> Void)?
+}
+
+struct PromptNavigationKey: FocusedValueKey {
+    typealias Value = PromptNavigationActions
+}
+
 extension FocusedValues {
     var browseViewModel: BrowseViewModel? {
         get { self[BrowseViewModelKey.self] }
@@ -158,6 +200,11 @@ extension FocusedValues {
     var shellCommands: ShellCommandActions? {
         get { self[ShellCommandsKey.self] }
         set { self[ShellCommandsKey.self] = newValue }
+    }
+
+    var promptNavigation: PromptNavigationActions? {
+        get { self[PromptNavigationKey.self] }
+        set { self[PromptNavigationKey.self] = newValue }
     }
 }
 
@@ -183,6 +230,10 @@ struct AppCommands: Commands {
     @FocusedValue(\.browseViewModel) private var browseViewModel
     @FocusedValue(\.libraryViewModel) private var libraryViewModel
     @FocusedValue(\.shellCommands) private var shell
+    /// Non-nil only when state 3's prompt list owns keyboard focus.
+    /// Takes precedence over `shell`'s thread-level jump closures
+    /// so ⌘↑/⌘↓ retarget the prompt rows instead of the cards.
+    @FocusedValue(\.promptNavigation) private var promptNav
 
     var body: some Commands {
         // View menu — layout switchers. `after: .sidebar` slots them
@@ -224,17 +275,61 @@ struct AppCommands: Commands {
             // movement in the search box). Matches the macOS-wide
             // "top of document / end of document" convention for ⌘↑
             // and ⌘↓.
-            Button("First Conversation") {
-                shell?.selectFirstConversation?()
+            // Target resolution: prompt list wins when focused
+            // (state 3), otherwise fall through to the shell's
+            // thread-list jump closures. Both the call-site and
+            // the disabled-state evaluation mirror that order, so
+            // the menu item's enablement reflects whatever list
+            // the user is currently navigating.
+            // ⌘↑ / ⌘↓ — Step through prompts in the transcript.
+            // Only active in viewer mode; state 3 leaves these
+            // closures nil because the prompt list's plain ↑ / ↓
+            // already steps rows and a duplicate menu binding
+            // would be noise. In state 1/2 no `promptNav` is
+            // published, so the items grey out — ⌘↑ / ⌘↓ have no
+            // thread-level meaning now that edge-jump moved to
+            // ⌘⇧↑ / ⌘⇧↓.
+            Button("Previous Prompt") {
+                promptNav?.stepPrev?()
             }
             .keyboardShortcut(.upArrow, modifiers: .command)
-            .disabled(shell?.selectFirstConversation == nil)
+            .disabled(promptNav?.stepPrev == nil)
 
-            Button("Last Conversation") {
-                shell?.selectLastConversation?()
+            Button("Next Prompt") {
+                promptNav?.stepNext?()
             }
             .keyboardShortcut(.downArrow, modifiers: .command)
-            .disabled(shell?.selectLastConversation == nil)
+            .disabled(promptNav?.stepNext == nil)
+
+            Divider()
+
+            // ⌘⇧↑ / ⌘⇧↓ — Jump to the first / last row of
+            // whichever list is currently in focus. Resolution
+            // order: prompt-level jump when a prompt surface is
+            // focused (state 3 or viewer), otherwise thread-level
+            // via the shell. User ask: "先頭と最後尾にジャンプ
+            // するのは、cmd+shift+上下に統一した方がいいかな？" —
+            // unifies edge-jump under a single shortcut family
+            // across all three list tiers.
+            Button("First Conversation") {
+                if let jump = promptNav?.jumpFirst {
+                    jump()
+                } else {
+                    shell?.selectFirstConversation?()
+                }
+            }
+            .keyboardShortcut(.upArrow, modifiers: [.command, .shift])
+            .disabled(promptNav?.jumpFirst == nil && shell?.selectFirstConversation == nil)
+
+            Button("Last Conversation") {
+                if let jump = promptNav?.jumpLast {
+                    jump()
+                } else {
+                    shell?.selectLastConversation?()
+                }
+            }
+            .keyboardShortcut(.downArrow, modifiers: [.command, .shift])
+            .disabled(promptNav?.jumpLast == nil && shell?.selectLastConversation == nil)
 
             Divider()
 
