@@ -81,22 +81,14 @@ struct ArchiveInspectorFileListPane: View {
 
     @ViewBuilder
     private var fileList: some View {
-        // `List(selection:)` drives the inline preview via
-        // `viewModel.selectedFileID`. We wrap the binding in a deferred
-        // `Task { @MainActor in ... }` mutate for the same reason the
-        // snapshot selection does: writing to @Observable state
-        // synchronously from inside a SwiftUI Binding.set can trigger
-        // the re-entrant observe/redraw cascade that blanked the old
-        // Vault Browser's detail column on macOS.
-        let selectionBinding = Binding<String?>(
-            get: { viewModel.selectedFileID },
-            set: { newValue in
-                Task { @MainActor in
-                    viewModel.selectedFileID = newValue
-                }
-            }
-        )
-        List(selection: selectionBinding) {
+        // Direct `@Bindable` binding — unlike the snapshot selection
+        // (which triggers a `.task(id:)` that mutates the VM inside a
+        // SwiftUI update pass and needed a deferred `Task { ... }`
+        // indirection to avoid the re-entrant blanking bug), the file
+        // selection only drives a downstream preview rebuild and has
+        // no cascading observed mutations. A synchronous write keeps
+        // List's native row-highlight in lock-step with the click.
+        List(selection: $viewModel.selectedFileID) {
             ForEach(viewModel.files) { entry in
                 ArchiveInspectorFileRow(entry: entry)
                     .tag(entry.id)
