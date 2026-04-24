@@ -1483,7 +1483,10 @@ struct DesignMockRootView: View {
             onReachEnd: {
                 store.loadMoreIfNeeded(services: services)
             },
-            onOpen: onOpen
+            onOpen: onOpen,
+            onMoveSelection: { delta in
+                moveSelection(by: delta)
+            }
         )
         .id("center-table")
     }
@@ -2473,6 +2476,18 @@ private struct DesignMockThreadTablePane: View {
     /// pane Table option, so this is always wired up to "flip to
     /// `.default` so the reader appears."
     var onOpen: ((DesignMockConversation.ID) -> Void)? = nil
+    /// Step-by-one selection callback, mirroring the one on the
+    /// card-list pane. SwiftUI `Table` DOES support arrow-key
+    /// navigation natively, but only once its underlying NSTableView
+    /// is first responder — which doesn't happen automatically when
+    /// the user drills back to `.table` via ⌘← (the NSTableView was
+    /// never clicked, so AppKit never promoted it). We attach our own
+    /// focus + onKeyPress handlers at the wrapper level so the
+    /// shortcut works the moment the pane appears, without relying
+    /// on the user clicking into the table first.
+    let onMoveSelection: (Int) -> Void
+
+    @FocusState private var isFocused: Bool
 
     var body: some View {
         // Re-sort locally so header clicks reflect immediately on the page
@@ -2643,6 +2658,30 @@ private struct DesignMockThreadTablePane: View {
             }
             try? await Task.sleep(nanoseconds: 80_000_000)
             proxy.scrollTo(id, anchor: .top)
+        }
+        // Wrap-level focus + arrow key handlers. `.focusEffectDisabled`
+        // on the wrapper keeps the Table's native selection row
+        // highlight as the sole focus indicator (otherwise the whole
+        // pane would sprout an accent-blue ring). onAppear pulls
+        // focus so ⌘← from `.default` lands the user somewhere that
+        // can receive ↑/↓ immediately — the underlying NSTableView
+        // needs a click to become first responder on its own, which
+        // broke keyboard flow across layout drills (user report:
+        // "デフォルトからcmd+←でテーブルに戻ると、上下移動が
+        // 聞かなくなるね").
+        .focusable()
+        .focusEffectDisabled()
+        .focused($isFocused)
+        .onKeyPress(.upArrow) {
+            onMoveSelection(-1)
+            return .handled
+        }
+        .onKeyPress(.downArrow) {
+            onMoveSelection(1)
+            return .handled
+        }
+        .onAppear {
+            isFocused = true
         }
         } // ScrollViewReader
     }
