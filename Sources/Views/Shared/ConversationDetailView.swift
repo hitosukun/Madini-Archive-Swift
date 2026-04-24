@@ -242,10 +242,19 @@ struct ConversationPromptOutlineItem: Identifiable, Hashable {
     let label: String
 }
 
+/// Named coordinate space shared by the reader's ScrollView and every
+/// anchor-publisher underneath it (user-message top-Y observers, and —
+/// from `MessageBubbleView` — per-block search anchors). The name is
+/// module-internal rather than nested-private because the in-thread
+/// finder needs `MessageBubbleView` to publish its block offsets into
+/// the *same* preference key the reader's scroll logic reads from, so
+/// the convergence loop in `performProgrammaticScroll` can tell when a
+/// block-level jump has actually landed on target.
+enum ReaderScrollCoordinateSpace {
+    static let name: String = "conversation.reader"
+}
+
 private struct LoadedConversationDetailView: View {
-    private enum ScrollCoordinateSpace: Hashable {
-        case conversation
-    }
 
     /// Top inset (points) below which a message is considered "current".
     /// Roughly matches the floating header bar's vertical footprint so
@@ -285,6 +294,26 @@ private struct LoadedConversationDetailView: View {
     /// final preference emission to settle), so the lock is
     /// self-healing even if a scroll is interrupted.
     @State private var programmaticScrollLock: UUID?
+
+    /// Cached copy of the most-recent `PromptTopYPreferenceKey`
+    /// dictionary. `handlePromptOffsetChange` ignores it while a
+    /// programmatic scroll is in flight, but `performProgrammaticScroll`
+    /// needs to *read* it mid-scroll to tell whether the target row has
+    /// actually landed at the anchor — that's what lets the convergence
+    /// loop exit as soon as the measured top-Y is close to zero, instead
+    /// of burning the full fixed timeout every time.
+    @State private var latestPromptOffsets: [String: CGFloat] = [:]
+
+    /// Height of the ScrollView's visible viewport, captured via a
+    /// background GeometryReader on the scroll container. Paired with
+    /// `latestPromptOffsets` it lets `performProgrammaticScroll` decide
+    /// "is this block anchor already on-screen?" — the find bar's N/M
+    /// stepping uses that check to skip a redundant scroll when the
+    /// next match sits inside the currently-visible screenful, so
+    /// stepping between nearby matches no longer yanks the viewport
+    /// (user report: "毎回スクロールするより、画面外にハイライトが
+    /// あったらジャンプするという挙動にできる？").
+    @State private var readerViewportHeight: CGFloat = 0
 
     var body: some View {
         let detailBody = Group {
@@ -363,7 +392,7 @@ private struct LoadedConversationDetailView: View {
                                                     key: PromptTopYPreferenceKey.self,
                                                     value: [
                                                         message.id: proxyGeo.frame(
-                                                            in: .named(ScrollCoordinateSpace.conversation)
+                                                            in: .named(ReaderScrollCoordinateSpace.name)
                                                         ).minY
                                                     ]
                                                 )
@@ -402,7 +431,25 @@ private struct LoadedConversationDetailView: View {
                         .padding(.horizontal, 24)
                         .padding(.vertical, 16)
                     }
-                    .coordinateSpace(name: ScrollCoordinateSpace.conversation)
+                    .coordinateSpace(name: ReaderScrollCoordinateSpace.name)
+                    // Capture the ScrollView's visible height so the
+                    // find-bar step logic can tell whether a block
+                    // anchor's top-Y (read from `latestPromptOffsets`)
+                    // falls inside the viewport. The GeometryReader
+                    // sits in the background so it doesn't interfere
+                    // with layout; its size mirrors the ScrollView's
+                    // own frame.
+                    .background(
+                        GeometryReader { geo in
+                            Color.clear.preference(
+                                key: ReaderViewportSizePreferenceKey.self,
+                                value: geo.size.height
+                            )
+                        }
+                    )
+                    .onPreferenceChange(ReaderViewportSizePreferenceKey.self) { h in
+                        readerViewportHeight = h
+                    }
                     .scrollContentBackground(.hidden)
                     // Reserve scroll-overshoot room at the bottom equal to
                     // the bottom-fade height. Without this the last line
@@ -426,6 +473,11 @@ private struct LoadedConversationDetailView: View {
                         // per frame". `Task { @MainActor in … }` hops to
                         // the next runloop iteration, breaking the cycle.
                         Task { @MainActor in
+                            // Always keep the cache fresh, even while
+                            // programmaticScrollLock is held — the
+                            // convergence loop reads it to decide when the
+                            // target row has actually landed on the anchor.
+                            latestPromptOffsets = offsets
                             handlePromptOffsetChange(offsets)
                         }
                     }
@@ -589,60 +641,193 @@ private struct LoadedConversationDetailView: View {
         }
     }
 
-    /// Instant programmatic jump to the requested id. Holds
-    /// `programmaticScrollLock` for ~300ms to swallow the burst of
-    /// `PromptTopYPreferenceKey` emissions the layout cascade fires
-    /// right after the content reflows.
+    /// Instant programmatic jump to the requested id, driven by a
+    /// measurement-based convergence loop.
     ///
-    /// **Why three scrollTo calls?** The reader's body is a
-    /// `LazyVStack`, so messages below the current viewport don't
-    /// exist yet. `proxy.scrollTo(id, anchor: .top)` then has to
-    /// estimate the target's position from the heights of the rows
-    /// that *have* been materialised — usually wrong for long
-    /// conversations, so the first jump lands close to the target
-    /// but not on it. User report: "何回か押さないと指定した場所に
-    /// 綺麗に飛ばなかったり". We fire a second scrollTo one frame
-    /// later (after the target materialised and SwiftUI knows its
-    /// true height) and a third ~120ms later to absorb the final
-    /// layout settle. Each subsequent call converges toward the
-    /// correct offset. The lock stays in force through all three so
-    /// the scroll-position observer can't sneak in a stale
-    /// `selectedPromptID` between them.
+    /// **Why not just call `proxy.scrollTo` once?** The reader body is a
+    /// `LazyVStack`, so messages below the viewport haven't been
+    /// materialised. `proxy.scrollTo(id, anchor: .top)` estimates the
+    /// target's offset from the currently-known row heights — usually
+    /// wrong for distant jumps, so the first scroll lands close but not
+    /// on target. Worse, on *long* conversations a fixed-iteration
+    /// retry (what we used to do: three calls at 0ms / 16ms / 120ms)
+    /// still hadn't converged by the time the lock released, so the
+    /// user report "離れた場所にジャンプする時かなり遅くなるし反応
+    /// しないことが多い" matched the observed behavior — the last
+    /// scrollTo fired before the LazyVStack had materialised the
+    /// region, and the viewport stayed parked near the initial estimate.
     ///
-    /// Previously this used `withAnimation(.easeInOut(duration: 0.2))`
-    /// so the reader smoothly scrolled to the new position, but the
-    /// user asked for a lighter, snappier response: "スクロールより、
-    /// ジャンプして欲しい。動作が軽い方がいいので". Dropping the
-    /// animation was step one; the multi-call convergence below is
-    /// step two — together they make prompt-list and
-    /// search-next clicks land on target reliably on the first try.
+    /// The fix is to *measure* where the target actually lands after
+    /// each scroll (via the `PromptTopYPreferenceKey` cache populated
+    /// by the same GeometryReaders that feed the scroll-position
+    /// observer) and exit the loop the frame we see the target's
+    /// measured top-Y within a couple of points of the anchor (0pt,
+    /// because `anchor: .top` means the row's top should sit at the
+    /// viewport top). For nearby jumps this converges in 1–2
+    /// iterations; for distant jumps it keeps firing `scrollTo` at
+    /// ~16ms cadence until the LazyVStack has materialised the target
+    /// and the scroll offset settles.
+    ///
+    /// Total budget is capped at ~480ms (30 frames at 16ms) so a
+    /// pathological case — e.g. a target id that never appears in the
+    /// offset dictionary because the conversation list changed under us
+    /// — can't hang the lock forever. The scroll-position observer is
+    /// gated out for the duration so intermediate frames don't
+    /// overwrite `selectedPromptID` with a transient "current prompt".
     private func performProgrammaticScroll(
         to id: String?,
         using proxy: ScrollViewProxy
     ) {
         guard let id else { return }
+        // Find-bar shortcut: if the caller is targeting a search-block
+        // anchor whose top-Y falls inside the currently-visible
+        // viewport, the match is already on-screen. Skip the scroll
+        // entirely so the find bar's Next/Prev just updates the orange
+        // cursor in place — user complained about the "毎回スクロール
+        // するより、画面外にハイライトがあったらジャンプする" feel
+        // when walking matches inside one screenful of content. Only
+        // gated on the block-anchor prefix so prompt-outline taps
+        // (which the user explicitly selected and expects to land at
+        // the anchor top) keep their old behaviour.
+        if shouldSkipScrollForVisibleSearchAnchor(id) {
+            return
+        }
         let token = UUID()
         programmaticScrollLock = token
+        // Pre-materialization for distant block-anchor jumps.
+        //
+        // A block anchor lives on a nested `ForEach` `.id(...)` inside
+        // a bubble. When the owning bubble hasn't been materialized by
+        // the outer LazyVStack — common when jumping into a long
+        // assistant reply that's currently off-screen —
+        // `proxy.scrollTo(anchorID)` can no-op because the nested id
+        // isn't reachable from the proxy until the parent row exists.
+        // Detect this by the anchor's absence from the offset cache
+        // (an on-screen or adjacent block would have published its
+        // top-Y via `PromptTopYPreferenceKey` already) and do a
+        // one-shot `scrollTo` on the parent message id first so
+        // LazyVStack instantiates the bubble and its inner ids. The
+        // convergence loop below then refines onto the precise block.
+        //
+        // This materialization step used to live on the caller side
+        // (`DesignMockReaderPaneContent.performTwoStageJump`), but it
+        // fired unconditionally for every cross-message step — so
+        // stepping between two matches whose messages were both
+        // visible still scrolled the next message's top to the
+        // viewport top, exactly the "画面外にハイライトがあったら
+        // ジャンプする" feel the user wanted to avoid. Gating it on
+        // the offset-cache miss means we only pay the materialization
+        // scroll when the bubble genuinely isn't rendered yet.
+        if id.hasPrefix(SearchBlockAnchor.idPrefix),
+           latestPromptOffsets[id] == nil,
+           let messageID = Self.parentMessageID(ofBlockAnchor: id) {
+            proxy.scrollTo(messageID, anchor: .top)
+        }
+        // Fire the first scroll synchronously so the viewport starts
+        // moving in the same frame as the user gesture — avoids the
+        // "click did nothing" feeling if the loop's first await slips
+        // past a display refresh.
         proxy.scrollTo(id, anchor: .top)
         Task { @MainActor in
-            // One frame later: the LazyVStack has had a chance to
-            // materialise the target row, so the now-correct height
-            // map produces the correct scroll offset.
-            try? await Task.sleep(nanoseconds: 16_000_000)
-            guard programmaticScrollLock == token else { return }
-            proxy.scrollTo(id, anchor: .top)
-            // Layout settle: Dynamic Type, image loads, and Markdown
-            // rendering can push the target row by a few points after
-            // the frame-one correction. A final nudge at ~120ms
-            // absorbs that jitter.
-            try? await Task.sleep(nanoseconds: 120_000_000)
-            guard programmaticScrollLock == token else { return }
-            proxy.scrollTo(id, anchor: .top)
-            try? await Task.sleep(nanoseconds: 180_000_000)
+            // Tolerances:
+            //   convergedPx — how close the measured top-Y must get to
+            //     0 before we consider the row "on the anchor". A
+            //     couple of points absorbs sub-pixel rounding without
+            //     accepting a visibly-off result.
+            //   stableDeltaPx — if the measurement didn't move more
+            //     than this between two consecutive frames, layout has
+            //     settled and we can exit even if we aren't quite at 0
+            //     (e.g. the target is the very last message and the
+            //     scrollview's contentMargins prevent it from reaching
+            //     the top).
+            let convergedPx: CGFloat = 2
+            let stableDeltaPx: CGFloat = 0.5
+            let frameNanos: UInt64 = 16_000_000
+            let maxIterations = 30
+
+            var previousY: CGFloat? = nil
+            for iteration in 0..<maxIterations {
+                try? await Task.sleep(nanoseconds: frameNanos)
+                guard programmaticScrollLock == token else { return }
+
+                if let y = latestPromptOffsets[id] {
+                    // Close enough to the anchor → done.
+                    if abs(y) <= convergedPx { break }
+                    // Layout has stopped moving but we aren't at 0.
+                    // This happens when the target can't physically
+                    // reach the top (bottom bumper against
+                    // contentMargins). Ship the current position
+                    // instead of looping until the timeout.
+                    if let prev = previousY,
+                       abs(y - prev) <= stableDeltaPx,
+                       iteration >= 2 {
+                        break
+                    }
+                    previousY = y
+                }
+                // Either we don't have a measurement yet (target not
+                // materialised) or we're still approaching it. Re-fire
+                // with the now-fresher height map.
+                proxy.scrollTo(id, anchor: .top)
+            }
+
+            // Brief settle window before releasing the lock so the
+            // trailing batch of preference emissions the convergence
+            // kicked off doesn't race the observer into reassigning
+            // selection to a neighbouring prompt mid-reflow.
+            try? await Task.sleep(nanoseconds: 60_000_000)
             if programmaticScrollLock == token {
                 programmaticScrollLock = nil
             }
         }
+    }
+
+    /// Extract the owning message id from a block anchor string.
+    /// Block anchors have the form `"__mb-search-{messageID}#{index}"`
+    /// (see `MessageBubbleView.searchBlockAnchorID`). Returns nil for
+    /// strings that don't match the expected shape — the caller treats
+    /// that as "no pre-materialization needed" and lets the
+    /// convergence loop work with the id as-is.
+    private static func parentMessageID(ofBlockAnchor id: String) -> String? {
+        guard id.hasPrefix(SearchBlockAnchor.idPrefix) else { return nil }
+        let tail = id.dropFirst(SearchBlockAnchor.idPrefix.count)
+        guard let hashIdx = tail.firstIndex(of: "#") else { return nil }
+        let messageID = tail[..<hashIdx]
+        return messageID.isEmpty ? nil : String(messageID)
+    }
+
+    /// `true` when `id` refers to a find-bar block anchor AND that
+    /// anchor's top is currently inside the reader's visible viewport.
+    /// The caller uses this to skip a redundant scroll when stepping
+    /// between matches that share a screenful of content.
+    ///
+    /// Gated on the `SearchBlockAnchor.idPrefix` so only find-bar
+    /// targets get the "don't scroll if already visible" treatment —
+    /// prompt-outline anchors (user explicitly asked to jump there)
+    /// still scroll to `.top` unconditionally.
+    ///
+    /// Visibility window is `[0, viewportHeight - bottomFadeHeight]`:
+    /// - `0` as the top bound means "block top is NOT scrolled above
+    ///   the visible top"; if it were, the block's interior (where the
+    ///   match likely lives) could easily be off-screen, so we scroll.
+    /// - `viewportHeight - bottomFadeHeight` as the bottom bound keeps
+    ///   a block that's only peeking in under the bottom fade from
+    ///   counting as "visible enough" — the match sitting deeper
+    ///   inside the block would still be below the fade.
+    ///
+    /// Approximate by design: we only have block TOP-Y, not the match
+    /// position or the block's height. For most replies the match
+    /// falls within a screenful of the block top, so this is a good
+    /// trade-off against the cost of threading per-match geometry
+    /// through to the find bar.
+    private func shouldSkipScrollForVisibleSearchAnchor(_ id: String) -> Bool {
+        guard id.hasPrefix(SearchBlockAnchor.idPrefix) else { return false }
+        guard readerViewportHeight > 0 else { return false }
+        guard let y = latestPromptOffsets[id] else { return false }
+        let topBound: CGFloat = 0
+        let bottomBound: CGFloat = readerViewportHeight
+            - WorkspaceLayoutMetrics.bottomFadeHeight
+        return y >= topBound && y <= bottomBound
     }
 
     /// Scroll the body back to `Self.topAnchorID`. Shared by the
@@ -696,8 +881,22 @@ private struct LoadedConversationDetailView: View {
         // clean observer fire.
         guard programmaticScrollLock == nil else { return }
 
+        // The preference dictionary is shared with the in-thread search
+        // infrastructure: `MessageBubbleView` publishes one entry per
+        // rendered block inside an assistant reply so
+        // `performProgrammaticScroll` can measure per-block jumps.
+        // Those anchors are NOT prompt boundaries — they sit below the
+        // owning user message — so let them through to the outline
+        // cursor logic would flip the "current prompt" readout to
+        // mid-reply block anchors as the user scrolls. Filter by the
+        // shared `SearchBlockAnchor.idPrefix` so only bona-fide prompt
+        // ids compete for the current-prompt slot.
+        let promptOffsets = offsets.filter {
+            !$0.key.hasPrefix(SearchBlockAnchor.idPrefix)
+        }
+        guard !promptOffsets.isEmpty else { return }
         let threshold = Self.currentPromptTopThreshold
-        let crossed = offsets.filter { $0.value <= threshold }
+        let crossed = promptOffsets.filter { $0.value <= threshold }
 
         let candidate: String?
         if let top = crossed.max(by: { $0.value < $1.value })?.key {
@@ -705,7 +904,7 @@ private struct LoadedConversationDetailView: View {
         } else {
             // Haven't scrolled past the first prompt yet — default to
             // the earliest message (smallest minY).
-            candidate = offsets.min(by: { $0.value < $1.value })?.key
+            candidate = promptOffsets.min(by: { $0.value < $1.value })?.key
         }
 
         guard let candidate else { return }
@@ -730,14 +929,58 @@ private struct LoadedConversationDetailView: View {
     }
 }
 
-/// Per-message top-edge y coordinate in the ScrollView's coordinate
-/// space. Each user message contributes one entry; merge is a plain
-/// dictionary merge because keys (message ids) are unique.
-private struct PromptTopYPreferenceKey: PreferenceKey {
+/// Per-anchor top-edge y coordinate in the ScrollView's coordinate
+/// space. Two kinds of keys live in this dictionary:
+///
+/// - **User-message ids** (e.g. `"msg-123"`): published by the
+///   observers in `LoadedConversationDetailView` and consumed by the
+///   outline cursor in `handlePromptOffsetChange`. The outline logic
+///   filters block-level ids out so a per-block offset can't be
+///   mistaken for a prompt boundary.
+///
+/// - **Block-level search anchors** (prefixed with
+///   `"__mb-search-"`, see
+///   `MessageBubbleView.searchBlockAnchorID(messageID:blockIndex:)`):
+///   published by `MessageBubbleView` for every rendered block inside
+///   an assistant reply, so `performProgrammaticScroll` can measure
+///   whether an in-thread-search block jump has actually landed on
+///   target, instead of burning its whole timeout on a distant one-
+///   shot `proxy.scrollTo` that an under-materialised LazyVStack
+///   answered with a stale estimate.
+///
+/// Merge is a plain dictionary overwrite because anchor ids are unique
+/// across the reader body — the last emission from a GeometryReader is
+/// always the authoritative current position.
+internal struct PromptTopYPreferenceKey: PreferenceKey {
     static var defaultValue: [String: CGFloat] = [:]
 
     static func reduce(value: inout [String: CGFloat], nextValue: () -> [String: CGFloat]) {
         value.merge(nextValue()) { _, new in new }
+    }
+}
+
+/// Shared id prefix for `MessageBubbleView`-published block scroll
+/// anchors. Used both at the publishing site (building the id) and at
+/// the consuming site (`handlePromptOffsetChange` filters by this
+/// prefix so block anchors never compete with user-prompt anchors for
+/// the outline cursor slot).
+internal enum SearchBlockAnchor {
+    static let idPrefix: String = "__mb-search-"
+}
+
+/// Published by a background `GeometryReader` on the reader ScrollView
+/// so the detail view can cache the current viewport height. Used by
+/// `performProgrammaticScroll` to decide whether a find-bar block
+/// anchor is already on-screen (and therefore the step can skip its
+/// scroll, leaving the viewport alone and letting the orange cursor
+/// repaint in place).
+private struct ReaderViewportSizePreferenceKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        // Last emission wins — the ScrollView only publishes one value
+        // at a time, so the "newer" reading is always authoritative.
+        value = nextValue()
     }
 }
 

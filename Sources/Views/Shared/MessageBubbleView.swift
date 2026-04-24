@@ -14,23 +14,41 @@ import SwiftMath
 ///
 /// Semantics:
 /// - `query` empty / whitespace → no highlight (cheap no-op path).
-/// - `activeMessageID == message.id` + `activeOccurrenceInMessage == N` →
-///   the Nth (0-indexed) occurrence inside that message is the single
-///   "you are here" hit and gets the hot color; every other occurrence
-///   (in this message and across the thread) stays in the dim "also
-///   hit" color.
-/// - `activeMessageID == message.id` with `activeOccurrenceInMessage ==
-///   nil` → every occurrence in this message gets the hot color
-///   (legacy message-level cursor). Retained so non-per-occurrence
-///   callers keep working.
+/// - `activeAnchorID` matches the current block's anchor +
+///   `activeOccurrenceInBlock == N` → the Nth (0-indexed) occurrence
+///   inside that specific rendered block is the single "you are here"
+///   hit and gets the hot color; every other occurrence (in this
+///   block, in other blocks of this message, or across the thread)
+///   stays in the dim "also hit" color.
+/// - `activeAnchorID` matches the current block with
+///   `activeOccurrenceInBlock == nil` → every occurrence in this block
+///   gets the hot color (block-level cursor). Retained so non-per-
+///   occurrence callers keep working.
+///
+/// The anchor id is threaded EXPLICITLY down `MessageBubbleView`'s
+/// render chain (`renderItem` → `renderBlock` → per-block helpers →
+/// `applyingSearchHighlight`) as a `blockAnchorID` parameter. For user
+/// messages it's the message id; for rendered assistant replies it's
+/// the per-render-item block anchor id produced by
+/// `searchBlockAnchorID(messageID:blockIndex:)`. Earlier iterations
+/// tried to deliver this via `@Environment`, but `@Environment` on a
+/// view reads from the PARENT scope — writing
+/// `.environment(\.currentSearchBlockAnchor, …)` inside the view's own
+/// body never flowed back to `self`'s env read, so the hot cursor was
+/// silently painted with `nil` and never showed up. This granularity
+/// is what keeps the "hot" highlight on the *one* match the find bar's
+/// N/M cursor points at in a long assistant reply with many matches.
 struct SearchHighlightSpec: Equatable {
     var query: String
-    var activeMessageID: String?
-    /// Which specific occurrence inside `activeMessageID` is the current
-    /// jump target. 0-indexed against a case-insensitive left-to-right
-    /// scan of the message text. `nil` falls back to the message-level
-    /// highlight so older call sites keep working without opting in.
-    var activeOccurrenceInMessage: Int?
+    /// Anchor id (user message id OR assistant block anchor id) that
+    /// contains the active match. `nil` → no block is hot.
+    var activeAnchorID: String?
+    /// Which occurrence inside the active block is the current jump
+    /// target. 0-indexed against a case-insensitive left-to-right scan
+    /// of that block's rendered text (the same scan
+    /// `applyingSearchHighlight` uses). `nil` falls back to block-level
+    /// highlight so older call sites keep working.
+    var activeOccurrenceInBlock: Int?
 
     var normalizedQuery: String {
         query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -173,6 +191,11 @@ struct MessageBubbleView: View, Equatable {
     #endif
 
     var body: some View {
+        bodyContent
+    }
+
+    @ViewBuilder
+    private var bodyContent: some View {
         // Two layouts:
         //
         // - **User** → classic speech-bubble form. Avatar lives in its own
@@ -262,7 +285,7 @@ struct MessageBubbleView: View, Equatable {
 
             attachmentImagesView(alignment: .trailing)
 
-            Text(highlightedVerbatim(message.content))
+            Text(highlightedVerbatim(message.content, blockAnchorID: message.id))
                 .font(.system(size: Layout.bodyFontSize))
                 .textSelection(.enabled)
                 .multilineTextAlignment(.leading)
@@ -376,7 +399,7 @@ struct MessageBubbleView: View, Equatable {
             // normal text-only reader path.
             attachmentImagesView(alignment: .trailing)
 
-            Text(highlightedVerbatim(message.content))
+            Text(highlightedVerbatim(message.content, blockAnchorID: message.id))
                 .font(.system(size: Layout.bodyFontSize))
                 .textSelection(.enabled)
                 .multilineTextAlignment(.leading)
@@ -421,13 +444,53 @@ struct MessageBubbleView: View, Equatable {
                 // as user prompts, so power-users can inspect raw
                 // content without losing formatting chars.
                 if displayMode == .plain {
-                    Text(highlightedVerbatim(message.content))
+                    Text(highlightedVerbatim(message.content, blockAnchorID: message.id))
                         .font(.system(size: Layout.bodyFontSize))
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 } else {
-                    ForEach(Array(renderItems.enumerated()), id: \.offset) { _, item in
-                        renderItem(item)
+                    ForEach(Array(renderItems.enumerated()), id: \.offset) { offset, item in
+                        let anchorID = Self.searchBlockAnchorID(
+                            messageID: message.id,
+                            blockIndex: offset
+                        )
+                        // Pass the anchor EXPLICITLY to `renderItem` so
+                        // `applyingSearchHighlight` — called deep inside
+                        // the render chain — compares against the right
+                        // per-block id. An earlier env-based delivery
+                        // (`.environment(\.currentSearchBlockAnchor,…)`)
+                        // didn't work because @Environment on
+                        // MessageBubbleView reads its PARENT scope, not
+                        // any `.environment(...)` written inside its
+                        // own body — the env write was silently nil at
+                        // the call site and the orange cursor never
+                        // painted.
+                        renderItem(item, blockAnchorID: anchorID)
+                            // Register a scroll target per block so the
+                            // find-bar's Next/Prev can land on the
+                            // specific match inside a long reply,
+                            // rather than always snapping back to the
+                            // message top.
+                            .id(anchorID)
+                            // Publish this block's top-Y so the
+                            // convergence loop in
+                            // `performProgrammaticScroll` can tell when
+                            // a block-level jump has actually landed,
+                            // instead of always eating its full
+                            // 480ms timeout because the target id
+                            // never shows up in the offset cache.
+                            .background(
+                                GeometryReader { proxyGeo in
+                                    Color.clear.preference(
+                                        key: PromptTopYPreferenceKey.self,
+                                        value: [
+                                            anchorID: proxyGeo.frame(
+                                                in: .named(ReaderScrollCoordinateSpace.name)
+                                            ).minY
+                                        ]
+                                    )
+                                }
+                            )
                     }
                 }
             }
@@ -443,30 +506,46 @@ struct MessageBubbleView: View, Equatable {
     // MARK: - Block rendering
 
     @ViewBuilder
-    private func renderItem(_ item: MessageRenderItem) -> some View {
+    private func renderItem(
+        _ item: MessageRenderItem,
+        blockAnchorID: String
+    ) -> some View {
         switch item {
         case .block(let block):
-            renderBlock(block)
+            renderBlock(block, blockAnchorID: blockAnchorID)
         case .foreignLanguageGroup(let language, let blocks):
             ForeignLanguageBlockView(language: language, blocks: blocks) { displayBlocks in
+                // All sub-blocks inside a foreign-language group share
+                // the outer group's anchor, so matches inside any
+                // paragraph of the group hot-color as a single unit
+                // when the find bar's cursor points at this group.
                 ForEach(Array(displayBlocks.enumerated()), id: \.offset) { _, block in
-                    renderBlock(block)
+                    renderBlock(block, blockAnchorID: blockAnchorID)
                 }
             }
         }
     }
 
     @ViewBuilder
-    private func renderBlock(_ block: ContentBlock) -> some View {
+    private func renderBlock(
+        _ block: ContentBlock,
+        blockAnchorID: String
+    ) -> some View {
         switch block {
         case .paragraph(let text):
-            paragraphView(text)
+            paragraphView(text, blockAnchorID: blockAnchorID)
         case .heading(let level, let text):
-            headingView(level: level, text: text)
+            headingView(level: level, text: text, blockAnchorID: blockAnchorID)
         case .listItem(let ordered, let depth, let text, let marker):
-            listItemView(ordered: ordered, depth: depth, text: text, marker: marker)
+            listItemView(
+                ordered: ordered,
+                depth: depth,
+                text: text,
+                marker: marker,
+                blockAnchorID: blockAnchorID
+            )
         case .blockquote(let text):
-            blockquoteView(text)
+            blockquoteView(text, blockAnchorID: blockAnchorID)
         case .code(let language, let code):
             CodeBlockView(language: language, code: code, fontSize: Layout.codeFontSize)
         case .math(let source):
@@ -477,7 +556,16 @@ struct MessageBubbleView: View, Equatable {
                 rows: rows,
                 alignments: alignments,
                 fontSize: Layout.bodyFontSize,
-                renderInline: { renderInlineRich($0, fontSize: Layout.bodyFontSize) }
+                renderInline: { text in
+                    // Capture this block's anchor so the table's inline
+                    // cells flow through the same hot/dim decision as
+                    // top-level paragraphs in this block.
+                    renderInlineRich(
+                        text,
+                        fontSize: Layout.bodyFontSize,
+                        blockAnchorID: blockAnchorID
+                    )
+                }
             )
         case .horizontalRule:
             Divider()
@@ -488,12 +576,19 @@ struct MessageBubbleView: View, Equatable {
     }
 
     @ViewBuilder
-    private func paragraphView(_ text: String) -> some View {
+    private func paragraphView(
+        _ text: String,
+        blockAnchorID: String
+    ) -> some View {
         let rendered: Text = {
             if canRenderMarkdown(text) {
-                return renderInlineRich(text, fontSize: Layout.bodyFontSize)
+                return renderInlineRich(
+                    text,
+                    fontSize: Layout.bodyFontSize,
+                    blockAnchorID: blockAnchorID
+                )
             }
-            return Text(highlightedVerbatim(text))
+            return Text(highlightedVerbatim(text, blockAnchorID: blockAnchorID))
         }()
 
         rendered
@@ -504,7 +599,11 @@ struct MessageBubbleView: View, Equatable {
     }
 
     @ViewBuilder
-    private func headingView(level: Int, text: String) -> some View {
+    private func headingView(
+        level: Int,
+        text: String,
+        blockAnchorID: String
+    ) -> some View {
         let size: CGFloat = {
             switch level {
             case 1: return Layout.heading1FontSize
@@ -514,7 +613,7 @@ struct MessageBubbleView: View, Equatable {
             }
         }()
 
-        renderInlineRich(text, fontSize: size)
+        renderInlineRich(text, fontSize: size, blockAnchorID: blockAnchorID)
             .font(.system(size: size, weight: .semibold))
             .textSelection(.enabled)
             .padding(.top, level <= 2 ? 6 : 2)
@@ -524,14 +623,24 @@ struct MessageBubbleView: View, Equatable {
     }
 
     @ViewBuilder
-    private func listItemView(ordered: Bool, depth: Int, text: String, marker: String) -> some View {
+    private func listItemView(
+        ordered: Bool,
+        depth: Int,
+        text: String,
+        marker: String,
+        blockAnchorID: String
+    ) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 6) {
             Text(marker)
                 .font(.system(size: Layout.bodyFontSize).monospacedDigit())
                 .foregroundStyle(.secondary)
                 .frame(minWidth: ordered ? 22 : 14, alignment: .trailing)
 
-            renderInlineRich(text, fontSize: Layout.bodyFontSize)
+            renderInlineRich(
+                text,
+                fontSize: Layout.bodyFontSize,
+                blockAnchorID: blockAnchorID
+            )
                 .font(.system(size: Layout.bodyFontSize))
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -541,13 +650,20 @@ struct MessageBubbleView: View, Equatable {
     }
 
     @ViewBuilder
-    private func blockquoteView(_ text: String) -> some View {
+    private func blockquoteView(
+        _ text: String,
+        blockAnchorID: String
+    ) -> some View {
         HStack(alignment: .top, spacing: 8) {
             RoundedRectangle(cornerRadius: 1.5, style: .continuous)
                 .fill(Color.accentColor.opacity(0.6))
                 .frame(width: 3)
 
-            renderInlineRich(text, fontSize: Layout.bodyFontSize)
+            renderInlineRich(
+                text,
+                fontSize: Layout.bodyFontSize,
+                blockAnchorID: blockAnchorID
+            )
                 .font(.system(size: Layout.bodyFontSize).italic())
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)
@@ -815,6 +931,92 @@ struct MessageBubbleView: View, Equatable {
         message.content.count <= Layout.maxRenderedMessageLength
     }
 
+    // MARK: - In-thread search anchor helpers
+
+    /// Scroll-anchor id for an individual assistant block. Pairs with
+    /// the per-renderItem `.id(...)` in `assistantMessageColumn` so the
+    /// find-bar's Next/Prev can scroll to the block containing the
+    /// active match, not just to the message top.
+    ///
+    /// Prefix matches `SearchBlockAnchor.idPrefix` so the reader's
+    /// outline-cursor logic can cleanly filter these ids back out
+    /// (they're NOT prompt boundaries).
+    static func searchBlockAnchorID(messageID: String, blockIndex: Int) -> String {
+        "\(SearchBlockAnchor.idPrefix)\(messageID)#\(blockIndex)"
+    }
+
+    /// Build the (text, anchorID) list the in-thread search scanner
+    /// needs — one entry per addressable render block inside the
+    /// message, in the same order the view lays them out.
+    ///
+    /// - User messages: a single entry whose anchor id is the outer
+    ///   message id, since the whole prompt renders as one Text.
+    /// - Assistant messages: one entry per `MessageRenderItem` produced
+    ///   by `ForeignLanguageGrouping.group(...)`, so the scanner's
+    ///   per-block occurrence counting stays aligned with
+    ///   `applyingSearchHighlight`'s per-block scan.
+    ///
+    /// Caller is `DesignMockReaderPaneContent.recomputeMatches`. Lives
+    /// here so the block-enumeration logic is owned by exactly the
+    /// view that renders the blocks — the two can't drift out of
+    /// sync as the markdown parser / grouper evolves.
+    static func searchableBlocks(
+        for message: Message
+    ) -> [(text: String, anchorID: String)] {
+        if message.isUser {
+            return [(message.content, message.id)]
+        }
+        let parsed = ContentBlock.parse(message.content)
+        let items = ForeignLanguageGrouping.group(parsed)
+        return items.enumerated().map { offset, item in
+            let anchorID = searchBlockAnchorID(
+                messageID: message.id,
+                blockIndex: offset
+            )
+            return (searchText(for: item), anchorID)
+        }
+    }
+
+    /// Visible-text payload for a single render item. Matches the text
+    /// the layout-side `applyingSearchHighlight` scans, so occurrence
+    /// indices produced here line up with the ones the renderer sees
+    /// when it picks which range to hot-color.
+    private static func searchText(for item: MessageRenderItem) -> String {
+        switch item {
+        case .block(let block):
+            return searchText(for: block)
+        case .foreignLanguageGroup(_, let blocks):
+            return blocks.map(searchText(for:)).joined(separator: "\n")
+        }
+    }
+
+    private static func searchText(for block: ContentBlock) -> String {
+        switch block {
+        case .paragraph(let text):
+            return text
+        case .heading(_, let text):
+            return text
+        case .listItem(_, _, let text, _):
+            return text
+        case .blockquote(let text):
+            return text
+        case .code(_, let code):
+            return code
+        case .math(let source):
+            return source
+        case .table(let headers, let rows, _):
+            var parts: [String] = headers
+            for row in rows {
+                parts.append(contentsOf: row)
+            }
+            return parts.joined(separator: " ")
+        case .horizontalRule:
+            return ""
+        case .image(_, let alt):
+            return alt
+        }
+    }
+
     /// Inline-only markdown: bold, italic, inline code, links. We handle
     /// block structures (headings, lists, etc.) ourselves above, so we
     /// specifically do NOT want `.full` here — that would double-format
@@ -826,22 +1028,34 @@ struct MessageBubbleView: View, Equatable {
     /// paragraphs), so we memoize by the exact source string. Cache lives at
     /// process scope because the same paragraph often repeats across messages
     /// (greetings, signatures, template replies).
-    private func renderInlineMarkdown(_ text: String) -> AttributedString {
+    private func renderInlineMarkdown(
+        _ text: String,
+        blockAnchorID: String
+    ) -> AttributedString {
         // The cache stores the markdown-parsed `AttributedString` keyed
         // on source text only — deliberately NOT on the search spec, so
         // the cache stays valid across typing. Highlight runs are applied
         // on the way out as a cheap post-pass; they mutate only the
         // `.backgroundColor` attribute of character ranges that match,
         // which is O(n) in the paragraph length.
-        applyingSearchHighlight(to: InlineMarkdownCache.shared.render(text))
+        applyingSearchHighlight(
+            to: InlineMarkdownCache.shared.render(text),
+            blockAnchorID: blockAnchorID
+        )
     }
 
     /// Wrap a raw `String` in an `AttributedString`, applying any active
     /// search highlight. Used for the three verbatim-text paths (user
     /// prompt, assistant plain mode, oversized-paragraph fallback) that
     /// bypass the markdown pipeline entirely.
-    private func highlightedVerbatim(_ text: String) -> AttributedString {
-        applyingSearchHighlight(to: AttributedString(text))
+    private func highlightedVerbatim(
+        _ text: String,
+        blockAnchorID: String
+    ) -> AttributedString {
+        applyingSearchHighlight(
+            to: AttributedString(text),
+            blockAnchorID: blockAnchorID
+        )
     }
 
     /// Paint `.backgroundColor` runs onto every case-insensitive substring
@@ -849,7 +1063,23 @@ struct MessageBubbleView: View, Equatable {
     /// empty, or when this bubble's message content doesn't contain the
     /// query (the containment check is a cheap filter to skip the
     /// per-range scan for the majority of bubbles that aren't hits).
-    private func applyingSearchHighlight(to attr: AttributedString) -> AttributedString {
+    ///
+    /// `blockAnchorID` identifies the rendered block this attributed
+    /// string belongs to. It's compared against
+    /// `SearchHighlightSpec.activeAnchorID` to decide whether THIS block
+    /// should draw its Nth match in the hot color (orange) or leave all
+    /// matches in the dim color (yellow). Threading this in as an
+    /// explicit parameter — rather than via `@Environment` on
+    /// MessageBubbleView — is load-bearing: SwiftUI's `@Environment`
+    /// properties on a view are read from the view's PARENT scope, so a
+    /// `.environment(...)` modifier applied INSIDE MessageBubbleView's
+    /// body never flows back up to `self`'s env read. A per-block env
+    /// write was silently nil-valued at this call site, which is why
+    /// the orange cursor was never visible.
+    private func applyingSearchHighlight(
+        to attr: AttributedString,
+        blockAnchorID: String
+    ) -> AttributedString {
         guard let spec = searchHighlight, !spec.isEmpty else { return attr }
         let needle = spec.normalizedQuery
         // Fast path: this bubble isn't a match, don't scan its runs.
@@ -857,15 +1087,9 @@ struct MessageBubbleView: View, Equatable {
             return attr
         }
         var result = attr
-        let isActiveMessage = (spec.activeMessageID == message.id)
-        // Per-occurrence active index: when the find bar's cursor
-        // points at a specific occurrence inside this message, only
-        // that single occurrence gets the hot color. If the caller
-        // didn't opt into per-occurrence semantics (legacy callers
-        // pass `nil`), fall back to painting every occurrence in the
-        // active message hot — this preserves the old message-level
-        // cursor behavior.
-        let activeOccurrence = spec.activeOccurrenceInMessage
+        let isActiveBlock = spec.activeAnchorID != nil
+            && spec.activeAnchorID == blockAnchorID
+        let activeOccurrence = spec.activeOccurrenceInBlock
         let hot = Color.orange.opacity(0.55)
         let dim = Color.yellow.opacity(0.45)
 
@@ -875,7 +1099,7 @@ struct MessageBubbleView: View, Equatable {
               let range = result[searchStart..<result.endIndex]
                 .range(of: needle, options: .caseInsensitive) {
             let isHot: Bool
-            if isActiveMessage {
+            if isActiveBlock {
                 if let target = activeOccurrence {
                     isHot = occurrenceIndex == target
                 } else {
@@ -912,12 +1136,16 @@ struct MessageBubbleView: View, Equatable {
     /// concatenated `Text` with a `baselineOffset(-descent)` so the
     /// math's internal baseline lines up with the surrounding prose
     /// baseline instead of its bounding box sitting on top.
-    private func renderInlineRich(_ text: String, fontSize: CGFloat) -> Text {
+    private func renderInlineRich(
+        _ text: String,
+        fontSize: CGFloat,
+        blockAnchorID: String
+    ) -> Text {
         // Fast path: nothing that could possibly be inline math. Skip
         // the splitter entirely and go straight to the existing
         // markdown path (which itself has a fast path for pure prose).
         if !text.contains("$") && !text.contains("\\(") {
-            return Text(renderInlineMarkdown(text))
+            return Text(renderInlineMarkdown(text, blockAnchorID: blockAnchorID))
         }
 
         let runs = InlineMathSplitter.split(text)
@@ -926,14 +1154,14 @@ struct MessageBubbleView: View, Equatable {
         // to the plain-markdown path so we don't pay for Text
         // concatenation when there's nothing to typeset.
         if runs.count == 1, case .text(let only) = runs[0] {
-            return Text(renderInlineMarkdown(only))
+            return Text(renderInlineMarkdown(only, blockAnchorID: blockAnchorID))
         }
 
         var result = Text("")
         for run in runs {
             switch run {
             case .text(let segment):
-                result = result + Text(renderInlineMarkdown(segment))
+                result = result + Text(renderInlineMarkdown(segment, blockAnchorID: blockAnchorID))
             case .math(let latex):
                 if let rendered = InlineMathImageCache.shared.rendered(for: latex, fontSize: fontSize) {
                     #if os(macOS)

@@ -203,9 +203,20 @@ fileprivate final class DesignMockDataStore: ObservableObject {
             guard let detail = try await services.conversations.fetchDetail(id: conversationID) else {
                 return []
             }
+            // Filter THEN enumerate — the previous order enumerated all
+            // messages (user + assistant) and filtered down to user, so
+            // `idx` was the position in the full transcript, not the
+            // prompt-within-thread count. That produced a jumpy
+            // "1, 3, 5, 7…" display in the card outline whenever
+            // assistant replies sat between prompts. The canonical
+            // `ConversationDetailView.promptOutline` already uses
+            // user-only numbering for the same reason; keeping the
+            // DesignMock outline aligned avoids a visual mismatch
+            // between the expanded card ("1, 3, 5…") and the reader
+            // header counter ("1 / 12").
             let prompts = detail.messages
+                .filter { $0.isUser }
                 .enumerated()
-                .filter { $0.element.isUser }
                 .map { idx, message in
                     DesignMockPrompt(
                         id: message.id,
@@ -912,7 +923,21 @@ struct DesignMockRootView: View {
                 if showingAutoIntake {
                     AutoIntakeDetailPlaceholder()
                 } else {
-                    readerPane(inThreadSearch: nil)
+                    // Unified with viewer/focus mode: the toolbar search
+                    // field is an in-thread finder in default mode too.
+                    // User request: "デフォルトビューのときはフォーカス
+                    // ビューと同様にスレッド検索で統一して". Previously
+                    // default routed `searchText` into `composedQuery`
+                    // as a library-level keyword filter on the card
+                    // list; now both modes share the same reader-find
+                    // behavior, and library-scoped filtering happens
+                    // via the sidebar (Sources / Bookmarks / History)
+                    // and DSL directives (`source:` etc., which still
+                    // flow through `parsed.sortToken` + scope logic in
+                    // `composedQuery`). `.table` mode still uses the
+                    // field as a library keyword filter since a table
+                    // without the reader pane has no thread to search.
+                    readerPane(inThreadSearch: $searchText)
                 }
             }
             .id("default")
@@ -1037,11 +1062,14 @@ struct DesignMockRootView: View {
                 pendingPromptID: $pendingPromptID,
                 libraryViewModel: libraryViewModel,
                 inThreadSearch: inThreadSearch,
-                // Only the focus/viewer-mode reader acts on the Enter
-                // token — in default mode the search field drives the
-                // center-pane filter instead, so Enter there should
-                // NOT also be hijacked into a reader-side step. Pass
-                // nil to mute the signal in that mode.
+                // Gate Enter-to-step-match on whether this call site is
+                // actually running an in-thread search. `.default` and
+                // `.viewer` both pass a non-nil binding → Enter steps
+                // matches. The now-orphan `inThreadSearch == nil` branch
+                // is only taken by call sites that don't surface the
+                // in-thread finder (e.g. future embeds / previews) so
+                // pressing Enter in the toolbar field there is a silent
+                // no-op rather than a hijacked reader step.
                 findNextToken: inThreadSearch == nil ? nil : $findNextToken
             )
         } else {
@@ -1217,7 +1245,16 @@ struct DesignMockRootView: View {
         // switches.
         var query = DesignMockDataStore.FetchQuery()
         let parsed = DesignMockQueryLanguage.parse(searchText)
-        if selectedLayoutMode != .viewer {
+        // Only `.table` mode (no reader pane) treats the free-text
+        // keyword as a library filter. `.default` and `.viewer` both
+        // ship it to the reader as an in-thread query instead — they
+        // each have a thread open, and the user's mental model for the
+        // search field in those modes is "find inside what I'm reading"
+        // (request: "デフォルトビューのときはフォーカスビューと同様に
+        // スレッド検索で統一して"). DSL directives like `sort:` and
+        // sidebar-driven scoping still apply below so library navigation
+        // remains possible without the keyword filter.
+        if selectedLayoutMode == .table {
             query.keyword = parsed.keyword.trimmingCharacters(in: .whitespacesAndNewlines)
         }
         query.sortKey = DesignMockQueryLanguage.dbSortKey(from: parsed.sortToken)
@@ -1279,12 +1316,16 @@ struct DesignMockRootView: View {
 
     /// Toolbar search field placeholder. Flips with the layout mode so the
     /// affordance tells the user what the field currently does — library
-    /// filter vs. in-thread finder.
+    /// filter vs. in-thread finder. `.default` joins `.viewer` on the
+    /// in-thread side since both modes have a reader pane visible and
+    /// share a single "find in the open thread" semantic; only `.table`
+    /// (no reader) still uses the field for library-wide keyword
+    /// filtering.
     private var searchPrompt: String {
         switch selectedLayoutMode {
-        case .table, .default:
+        case .table:
             return "ライブラリを検索"
-        case .viewer:
+        case .default, .viewer:
             return "このスレッド内を検索"
         }
     }
@@ -1535,13 +1576,21 @@ private struct DesignMockSidebar: View {
                                 .lineLimit(1)
                         }
                     }
-                    Spacer(minLength: 4)
                     if hasDisclosure {
                         // Dedicated tappable region so clicking the
                         // chevron only toggles expansion — the rest of
                         // the row still fires selection. Matches the
                         // macOS convention where the row label and the
                         // disclosure arrow are independent hit targets.
+                        //
+                        // Chevron hugs the title column instead of
+                        // floating out at the row's trailing edge —
+                        // with no natural end-of-row content next to
+                        // it, a trailing-edge position read as
+                        // "disconnected" (user flag: "矢印が離れすぎ
+                        // ている"). The `Spacer` below fills the
+                        // remainder of the row so the selection pill
+                        // still spans full width.
                         Button {
                             onToggleDisclosure?()
                         } label: {
@@ -1554,6 +1603,7 @@ private struct DesignMockSidebar: View {
                         }
                         .buttonStyle(.plain)
                     }
+                    Spacer(minLength: 0)
                 }
                 .padding(.horizontal, 4)
                 .padding(.vertical, 4)
@@ -1765,6 +1815,22 @@ private struct DesignMockThreadListPane: View {
                         // Padding is INSIDE the hit shape — tapping in
                         // the edge margin still registers as the row.
                         .contentShape(Rectangle())
+                        // Subtle inter-card divider. Mail / Finder-style
+                        // hairline at ~6% primary; 0.5pt on retina reads
+                        // as a barely-there separator without competing
+                        // with the selection pill or source color dots.
+                        // Suppressed on the last row so the list doesn't
+                        // end on a line. Inset by the same 12pt the card
+                        // itself uses so the divider aligns with the pill
+                        // edges rather than the pane edges.
+                        .overlay(alignment: .bottom) {
+                            if conversation.id != conversations.last?.id {
+                                Rectangle()
+                                    .fill(Color.primary.opacity(0.06))
+                                    .frame(height: 0.5)
+                                    .padding(.horizontal, 12)
+                            }
+                        }
                         // `.id(conversation.id)` attaches a
                         // `ScrollViewReader`-visible anchor to each row,
                         // so `proxy.scrollTo(id, anchor: .top)` lands
@@ -2339,14 +2405,21 @@ private struct DesignMockReaderPaneContent: View {
     /// `matchLocations.indices` — reset to 0 when the list changes.
     @State private var currentMatchIndex: Int = 0
 
-    /// A single keyword hit. `occurrenceInMessage` is the 0-indexed
-    /// rank of this hit inside its own message under a case-insensitive
-    /// left-to-right scan, and matches the indexing
-    /// `MessageBubbleView.applyingSearchHighlight` uses when picking
-    /// which range to paint hot.
+    /// A single keyword hit. `anchorID` is the per-block scroll anchor
+    /// (see `MessageBubbleView.searchBlockAnchorID`), used both as the
+    /// scroll target and as the identity `applyingSearchHighlight`
+    /// compares against to decide which block owns the active hit.
+    /// `occurrenceInBlock` is the 0-indexed rank of this hit inside its
+    /// own block under a case-insensitive left-to-right scan, matching
+    /// the per-block indexing the bubble uses when picking which range
+    /// to paint hot. `messageID` is kept so the stepper can detect
+    /// cross-message jumps (which need a two-stage scroll to
+    /// materialize the destination bubble before the precise block
+    /// anchor resolves).
     fileprivate struct MatchLocation: Equatable {
         let messageID: String
-        let occurrenceInMessage: Int
+        let anchorID: String
+        let occurrenceInBlock: Int
     }
     /// Monotonic token used to cancel in-flight search recomputations
     /// when the user keeps typing.
@@ -2534,8 +2607,8 @@ private struct DesignMockReaderPaneContent: View {
             : nil
         return SearchHighlightSpec(
             query: q,
-            activeMessageID: location?.messageID,
-            activeOccurrenceInMessage: location?.occurrenceInMessage
+            activeAnchorID: location?.anchorID,
+            activeOccurrenceInBlock: location?.occurrenceInBlock
         )
     }
 
@@ -2563,42 +2636,69 @@ private struct DesignMockReaderPaneContent: View {
             // Case-insensitive substring scan. We intentionally don't
             // tokenize — the user's mental model for an in-thread
             // finder is "literal substring", matching ⌘F in every text
-            // editor. Per message we walk left-to-right and record
-            // each hit; the resulting flat list is what the find bar's
-            // N/M cursor steps through.
+            // editor.
+            //
+            // The scan happens PER BLOCK rather than per message
+            // because long assistant replies render as many separate
+            // bubble sub-views (paragraph / heading / code / table /
+            // …), and each carries its own scroll anchor. Stepping
+            // through matches needs block-level granularity or the
+            // scroll jump and the highlight cursor desync for long
+            // replies — user report: "アシスタントの回答みたいに
+            // テキストが長くなると、ハイライトが一つずつ追えなく
+            // なり、スクロールのジャンプも機能しなくなる".
+            //
+            // The block enumeration MUST mirror what
+            // `MessageBubbleView` does at render time — we delegate to
+            // `MessageBubbleView.searchableBlocks(for:)` which returns
+            // `(text, anchorID)` pairs in the exact order the bubble
+            // attaches `.id(anchorID)`. That keeps per-block
+            // occurrence indices aligned with
+            // `applyingSearchHighlight`'s per-block scan.
             let needle = query
             var locations: [MatchLocation] = []
             for message in detail.messages {
-                let content = message.content
-                var searchFrom = content.startIndex
-                var occurrence = 0
-                while searchFrom < content.endIndex,
-                      let range = content.range(
-                        of: needle,
-                        options: .caseInsensitive,
-                        range: searchFrom..<content.endIndex
-                      ) {
-                    locations.append(MatchLocation(
-                        messageID: message.id,
-                        occurrenceInMessage: occurrence
-                    ))
-                    occurrence += 1
-                    // Advance past the match. Use `range.upperBound`
-                    // directly — overlapping matches aren't meaningful
-                    // for user-facing find, and this matches the
-                    // non-overlapping scan in `applyingSearchHighlight`
-                    // so per-occurrence indices line up exactly.
-                    searchFrom = range.upperBound
+                let blocks = MessageBubbleView.searchableBlocks(for: message)
+                for (text, anchorID) in blocks {
+                    var searchFrom = text.startIndex
+                    var occurrence = 0
+                    while searchFrom < text.endIndex,
+                          let range = text.range(
+                            of: needle,
+                            options: .caseInsensitive,
+                            range: searchFrom..<text.endIndex
+                          ) {
+                        locations.append(MatchLocation(
+                            messageID: message.id,
+                            anchorID: anchorID,
+                            occurrenceInBlock: occurrence
+                        ))
+                        occurrence += 1
+                        // Advance past the match. Use `range.upperBound`
+                        // directly — overlapping matches aren't meaningful
+                        // for user-facing find, and this matches the
+                        // non-overlapping scan in `applyingSearchHighlight`
+                        // so per-occurrence indices line up exactly.
+                        searchFrom = range.upperBound
+                    }
                 }
             }
             await MainActor.run {
                 matchLocations = locations
                 currentMatchIndex = 0
-                // Auto-jump to the first match's message so the user
-                // sees feedback immediately on typing. Subsequent hits
-                // inside the same message don't need a re-scroll.
+                // Auto-jump to the first match so the user sees
+                // feedback immediately on typing. Fire the block
+                // anchor directly — the reader's
+                // `performProgrammaticScroll` handles the on-screen
+                // case (skip the scroll), the "bubble not materialized
+                // yet" case (first jump to the parent message id, then
+                // converge to the block), and the in-between cases
+                // uniformly. Previously this path used a two-stage
+                // jump that unconditionally scrolled to the message id
+                // first, which yanked the viewport even when the hit
+                // was already visible.
                 if let first = locations.first {
-                    pendingPromptID = first.messageID
+                    pendingPromptID = first.anchorID
                 }
             }
         } catch {
@@ -2612,21 +2712,48 @@ private struct DesignMockReaderPaneContent: View {
     }
 
     /// Move the active match index by `delta`, wrapping around the ends
-    /// of the list. Only fires `pendingPromptID` when the step crosses a
-    /// message boundary — stepping between two occurrences inside the
-    /// same bubble just advances the hot-color cursor via the updated
-    /// `SearchHighlightSpec`, without re-triggering a scroll that would
-    /// jerk the viewport back to the top of the message.
+    /// of the list.
+    ///
+    /// Two stepping regimes:
+    /// 1. Same anchor (same block). The hit is inside the same rendered
+    ///    sub-view we were just painting — no scroll even requested,
+    ///    the updated `SearchHighlightSpec.activeOccurrenceInBlock`
+    ///    re-paints which range gets the hot color.
+    /// 2. Different anchor (different block, same or different
+    ///    message). Fire `pendingPromptID = target.anchorID` and let
+    ///    the reader's `performProgrammaticScroll` decide what to do:
+    ///    - anchor already visible → no scroll, just the orange
+    ///      cursor moves
+    ///    - anchor off-screen but bubble materialized → single-shot
+    ///      scrollTo + convergence
+    ///    - anchor off-screen with bubble NOT materialized →
+    ///      pre-scroll to the parent message id first so LazyVStack
+    ///      builds the bubble, then converge onto the inner block
+    ///
+    /// Earlier iterations split cross-message stepping into a caller-
+    /// side two-stage jump (messageID → 120ms → anchorID), but that
+    /// unconditionally scrolled the next message's top to the viewport
+    /// top — even when the adjacent message was already fully visible
+    /// — which defeated the "画面外にハイライトがあったらジャンプする"
+    /// refactor. The materialization check now lives inside the reader
+    /// where it can be gated on "anchor not in offset cache yet"
+    /// instead of "messages are different".
     private func stepMatch(by delta: Int) {
         guard !matchLocations.isEmpty else { return }
         let count = matchLocations.count
         let next = ((currentMatchIndex + delta) % count + count) % count
-        let previousMessageID = matchLocations[currentMatchIndex].messageID
+        let prev = matchLocations[currentMatchIndex]
         currentMatchIndex = next
-        let nextMessageID = matchLocations[next].messageID
-        if nextMessageID != previousMessageID {
-            pendingPromptID = nextMessageID
+        let target = matchLocations[next]
+
+        // Regime 1: same block. Only the hot-color cursor moves.
+        if target.anchorID == prev.anchorID && target.messageID == prev.messageID {
+            return
         }
+
+        // Regime 2: anywhere else. Let the reader decide whether to
+        // scroll, pre-materialize, or skip entirely.
+        pendingPromptID = target.anchorID
     }
 
     private var emptyState: some View {
