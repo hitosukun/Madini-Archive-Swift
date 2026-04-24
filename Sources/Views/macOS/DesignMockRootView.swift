@@ -803,32 +803,46 @@ struct DesignMockRootView: View {
             // paused ≥400ms) is recorded. `saveRecentFilter` still
             // dedupes by filter_hash on top of this, so pinning the
             // same query twice never double-writes.
+            // Record into the library-filter history ONLY in `.table`
+            // mode. Thread-mode recording rides a separate
+            // `.onChange(of: searchText)` below because `composedQuery`
+            // doesn't include the keyword in `.default` / `.viewer`
+            // (the keyword is a find-in-page substring there, not a
+            // library filter), so this observer wouldn't fire on
+            // keyword changes in those modes and the in-thread history
+            // would stay empty forever.
+            guard selectedLayoutMode == .table else { return }
             recordRecentSearchTask?.cancel()
             let capturedQuery = newQuery
-            let capturedMode = selectedLayoutMode
-            let capturedText = searchText
             recordRecentSearchTask = Task { @MainActor in
                 try? await Task.sleep(nanoseconds: 400_000_000)
                 guard !Task.isCancelled else { return }
-                // Route the settled query to the history that matches
-                // the field's current role. In `.table` mode the text
-                // scoped the library (library history); in the reader
-                // modes it was a find-in-page inside the open thread
-                // (in-thread history). Mutually exclusive — one
-                // recording per settle — so the two streams don't
-                // double-count the same keystroke.
-                if capturedMode == .table {
-                    libraryViewModel?.recordRecentSearch(
-                        archiveFilter(from: capturedQuery)
-                    )
-                } else {
-                    // Strip DSL directives (`sort:`, `source:`, …) the
-                    // same way the reader's `effectiveQuery` does, so
-                    // the history stores only the substring that was
-                    // actually matched.
-                    let parsed = DesignMockQueryLanguage.parse(capturedText)
-                    recentInThreadQueriesStore.record(parsed.keyword)
-                }
+                libraryViewModel?.recordRecentSearch(
+                    archiveFilter(from: capturedQuery)
+                )
+            }
+        }
+        // Thread-mode ( `.default` / `.viewer` ) history recording.
+        // In those modes the search field is a find-in-page over the
+        // open thread, so the user's keystrokes never flow into
+        // `composedQuery` (the library filter). Observe `searchText`
+        // directly, debounce by 400ms just like the library path, and
+        // route the settled substring into `recentInThreadQueriesStore`
+        // so the `.searchSuggestions` dropdown has something to offer
+        // on subsequent focuses.
+        .onChange(of: searchText) { _, newText in
+            guard selectedLayoutMode != .table else { return }
+            recordRecentSearchTask?.cancel()
+            let capturedText = newText
+            recordRecentSearchTask = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 400_000_000)
+                guard !Task.isCancelled else { return }
+                // Strip DSL directives (`sort:`, `source:`, …) the
+                // same way the reader's `effectiveQuery` does, so
+                // the history stores only the substring that was
+                // actually matched.
+                let parsed = DesignMockQueryLanguage.parse(capturedText)
+                recentInThreadQueriesStore.record(parsed.keyword)
             }
         }
         // Keep one canonical "currently displayed" conversation across
