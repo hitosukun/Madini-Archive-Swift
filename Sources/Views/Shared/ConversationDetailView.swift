@@ -1437,19 +1437,28 @@ enum LLMPromptClipboard {
 /// Each caller owns its own `@State` for the two temp-file URLs and
 /// writes them in a `.task(id:)` via
 /// `prepareConversationShareURLs(for:)`, then hands them and the
-/// `ConversationDetail` to this builder. The builder renders:
+/// `ConversationDetail` to this builder.
 ///
-///   1. `ShareLink` for the Markdown export (human-friendly, retains
-///      `###` role headings and metadata block).
-///   2. `ShareLink` for the plain-text export (LLM-friendly; see
-///      `PlainTextExporter` docs).
-///   3. A `Button` that copies the plain-text form to the clipboard
-///      — for the common case of pasting straight into a chat box.
+/// ## Why `Button` on macOS instead of `ShareLink`
 ///
-/// Each `ShareLink` gracefully degrades to a disabled placeholder
-/// while its temp file is being written, keeping the menu present
-/// (so the surrounding button layout doesn't jump) but preventing a
-/// click on an incomplete export.
+/// `ShareLink` inside a `Menu` renders as a **hierarchical submenu**
+/// on macOS — clicking "Share as Markdown" expands a nested menu of
+/// share targets (AirDrop / Mail / Messages / Notes / …) at the same
+/// anchor as the parent menu. To the user this reads as "I picked a
+/// format and the menu reopened showing unrelated content" — a
+/// confusing UX (reported user-facing bug: `共有ボタンを押して、
+/// プルダウンから選択したら、また共有ボタンがひらいて元の内容が出た`).
+///
+/// Using a plain `Button` that manually presents
+/// `NSSharingServicePicker` gives the expected "click format → a
+/// sharing popover appears" flow: the format menu closes, then the
+/// sharing popover opens as a separate surface. The popover is the
+/// same native control `ShareLink` would have opened if it were a
+/// standalone toolbar button rather than a menu child.
+///
+/// On iOS / iPadOS the nested-menu issue doesn't apply (`ShareLink`
+/// presents a full-screen activity sheet, not a submenu), so we keep
+/// `ShareLink` there.
 @ViewBuilder
 func conversationShareMenuItems(
     detail: ConversationDetail?,
@@ -1457,40 +1466,20 @@ func conversationShareMenuItems(
     plainTextURL: URL?
 ) -> some View {
     if let detail {
-        let previewTitle = detail.summary.title ?? "Conversation"
-        if let markdownURL {
-            ShareLink(
-                item: markdownURL,
-                preview: SharePreview(
-                    previewTitle,
-                    image: Image(systemName: "doc.text")
-                )
-            ) {
-                Label("Markdown (.md) として共有…", systemImage: "doc.text")
-            }
-        } else {
-            Button {} label: {
-                Label("Markdown を書き出し中…", systemImage: "doc.text")
-            }
-            .disabled(true)
-        }
-        if let plainTextURL {
-            ShareLink(
-                item: plainTextURL,
-                preview: SharePreview(
-                    previewTitle,
-                    image: Image(systemName: "text.alignleft")
-                )
-            ) {
-                Label("プレーンテキスト (.txt) として共有… — LLM 向け",
-                      systemImage: "text.alignleft")
-            }
-        } else {
-            Button {} label: {
-                Label("プレーンテキストを書き出し中…", systemImage: "text.alignleft")
-            }
-            .disabled(true)
-        }
+        ConversationShareMenuRow(
+            label: "Markdown (.md) として共有…",
+            inProgressLabel: "Markdown を書き出し中…",
+            systemImage: "doc.text",
+            url: markdownURL,
+            previewTitle: detail.summary.title ?? "Conversation"
+        )
+        ConversationShareMenuRow(
+            label: "プレーンテキスト (.txt) として共有… — LLM 向け",
+            inProgressLabel: "プレーンテキストを書き出し中…",
+            systemImage: "text.alignleft",
+            url: plainTextURL,
+            previewTitle: detail.summary.title ?? "Conversation"
+        )
         Divider()
         Button {
             LLMPromptClipboard.copy(detail)
@@ -1507,6 +1496,79 @@ func conversationShareMenuItems(
         .disabled(true)
     }
 }
+
+/// One row of the conversation share menu. macOS and iOS take
+/// different paths: macOS uses a plain `Button` that hand-drives
+/// `NSSharingServicePicker` (to avoid `ShareLink`'s nested-submenu
+/// behavior inside a `Menu`); iOS uses `ShareLink` directly (its
+/// activity sheet isn't a menu so there's no nesting issue). The
+/// "writing in progress" placeholder state is shared across both.
+private struct ConversationShareMenuRow: View {
+    let label: String
+    let inProgressLabel: String
+    let systemImage: String
+    let url: URL?
+    let previewTitle: String
+
+    var body: some View {
+        #if os(macOS)
+        if let url {
+            Button {
+                ConversationSharePresenter.present(url: url)
+            } label: {
+                Label(label, systemImage: systemImage)
+            }
+        } else {
+            Button {} label: {
+                Label(inProgressLabel, systemImage: systemImage)
+            }
+            .disabled(true)
+        }
+        #else
+        if let url {
+            ShareLink(
+                item: url,
+                preview: SharePreview(
+                    previewTitle,
+                    image: Image(systemName: systemImage)
+                )
+            ) {
+                Label(label, systemImage: systemImage)
+            }
+        } else {
+            Button {} label: {
+                Label(inProgressLabel, systemImage: systemImage)
+            }
+            .disabled(true)
+        }
+        #endif
+    }
+}
+
+#if os(macOS)
+/// macOS sharing-popover helper. Extracted so the menu-row code stays
+/// a declarative one-liner and the AppKit-specific key-window /
+/// content-view lookup is in one place.
+///
+/// We anchor the popover at `.zero` of the content view because
+/// SwiftUI's `Menu` doesn't expose the originating button's screen
+/// rect to its children. That's the same fallback the Apple sample
+/// code for `NSSharingServicePicker` uses for toolbar-initiated
+/// shares; the popover lands near the top-leading edge of the window
+/// rather than on the share button itself, which is a small UX cost
+/// but keeps the code simple and deterministic.
+enum ConversationSharePresenter {
+    @MainActor
+    static func present(url: URL) {
+        let picker = NSSharingServicePicker(items: [url])
+        guard let window = NSApp.keyWindow ?? NSApp.mainWindow,
+              let contentView = window.contentView else {
+            return
+        }
+        picker.show(relativeTo: .zero, of: contentView, preferredEdge: .minY)
+    }
+}
+#endif
 
 /// Kick off markdown and plain-text exports in parallel for the given
 /// conversation and return both URLs. Used by every site that hosts
