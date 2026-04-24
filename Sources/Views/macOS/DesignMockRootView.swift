@@ -2146,19 +2146,30 @@ private struct DesignMockThreadListPane: View {
         .focusable()
         .focusEffectDisabled()
         .focused($isFocused)
-        // Plain ↑ / ↓ step selection by one row in either branch of
-        // the body (closed card list or expanded state 3 prompt
-        // view). Intercepting at this level rather than inside
-        // `cardList` / `pinnedPromptView` means the key binding
-        // survives across the open/close toggle without having to
-        // be re-installed per branch. `.handled` tells SwiftUI to
-        // stop the event from bubbling up to any enclosing
-        // container that might otherwise scroll.
+        // Plain ↑ / ↓ step selection by one row when the pane is
+        // showing the closed card list (state 2). In state 3 we
+        // delegate to the inner prompt list — guarding on
+        // `expandedPromptConversationID` here is belt-and-
+        // suspenders in case a focus race leaves the outer pane
+        // still focused while the card is open: the worst case
+        // becomes "nothing happens" instead of "threads
+        // silently switch out from under the user".
+        //
+        // We return `.handled` even in the guarded branch so the
+        // event doesn't bubble up to any enclosing scroll view
+        // (which would otherwise scroll the content and obscure
+        // the "arrows do nothing" surprise).
         .onKeyPress(.upArrow) {
+            guard expandedPromptConversationID == nil else {
+                return .handled
+            }
             onMoveSelection(-1)
             return .handled
         }
         .onKeyPress(.downArrow) {
+            guard expandedPromptConversationID == nil else {
+                return .handled
+            }
             onMoveSelection(1)
             return .handled
         }
@@ -2170,17 +2181,25 @@ private struct DesignMockThreadListPane: View {
         .onAppear {
             isFocused = true
         }
-        // When a card collapses (state 3 → state 2), the expanded
-        // prompt list disappears and with it whatever view held
-        // keyboard focus (typically the prompt list itself, which
-        // pulled focus on appear). Without this watcher, ↑/↓ would
-        // route to nowhere until the user clicked somewhere — the
-        // exact "上下移動ができなくなる" regression the user
-        // reported. Pulling focus back to the thread pane here
-        // keeps the keyboard flow unbroken across drill-out.
+        // Coordinate focus with the inner prompt list across
+        // state-2 ↔ state-3 transitions:
+        //
+        //   newValue == nil (state 3 → state 2)  — prompt list just
+        //   disappeared; nothing owns focus. Pull it back to the
+        //   thread pane so ↑/↓ keep working without a click.
+        //
+        //   newValue != nil (state 2 → state 3)  — prompt list is
+        //   about to appear and will claim focus via its own
+        //   .onAppear. Explicitly yield ours so both FocusState
+        //   instances don't briefly claim focus at once, which
+        //   made outer's `.onKeyPress` fire alongside the inner's
+        //   (user report: ↑/↓ was switching threads instead of
+        //   stepping prompts).
         .onChange(of: expandedPromptConversationID) { _, newValue in
             if newValue == nil {
                 isFocused = true
+            } else {
+                isFocused = false
             }
         }
     }
@@ -2692,6 +2711,18 @@ private struct DesignMockExpandedPromptList: View {
             movePromptSelection(by: 1)
             return .handled
         }
+        // Pull focus synchronously on appear — NOT inside the
+        // `.task` below. The task runs async and can take tens to
+        // hundreds of ms to finish loading the outline, and during
+        // that window the outer thread-list pane still owned
+        // focus. ↑/↓ presses landed there and switched threads
+        // (user report: "カードが開かれると、cmdなしで上下すると
+        // カード自体が切り替わってしまう"). onAppear fires
+        // synchronously as the view mounts, so focus transfer
+        // beats any key press the user can physically issue.
+        .onAppear {
+            isPromptListFocused = true
+        }
         .task(id: conversation.id) {
             // Re-fetch whenever the expanded card changes identity. Store
             // caches the outline, so flipping back to a previously-expanded
@@ -2703,11 +2734,6 @@ private struct DesignMockExpandedPromptList: View {
             // otherwise a prompt from the previous card would stay tinted.
             selectedPromptID = nil
             hoveredPromptID = nil
-            // Pull focus so the user can start driving prompts with
-            // ↑/↓ the instant a card expands. If they click away
-            // (into the search field, onto the reader), focus
-            // relocates naturally via the first-responder chain.
-            isPromptListFocused = true
         }
     }
 
