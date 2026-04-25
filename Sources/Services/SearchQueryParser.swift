@@ -66,7 +66,40 @@ enum SearchQueryParser {
     /// than passing a broken expression to SQLite.
     struct ParsedQuery: Equatable {
         let ftsMatchExpression: String?
+        /// LIKE-fallback terms surfaced when the query contains a
+        /// positive token shorter than the trigram tokenizer's 3-char
+        /// floor (e.g. `編集`, `削除`). FTS5 returns zero rows for those
+        /// — there's no 3-gram to index — so the repository must
+        /// detect the case and run a LIKE-based sweep against the
+        /// underlying tables instead. Each entry is the substring to
+        /// match (positive only; negations are dropped because the
+        /// LIKE path can't combine NOT cleanly with FTS-style boolean
+        /// composition). Field-scoped terms keep their field so the
+        /// LIKE sweep can target `c.title` vs `m.content` correctly.
+        let likeFallbackTerms: [LikeTerm]
+        /// Any clause uses the title field — used by the repository to
+        /// decide whether to JOIN the messages table at all.
+        let hasTitleScopedTerm: Bool
     }
+
+    /// One LIKE-fallback term — preserves the user's original word /
+    /// phrase content (un-escaped) plus the field scope so the
+    /// repository can build `c.title LIKE ?` vs `m.content LIKE ?`
+    /// correctly. The repository is responsible for percent-wrapping
+    /// and SQL-escaping the value.
+    struct LikeTerm: Equatable {
+        enum Scope: Equatable { case any, title, content }
+        let text: String
+        let scope: Scope
+    }
+
+    /// Minimum positive-token length the FTS5 trigram tokenizer can
+    /// match. The index emits 3-character n-grams, so any query token
+    /// shorter than this never produces a hit — common for 2-character
+    /// Japanese words like `編集` or `削除`. We surface a LIKE fallback
+    /// in `ParsedQuery` whenever a positive clause crosses below this
+    /// floor so the repository can route around FTS for that query.
+    static let trigramMinimumTokenLength = 3
 
     /// Parse `raw` into an FTS5 MATCH expression. Returns `nil`
     /// expression when the text is empty or would degenerate into
@@ -74,12 +107,12 @@ enum SearchQueryParser {
     static func parse(_ raw: String) -> ParsedQuery {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
-            return ParsedQuery(ftsMatchExpression: nil)
+            return ParsedQuery(ftsMatchExpression: nil, likeFallbackTerms: [], hasTitleScopedTerm: false)
         }
 
         let clauses = Self.tokenize(trimmed)
         guard !clauses.isEmpty else {
-            return ParsedQuery(ftsMatchExpression: nil)
+            return ParsedQuery(ftsMatchExpression: nil, likeFallbackTerms: [], hasTitleScopedTerm: false)
         }
 
         // FTS5 rejects expressions where every top-level operand is
@@ -89,13 +122,42 @@ enum SearchQueryParser {
         // date) still return their natural result set instead of
         // throwing a SQL error.
         guard clauses.contains(where: { !$0.isNegated }) else {
-            return ParsedQuery(ftsMatchExpression: nil)
+            return ParsedQuery(ftsMatchExpression: nil, likeFallbackTerms: [], hasTitleScopedTerm: false)
+        }
+
+        // Detect short positive tokens that the trigram tokenizer
+        // can't index. The whole query goes onto the LIKE fallback
+        // path in that case — combining FTS and LIKE in one SQL
+        // statement is doable but adds complexity for marginal speed
+        // gain on the rare mixed-length query.
+        let positiveTerms = clauses.filter { !$0.isNegated }
+        let needsLikeFallback = positiveTerms.contains { $0.match.text.unicodeScalars.count < trigramMinimumTokenLength }
+        if needsLikeFallback {
+            let likeTerms = positiveTerms.map { clause -> LikeTerm in
+                let scope: LikeTerm.Scope
+                switch clause.field {
+                case .title: scope = .title
+                case .content: scope = .content
+                case .none: scope = .any
+                }
+                return LikeTerm(text: clause.match.text, scope: scope)
+            }
+            let hasTitleScoped = likeTerms.contains { $0.scope == .title }
+            return ParsedQuery(
+                ftsMatchExpression: nil,
+                likeFallbackTerms: likeTerms,
+                hasTitleScopedTerm: hasTitleScoped
+            )
         }
 
         let expression = clauses
             .map { $0.ftsFragment }
             .joined(separator: " AND ")
-        return ParsedQuery(ftsMatchExpression: expression)
+        return ParsedQuery(
+            ftsMatchExpression: expression,
+            likeFallbackTerms: [],
+            hasTitleScopedTerm: clauses.contains { $0.field == .title }
+        )
     }
 
     // MARK: - AST
@@ -364,6 +426,14 @@ private extension SearchQueryParser.Match {
         switch self {
         case .word(let s), .phrase(let s):
             return "\"\(s.replacingOccurrences(of: "\"", with: "\"\""))\""
+        }
+    }
+
+    /// Raw, un-escaped text of the match — used by the LIKE fallback
+    /// path which does its own SQL parameter binding.
+    var text: String {
+        switch self {
+        case .word(let s), .phrase(let s): return s
         }
     }
 }

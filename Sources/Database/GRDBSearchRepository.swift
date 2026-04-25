@@ -13,6 +13,16 @@ final class GRDBSearchRepository: SearchRepository, @unchecked Sendable {
             return []
         }
 
+        // Short positive tokens (`編集`, `削除`, …) can't be matched by
+        // the FTS5 trigram tokenizer — it indexes 3-grams, so any
+        // 2-character query produces zero hits. Take the LIKE fallback
+        // path instead so 2-char Japanese keywords actually surface
+        // results.
+        if !query.normalizedText.isEmpty,
+           !SearchQueryParser.parse(query.normalizedText).likeFallbackTerms.isEmpty {
+            return try await searchViaLike(query: query)
+        }
+
         return try await GRDBAsync.read(from: dbQueue) { db in
             let (filterSQL, arguments) = Self.makeSearchWhereClause(query: query)
             let orderSQL = Self.orderByClause(for: query.sortKey)
@@ -65,6 +75,11 @@ final class GRDBSearchRepository: SearchRepository, @unchecked Sendable {
             return 0
         }
 
+        if !query.normalizedText.isEmpty,
+           !SearchQueryParser.parse(query.normalizedText).likeFallbackTerms.isEmpty {
+            return try await countViaLike(query: query)
+        }
+
         return try await GRDBAsync.read(from: dbQueue) { db in
             let (filterSQL, arguments) = Self.makeSearchWhereClause(query: query, includePagination: false)
             return try Int.fetchOne(
@@ -78,6 +93,154 @@ final class GRDBSearchRepository: SearchRepository, @unchecked Sendable {
                 arguments: arguments
             ) ?? 0
         }
+    }
+
+    // MARK: - LIKE fallback (sub-trigram queries)
+
+    /// Run the search via plain `LIKE` against `conversations.title` and
+    /// `messages.content`. Used only when the parsed query contains a
+    /// positive token shorter than the trigram tokenizer's 3-character
+    /// floor — which happens routinely for 2-character Japanese words
+    /// (`編集`, `削除`, `追加`). Slower than FTS but correct.
+    private func searchViaLike(query: SearchQuery) async throws -> [SearchResult] {
+        return try await GRDBAsync.read(from: dbQueue) { db in
+            let (whereSQL, arguments) = Self.makeLikeWhereClause(query: query)
+            let orderSQL = Self.likeOrderByClause(for: query.sortKey)
+            let rows = try Row.fetchAll(
+                db,
+                sql: """
+                    SELECT
+                        c.id AS conversation_id,
+                        c.title,
+                        c.source,
+                        c.model,
+                        c.prompt_count,
+                        \(Self.headlinePromptSQL) AS headline_prompt,
+                        \(Self.firstMessageSnippetSQL) AS first_message_snippet,
+                        \(Self.primaryTimeSQL) AS primary_time
+                        \(Self.bookmarkStatusSQL) AS is_bookmarked
+                    FROM conversations c
+                    \(whereSQL)
+                    \(orderSQL)
+                    LIMIT ? OFFSET ?
+                """,
+                arguments: arguments + [query.limit, query.offset]
+            )
+
+            return rows.map { row in
+                let title: String? = row["title"]
+                let firstMessage: String? = row["first_message_snippet"]
+                // No FTS5 `snippet()` available on this path — fall
+                // back to the headline / title text. The list-row
+                // renderer trims to the visible width on its own.
+                let snippet = (title?.isEmpty == false ? title : firstMessage) ?? ""
+                return SearchResult(
+                    conversationID: row["conversation_id"],
+                    headline: ConversationHeadlineSummary.build(
+                        prompt: row["headline_prompt"],
+                        title: title,
+                        firstMessage: firstMessage
+                    ),
+                    title: title,
+                    source: row["source"],
+                    model: row["model"],
+                    messageCount: row["prompt_count"] ?? 0,
+                    primaryTime: row["primary_time"],
+                    snippet: snippet,
+                    isBookmarked: (row["is_bookmarked"] as Int64? ?? 0) != 0
+                )
+            }
+        }
+    }
+
+    private func countViaLike(query: SearchQuery) async throws -> Int {
+        return try await GRDBAsync.read(from: dbQueue) { db in
+            let (whereSQL, arguments) = Self.makeLikeWhereClause(query: query)
+            return try Int.fetchOne(
+                db,
+                sql: """
+                    SELECT COUNT(*)
+                    FROM conversations c
+                    \(whereSQL)
+                """,
+                arguments: arguments
+            ) ?? 0
+        }
+    }
+
+    /// Build the LIKE-fallback `WHERE` clause + bound arguments. Each
+    /// positive term contributes either a `c.title LIKE ?` predicate
+    /// (title-scoped) or an `EXISTS(... messages)` predicate (content-
+    /// or any-scoped) — joined with AND so multiple keywords narrow
+    /// the result set, mirroring FTS5's implicit-AND behaviour.
+    /// Non-text filters (sources, dates, bookmarks) reuse the regular
+    /// where-clause builder so the two paths stay in lockstep.
+    private static func makeLikeWhereClause(
+        query: SearchQuery
+    ) -> (String, StatementArguments) {
+        var filters: [String] = ["COALESCE(c.source, '') != 'markdown'"]
+        var arguments = StatementArguments()
+
+        for term in SearchQueryParser.parse(query.normalizedText).likeFallbackTerms {
+            let pattern = "%\(escapeLikePattern(term.text))%"
+            switch term.scope {
+            case .title:
+                filters.append("c.title LIKE ? ESCAPE '\\'")
+                arguments += [pattern]
+            case .content:
+                filters.append("""
+                    EXISTS(
+                        SELECT 1 FROM messages m
+                        WHERE m.conv_id = c.id
+                          AND m.content LIKE ? ESCAPE '\\'
+                    )
+                    """)
+                arguments += [pattern]
+            case .any:
+                filters.append("""
+                    (
+                        c.title LIKE ? ESCAPE '\\'
+                        OR EXISTS(
+                            SELECT 1 FROM messages m
+                            WHERE m.conv_id = c.id
+                              AND m.content LIKE ? ESCAPE '\\'
+                        )
+                    )
+                    """)
+                arguments += [pattern, pattern]
+            }
+        }
+
+        let (sharedSQL, sharedArgs) = Self.makeNonTextFiltersClause(query: query)
+        if !sharedSQL.isEmpty {
+            filters.append(sharedSQL)
+            arguments += sharedArgs
+        }
+
+        let whereSQL = "WHERE " + filters.joined(separator: " AND ")
+        return (whereSQL, arguments)
+    }
+
+    private static func likeOrderByClause(for sortKey: ConversationSortKey?) -> String {
+        switch sortKey {
+        case .dateAsc:         return "ORDER BY \(primaryTimeSQL) ASC, c.id ASC"
+        case .promptCountDesc: return "ORDER BY c.prompt_count DESC, c.id ASC"
+        case .promptCountAsc:  return "ORDER BY c.prompt_count ASC, c.id ASC"
+        case .dateDesc, .none: return "ORDER BY \(primaryTimeSQL) DESC, c.id ASC"
+        }
+    }
+
+    /// Escape `%`, `_`, `\` for `LIKE … ESCAPE '\\'`. Without escaping
+    /// a query like `100%` would silently match anything.
+    private static func escapeLikePattern(_ raw: String) -> String {
+        var out = ""
+        for c in raw {
+            if c == "\\" || c == "%" || c == "_" {
+                out.append("\\")
+            }
+            out.append(c)
+        }
+        return out
     }
 
     /// Build the `ORDER BY` clause for a search fetch. Nil = keep the
@@ -167,8 +330,11 @@ final class GRDBSearchRepository: SearchRepository, @unchecked Sendable {
         let hasText = !query.normalizedText.isEmpty
         if hasText {
             // Text typed but unparseable (only negations, only
-            // separators, etc.) → reject.
-            guard SearchQueryParser.parse(query.normalizedText).ftsMatchExpression != nil else {
+            // separators, etc.) → reject. The LIKE fallback path is
+            // also a valid execution route — only reject when neither
+            // FTS nor LIKE has anything actionable.
+            let parsed = SearchQueryParser.parse(query.normalizedText)
+            guard parsed.ftsMatchExpression != nil || !parsed.likeFallbackTerms.isEmpty else {
                 return false
             }
             return true
@@ -202,6 +368,27 @@ final class GRDBSearchRepository: SearchRepository, @unchecked Sendable {
             filters.append("search_idx MATCH ?")
             arguments += [match]
         }
+
+        let (nonTextSQL, nonTextArgs) = makeNonTextFiltersClause(query: query)
+        if !nonTextSQL.isEmpty {
+            filters.append(nonTextSQL)
+            arguments += nonTextArgs
+        }
+
+        let whereSQL = filters.isEmpty ? "" : "WHERE " + filters.joined(separator: " AND ")
+        return (whereSQL, arguments)
+    }
+
+    /// All conversation-level filters (sources, models, dates, bookmarks,
+    /// roles, tags) packaged as a single AND-joined SQL fragment without
+    /// the leading `WHERE`. Shared between the FTS path and the LIKE
+    /// fallback so the two routes stay in lockstep when the filter
+    /// surface grows.
+    private static func makeNonTextFiltersClause(
+        query: SearchQuery
+    ) -> (String, StatementArguments) {
+        var filters: [String] = []
+        var arguments = StatementArguments()
 
         if !query.filter.sources.isEmpty {
             let sortedSources = Array(query.filter.sources).sorted()
@@ -289,8 +476,11 @@ final class GRDBSearchRepository: SearchRepository, @unchecked Sendable {
             }
         }
 
-        let whereSQL = filters.isEmpty ? "" : "WHERE " + filters.joined(separator: " AND ")
-        return (whereSQL, arguments)
+        // Combined as a single AND-joined fragment. Empty when no
+        // non-text filters are set, so callers can decide whether to
+        // append it or skip the AND glue entirely.
+        let combined = filters.isEmpty ? "" : "(" + filters.joined(separator: " AND ") + ")"
+        return (combined, arguments)
     }
 
 }
