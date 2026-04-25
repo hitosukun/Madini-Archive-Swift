@@ -1550,14 +1550,18 @@ struct DesignMockRootView: View {
 
     private var sidebar: some View {
         // Custom binding so a USER click on a Library / Sources /
-        // Bookmarks row clears any DSL-filled search text lingering
-        // from a previous saved-filter pick. Without this, selecting
-        // a saved-filter entry stuffs `source:claude` (or similar)
-        // into the toolbar, then clicking "Bookmarks" / "Sources →
-        // chatgpt" appears to do nothing — the DSL in `searchText`
-        // overrides the sidebar-derived scope in `composedQuery`, so
-        // the fetch query never actually matches what the user just
-        // clicked. Clearing `searchText` through the setter (NOT in
+        // Bookmarks row strips just the DSL directives the sidebar is
+        // about to override (`source:`, `model:`, `tag:`, `bookmark:`,
+        // `is:`). Without this, selecting a saved-filter entry stuffs
+        // `source:claude` (or similar) into the toolbar, then clicking
+        // "Bookmarks" / "Sources → chatgpt" appears to do nothing —
+        // the DSL in `searchText` overrides the sidebar-derived scope
+        // in `composedQuery`, so the fetch query never actually
+        // matches what the user just clicked. We DELIBERATELY leave
+        // free-text keywords and FTS field-scoped tokens (`content:`,
+        // `title:`) plus `sort:` intact so the user's typed query
+        // survives a sidebar narrow ("`content:編集` then click
+        // gpt-5-2 to drill in"). Clearing through the setter (NOT in
         // `.onChange`) means it only fires for List-driven writes;
         // programmatic writes to `selectedSidebarItemID` (e.g. the
         // saved-filter click handler re-routing to "All Threads")
@@ -1566,7 +1570,8 @@ struct DesignMockRootView: View {
             get: { selectedSidebarItemID },
             set: { newValue in
                 if let newValue, newValue != selectedSidebarItemID {
-                    searchText = ""
+                    searchText = DesignMockQueryLanguage
+                        .stripSidebarConflictingDirectives(from: searchText)
                 }
                 selectedSidebarItemID = newValue
             }
@@ -4161,6 +4166,30 @@ private enum DesignMockQueryLanguage {
 
         parsed.keyword = freeWords.joined(separator: " ")
         return parsed
+    }
+
+    /// Strip the DSL directives that the sidebar is about to override —
+    /// `source:`, `model:`, `tag:`, `bookmark:`, `is:`. Free text,
+    /// FTS field-scoped tokens (`title:`, `content:`), and `sort:`
+    /// survive untouched so a query like `content:編集 source:claude`
+    /// becomes just `content:編集` after the user clicks "Sources →
+    /// chatgpt" — the keyword they typed stays visible, only the
+    /// conflicting source filter goes away. Returns the trimmed
+    /// string with single-space separators rebuilt.
+    static func stripSidebarConflictingDirectives(from text: String) -> String {
+        let pieces = text.split(separator: " ", omittingEmptySubsequences: true)
+            .map(String.init)
+        let out = pieces.filter { piece in
+            guard let colonIx = piece.firstIndex(of: ":") else { return true }
+            let key = piece[..<colonIx].lowercased()
+            switch key {
+            case "source", "model", "tag", "bookmark", "is":
+                return false
+            default:
+                return true
+            }
+        }
+        return out.joined(separator: " ")
     }
 
     /// Rewrite `text` so its sort directive becomes `sort:\(token)`, or
