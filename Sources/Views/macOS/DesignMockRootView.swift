@@ -459,6 +459,7 @@ fileprivate final class DesignMockDataStore: ObservableObject {
                         id: result.conversationID,
                         title: result.displayTitle,
                         updated: Self.formatUpdated(result.primaryTime),
+                        updatedDate: Self.parseSortableDate(result.primaryTime),
                         sortRank: offset + idx,
                         prompts: result.messageCount,
                         source: (result.source ?? "unknown").lowercased(),
@@ -488,6 +489,7 @@ fileprivate final class DesignMockDataStore: ObservableObject {
                         id: summary.id,
                         title: summary.displayTitle,
                         updated: Self.formatUpdated(summary.primaryTime),
+                        updatedDate: Self.parseSortableDate(summary.primaryTime),
                         sortRank: offset + idx,
                         prompts: summary.messageCount,
                         source: (summary.source ?? "unknown").lowercased(),
@@ -569,6 +571,32 @@ fileprivate final class DesignMockDataStore: ObservableObject {
             return displayFormatter.string(from: date)
         }
         return String(raw.prefix(10))
+    }
+
+    /// Parser for the date column's in-memory sort key. Accepts both
+    /// the ISO-with-time forms our ISO formatters handle and the
+    /// bare `YYYY-MM-DD` strings that fall through `formatUpdated`'s
+    /// last-ditch `prefix(10)` branch — those are the most common
+    /// case in the actual archive, so a parser that only recognized
+    /// the ISO forms would leave the table sorting on `nil` for
+    /// almost every row. Unknown formats return nil and the row
+    /// sorts to the asc-end of the list (matching server NULL
+    /// semantics).
+    private static let bareDayFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone(secondsFromGMT: 0)
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+
+    static func parseSortableDate(_ raw: String?) -> Date? {
+        guard let raw, !raw.isEmpty else { return nil }
+        if let date = isoFormatter.date(from: raw) ?? fallbackISOFormatter.date(from: raw) {
+            return date
+        }
+        let head = String(raw.prefix(10))
+        return bareDayFormatter.date(from: head)
     }
 
     /// Collapse whitespace and trim to keep a prompt snippet to one visible
@@ -2617,10 +2645,15 @@ private struct DesignMockThreadTablePane: View {
             // the floor.
             .width(min: 56, ideal: 120)
 
-            // Date column sorts by `sortRank` rather than the display
-            // string — the latter is pre-formatted, so lexicographic
-            // order wouldn't be chronological.
-            TableColumn("Updated", value: \DesignMockConversation.sortRank) { conversation in
+            // Date column sorts by the parsed `updatedDate` so the
+            // visible direction matches the user's typed `sort:` token.
+            // Sorting on `sortRank` (server position) used to invert
+            // twice for `sort:updated-desc` — server already returned
+            // DESC, then a `.reverse` comparator on `\sortRank` flipped
+            // it back to ASC. Sorting on the actual `Date?` keeps the
+            // comparator's direction in lockstep with the server's
+            // ORDER BY direction, so they no longer fight.
+            TableColumn("Updated", value: \DesignMockConversation.sortableUpdatedDate) { conversation in
                 Text(conversation.updated)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -4027,6 +4060,19 @@ private struct DesignMockConversation: Identifiable, Hashable {
     let id: String
     let title: String
     let updated: String
+    /// Parsed form of `updated` for chronological in-memory sorting.
+    /// The Table's Updated column comparator binds to this so
+    /// `KeyPathComparator(\updatedDate, .forward)` produces "oldest
+    /// first" and `.reverse` produces "newest first" — independently
+    /// of what server-side order the rows happened to arrive in.
+    /// Sorting on `sortRank` (server position) inverted twice for
+    /// `sort:updated-desc`: server returned DESC, then a `.reverse`
+    /// comparator on `\sortRank` flipped that back to ASC. Sorting
+    /// on the actual date keeps the visible direction in lockstep
+    /// with the user's typed intent. Nil for rows whose primaryTime
+    /// the parser couldn't decode — those drift to the asc-end of
+    /// the list, matching SQLite's "NULL is smaller" convention.
+    let updatedDate: Date?
     let sortRank: Int
     let prompts: Int
     let source: String
@@ -4040,6 +4086,7 @@ private struct DesignMockConversation: Identifiable, Hashable {
         id: String,
         title: String,
         updated: String,
+        updatedDate: Date? = nil,
         sortRank: Int,
         prompts: Int,
         source: String,
@@ -4049,6 +4096,7 @@ private struct DesignMockConversation: Identifiable, Hashable {
         self.id = id
         self.title = title
         self.updated = updated
+        self.updatedDate = updatedDate
         self.sortRank = sortRank
         self.prompts = prompts
         self.source = source
@@ -4058,6 +4106,15 @@ private struct DesignMockConversation: Identifiable, Hashable {
 
     var sourceColor: Color {
         DesignMockSource.color(for: source)
+    }
+
+    /// Non-optional sort key for the Updated column — `KeyPathComparator`
+    /// needs a `Comparable` value, and `Optional<Date>` doesn't conform
+    /// out of the box. `nil` (unparseable / missing primary_time) maps
+    /// to `Date.distantPast` so those rows fall to the asc-end of the
+    /// list, matching SQLite's "NULL is smaller" sort convention.
+    var sortableUpdatedDate: Date {
+        updatedDate ?? .distantPast
     }
 }
 
@@ -4233,18 +4290,26 @@ private enum DesignMockQueryLanguage {
     /// tell the table is sorted at all.
     static func comparators(for token: String?) -> [KeyPathComparator<DesignMockConversation>] {
         switch token {
-        case "title-asc":    return [KeyPathComparator(\DesignMockConversation.title,    order: .forward)]
-        case "title-desc":   return [KeyPathComparator(\DesignMockConversation.title,    order: .reverse)]
-        case "model-asc":    return [KeyPathComparator(\DesignMockConversation.model,    order: .forward)]
-        case "model-desc":   return [KeyPathComparator(\DesignMockConversation.model,    order: .reverse)]
-        case "updated-asc":  return [KeyPathComparator(\DesignMockConversation.sortRank, order: .forward)]
-        case "updated-desc": return [KeyPathComparator(\DesignMockConversation.sortRank, order: .reverse)]
-        case "prompts-asc":  return [KeyPathComparator(\DesignMockConversation.prompts,  order: .forward)]
-        case "prompts-desc": return [KeyPathComparator(\DesignMockConversation.prompts,  order: .reverse)]
-        case "source-asc":   return [KeyPathComparator(\DesignMockConversation.source,   order: .forward)]
-        case "source-desc":  return [KeyPathComparator(\DesignMockConversation.source,   order: .reverse)]
+        case "title-asc":    return [KeyPathComparator(\DesignMockConversation.title,        order: .forward)]
+        case "title-desc":   return [KeyPathComparator(\DesignMockConversation.title,        order: .reverse)]
+        case "model-asc":    return [KeyPathComparator(\DesignMockConversation.model,        order: .forward)]
+        case "model-desc":   return [KeyPathComparator(\DesignMockConversation.model,        order: .reverse)]
+        case "updated-asc":  return [KeyPathComparator(\DesignMockConversation.sortableUpdatedDate,  order: .forward)]
+        case "updated-desc": return [KeyPathComparator(\DesignMockConversation.sortableUpdatedDate,  order: .reverse)]
+        case "prompts-asc":  return [KeyPathComparator(\DesignMockConversation.prompts,      order: .forward)]
+        case "prompts-desc": return [KeyPathComparator(\DesignMockConversation.prompts,      order: .reverse)]
+        case "source-asc":   return [KeyPathComparator(\DesignMockConversation.source,       order: .forward)]
+        case "source-desc":  return [KeyPathComparator(\DesignMockConversation.source,       order: .reverse)]
         default:
-            return [KeyPathComparator(\DesignMockConversation.sortRank, order: .forward)]
+            // Default = newest first. The empty / unrecognized token
+            // path used to fall back to `sortRank, .forward`, which
+            // *happened* to read as "newest first" only because the
+            // server's default was already DESC — flip the server
+            // default and the table silently inverted with it. Bind
+            // explicitly to `\updatedDate, .reverse` so the table's
+            // default ordering is self-describing instead of
+            // co-dependent with the SQL layer.
+            return [KeyPathComparator(\DesignMockConversation.sortableUpdatedDate, order: .reverse)]
         }
     }
 
@@ -4259,7 +4324,7 @@ private enum DesignMockQueryLanguage {
         switch first.keyPath {
         case \DesignMockConversation.title:    return "title-\(suffix)"
         case \DesignMockConversation.model:    return "model-\(suffix)"
-        case \DesignMockConversation.sortRank: return "updated-\(suffix)"
+        case \DesignMockConversation.sortableUpdatedDate: return "updated-\(suffix)"
         case \DesignMockConversation.prompts:  return "prompts-\(suffix)"
         case \DesignMockConversation.source:   return "source-\(suffix)"
         default:                               return nil
