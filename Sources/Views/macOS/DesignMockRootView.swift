@@ -887,15 +887,12 @@ struct DesignMockRootView: View {
             // paused ≥400ms) is recorded. `saveRecentFilter` still
             // dedupes by filter_hash on top of this, so pinning the
             // same query twice never double-writes.
-            // Record into the library-filter history ONLY in `.table`
-            // mode. Thread-mode recording rides a separate
-            // `.onChange(of: searchText)` below because `composedQuery`
-            // doesn't include the keyword in `.default` / `.viewer`
-            // (the keyword is a find-in-page substring there, not a
-            // library filter), so this observer wouldn't fire on
-            // keyword changes in those modes and the in-thread history
-            // would stay empty forever.
-            guard selectedLayoutMode == .table else { return }
+            // Record into the library-filter history when the search
+            // field acts as a library narrow — that's `.table` and
+            // `.default`. Only `.viewer` repurposes the field as
+            // in-thread find-in-page; that history rides the separate
+            // `.onChange(of: searchText)` below.
+            guard selectedLayoutMode != .viewer else { return }
             recordRecentSearchTask?.cancel()
             let capturedQuery = newQuery
             recordRecentSearchTask = Task { @MainActor in
@@ -906,16 +903,16 @@ struct DesignMockRootView: View {
                 )
             }
         }
-        // Thread-mode ( `.default` / `.viewer` ) history recording.
-        // In those modes the search field is a find-in-page over the
-        // open thread, so the user's keystrokes never flow into
-        // `composedQuery` (the library filter). Observe `searchText`
-        // directly, debounce by 400ms just like the library path, and
-        // route the settled substring into `recentInThreadQueriesStore`
-        // so the `.searchSuggestions` dropdown has something to offer
-        // on subsequent focuses.
+        // Thread-mode (`.viewer` only) history recording. In viewer
+        // the search field is a find-in-page over the open thread,
+        // so the user's keystrokes never flow into `composedQuery`
+        // (the library filter). Observe `searchText` directly,
+        // debounce by 400ms just like the library path, and route
+        // the settled substring into `recentInThreadQueriesStore`
+        // so the `.searchSuggestions` dropdown has something to
+        // offer on subsequent focuses.
         .onChange(of: searchText) { _, newText in
-            guard selectedLayoutMode != .table else { return }
+            guard selectedLayoutMode == .viewer else { return }
             recordRecentSearchTask?.cancel()
             let capturedText = newText
             recordRecentSearchTask = Task { @MainActor in
@@ -1397,21 +1394,16 @@ struct DesignMockRootView: View {
                     max: Self.centerWidthMax
                 )
             } detail: {
-                // Unified with viewer/focus mode: the toolbar search
-                // field is an in-thread finder in default mode too.
-                // User request: "デフォルトビューのときはフォーカス
-                // ビューと同様にスレッド検索で統一して". Previously
-                // default routed `searchText` into `composedQuery`
-                // as a library-level keyword filter on the card
-                // list; now both modes share the same reader-find
-                // behavior, and library-scoped filtering happens
-                // via the sidebar (Sources / Bookmarks / saved filters)
-                // and DSL directives (`source:` etc., which still
-                // flow through `parsed.sortToken` + scope logic in
-                // `composedQuery`). `.table` mode still uses the
-                // field as a library keyword filter since a table
-                // without the reader pane has no thread to search.
-                readerPane(inThreadSearch: $searchText)
+                // Default mode keeps the middle pane visible, so the
+                // toolbar search field stays a library filter — same
+                // semantics as `.table`. Opening a thread from a
+                // filtered table previously wiped the filter because
+                // the field was being repurposed as in-thread find;
+                // keeping it as a library narrow lets the user click
+                // through filtered results without losing their
+                // query. In-thread find lives in `.viewer` only,
+                // where the middle pane is hidden.
+                readerPane(inThreadSearch: nil)
             }
             .id("default")
         case .viewer:
@@ -1688,8 +1680,8 @@ struct DesignMockRootView: View {
     /// - `.table` mode → library filter. Pull from
     ///   `libraryViewModel.unifiedFilters` keywords so recent archive
     ///   searches bubble back up.
-    /// - `.default` / `.viewer` mode → in-thread find-in-page. Pull
-    ///   from `recentInThreadQueriesStore.queries` so the user sees
+    /// - `.viewer` mode → in-thread find-in-page. Pull from
+    ///   `recentInThreadQueriesStore.queries` so the user sees
     ///   "substrings I searched for while reading", not filters that
     ///   scoped the whole library.
     ///
@@ -1705,10 +1697,10 @@ struct DesignMockRootView: View {
     /// is the same order of magnitude Safari / Spotlight show and
     /// fits on-screen without resizing).
     private var searchQuerySuggestions: [String] {
-        if selectedLayoutMode == .table {
-            return librarySearchQuerySuggestions
-        } else {
+        if selectedLayoutMode == .viewer {
             return inThreadSearchQuerySuggestions
+        } else {
+            return librarySearchQuerySuggestions
         }
     }
 
@@ -1747,15 +1739,20 @@ struct DesignMockRootView: View {
         var query = DesignMockDataStore.FetchQuery()
         let parsed = DesignMockQueryLanguage.parse(searchText)
         // Only `.table` mode (no reader pane) treats the free-text
-        // keyword as a library filter. `.default` and `.viewer` both
-        // ship it to the reader as an in-thread query instead — they
-        // each have a thread open, and the user's mental model for the
-        // search field in those modes is "find inside what I'm reading"
-        // (request: "デフォルトビューのときはフォーカスビューと同様に
-        // スレッド検索で統一して"). DSL directives like `sort:` and
-        // sidebar-driven scoping still apply below so library navigation
-        // remains possible without the keyword filter.
-        if selectedLayoutMode == .table {
+        // keyword as a library filter. `.table` and `.default` both
+        // keep the middle pane visible, so the search field acts as a
+        // library narrow in those modes — the user can drill from
+        // "filtered list" to "filtered list + reader" without losing
+        // their query. `.viewer` is the only mode where the middle
+        // pane is hidden; there the field switches to in-thread
+        // find-in-page since there's no library list to scope.
+        // (Earlier this code unified `.default` with `.viewer` per
+        // request "デフォルトビューのときはフォーカスビューと同様に
+        // スレッド検索で統一して"; that was reverted because opening
+        // a thread from `.table` was wiping the table's filter and
+        // the user could no longer reach the rows they'd narrowed
+        // down to.)
+        if selectedLayoutMode != .viewer {
             query.keyword = parsed.keyword.trimmingCharacters(in: .whitespacesAndNewlines)
         }
         query.sortKey = DesignMockQueryLanguage.dbSortKey(from: parsed.sortToken)
