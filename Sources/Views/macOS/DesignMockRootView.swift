@@ -1621,7 +1621,20 @@ struct DesignMockRootView: View {
             if !parsedDSL.modelFilters.isEmpty {
                 return Set(parsedDSL.modelFilters)
             }
-            return allModelNames.subtracting(parsedDSL.excludedModels)
+            // Hierarchical exclusion: a model is unchecked if its
+            // own name is in `excludedModels` OR its parent source
+            // sits in `excludedSources`. Without this, turning a
+            // source off would leave its model dots painted as
+            // checked even though they're effectively off — the
+            // standard parent-checkbox-cascades-to-children
+            // behaviour the user expects.
+            var result = allModelNames.subtracting(parsedDSL.excludedModels)
+            for src in store.sources where parsedDSL.excludedSources.contains(src.name) {
+                for model in src.models {
+                    result.remove(model.name)
+                }
+            }
+            return result
         }()
         return DesignMockSidebar(
             selection: sidebarSelection,
@@ -1632,7 +1645,7 @@ struct DesignMockRootView: View {
             libraryViewModel: libraryViewModel,
             checkedSources: checkedSources,
             checkedModels: checkedModels,
-            onToggleSource: { name in
+            onToggleSource: { sourceName in
                 // Toggling an icon switches into multi-select mode —
                 // reset the sidebar's single-select highlight to
                 // "All Threads" so the visible filter matches the
@@ -1644,29 +1657,86 @@ struct DesignMockRootView: View {
                 if selectedSidebarItemID != DesignMockSidebarItem.allThreads.id {
                     selectedSidebarItemID = DesignMockSidebarItem.allThreads.id
                 }
-                // Strip any hand-typed positive `source:` directives
-                // before flipping the negation, so the include-set
-                // computation falls cleanly to the "all − excluded"
-                // branch instead of staying pinned to a stale
-                // positive list.
+                // Determine the source's current visual state from
+                // the parsed DSL. Hierarchical checkbox rule:
+                // "fully checked" means the user can flip to "fully
+                // off" with one click; "partial" or "fully off"
+                // means the click should restore everything to on.
+                let parsed = DesignMockQueryLanguage.parse(searchText)
+                let modelsUnder = store.sources
+                    .first(where: { $0.name == sourceName })?
+                    .models.map(\.name) ?? []
+                let sourceExcluded = parsed.excludedSources.contains(sourceName)
+                let allModelsExcluded = !modelsUnder.isEmpty &&
+                    modelsUnder.allSatisfy { parsed.excludedModels.contains($0) }
+                let isFullyChecked = !sourceExcluded && !allModelsExcluded
+                // Always rebuild from scratch so partial-state
+                // residue (per-model exclusions left over from the
+                // user toggling individual models) gets cleared on
+                // the way through.
                 var text = DesignMockQueryLanguage.stripDirectives(
                     key: "source", from: searchText
                 )
-                text = DesignMockQueryLanguage.toggleDirective(
-                    key: "-source", value: name, in: text
+                for modelName in modelsUnder {
+                    text = DesignMockQueryLanguage.setDirective(
+                        key: "-model", value: modelName, present: false, in: text
+                    )
+                }
+                text = DesignMockQueryLanguage.setDirective(
+                    key: "-source", value: sourceName,
+                    present: isFullyChecked, in: text
                 )
                 searchText = text
             },
-            onToggleModel: { name in
+            onToggleModel: { sourceName, modelName in
                 if selectedSidebarItemID != DesignMockSidebarItem.allThreads.id {
                     selectedSidebarItemID = DesignMockSidebarItem.allThreads.id
                 }
+                let parsed = DesignMockQueryLanguage.parse(searchText)
+                let parentSource = store.sources.first(where: { $0.name == sourceName })
+                let siblings = (parentSource?.models.map(\.name) ?? [])
+                    .filter { $0 != modelName }
+                let parentExcluded = parsed.excludedSources.contains(sourceName)
+                let modelExcluded = parsed.excludedModels.contains(modelName)
+                let isCurrentlyChecked = !parentExcluded && !modelExcluded
                 var text = DesignMockQueryLanguage.stripDirectives(
                     key: "model", from: searchText
                 )
-                text = DesignMockQueryLanguage.toggleDirective(
-                    key: "-model", value: name, in: text
-                )
+                if isCurrentlyChecked {
+                    // Turn this model off — straight model-level
+                    // exclusion. Parent stays as-is; the source's
+                    // tri-state will read as `.partial` next render
+                    // because at least one sibling remains on (or
+                    // `.unchecked` if this was the only one left).
+                    text = DesignMockQueryLanguage.setDirective(
+                        key: "-model", value: modelName, present: true, in: text
+                    )
+                } else {
+                    // Turn this model on. Two paths to consider:
+                    //   - Parent is excluded → lift the parent
+                    //     exclusion, mark every sibling individually
+                    //     excluded so the visual outcome is "this
+                    //     one on, siblings still off" (parent reads
+                    //     as `.partial`).
+                    //   - Parent isn't excluded → just remove the
+                    //     model-level exclusion of THIS model.
+                    if parentExcluded {
+                        text = DesignMockQueryLanguage.setDirective(
+                            key: "-source", value: sourceName,
+                            present: false, in: text
+                        )
+                        for sibling in siblings {
+                            text = DesignMockQueryLanguage.setDirective(
+                                key: "-model", value: sibling,
+                                present: true, in: text
+                            )
+                        }
+                    }
+                    text = DesignMockQueryLanguage.setDirective(
+                        key: "-model", value: modelName,
+                        present: false, in: text
+                    )
+                }
                 searchText = text
             }
         )
@@ -2001,8 +2071,14 @@ private struct DesignMockSidebar: View {
     /// keeps the row-vs-icon distinction discoverable — the row
     /// pill is wide and selects, the icon is the size of the dot
     /// itself and toggles inclusion.
+    /// `onToggleModel` carries `(sourceName, modelName)` so the
+    /// hierarchical-checkbox logic can reach back to the source's
+    /// sibling model list and apply the standard "click child while
+    /// parent is off" recovery (lift the parent exclusion, exclude
+    /// only the siblings, leave this child on) without round-
+    /// tripping through name lookups in the shell.
     let onToggleSource: (String) -> Void
-    let onToggleModel: (String) -> Void
+    let onToggleModel: (_ sourceName: String, _ modelName: String) -> Void
     /// Which sources are currently expanded. We seed from `sources` on
     /// first appear *and* whenever the source list changes shape (e.g. a
     /// real-data fetch finally lands), so newly-visible multi-model
@@ -2163,15 +2239,33 @@ private struct DesignMockSidebar: View {
         let toggle: (() -> Void)? = {
             switch item.kind {
             case .source(let name): return { onToggleSource(name) }
-            case .model(_, let name): return { onToggleModel(name) }
+            case .model(let sourceName, let modelName): return { onToggleModel(sourceName, modelName) }
             default: return nil
             }
         }()
-        let isChecked: Bool = {
+        let state: CheckState = {
             switch item.kind {
-            case .source(let name): return checkedSources.contains(name)
-            case .model(_, let name): return checkedModels.contains(name)
-            default: return false
+            case .source(let name):
+                // Tri-state derived from the children: a source is
+                // fully checked when every model under it is
+                // checked, fully unchecked when none are, and
+                // partial when the user has toggled an individual
+                // model on/off without touching the others.
+                guard let src = sources.first(where: { $0.name == name }) else {
+                    return checkedSources.contains(name) ? .checked : .unchecked
+                }
+                let modelNames = src.models.map(\.name)
+                guard !modelNames.isEmpty else {
+                    return checkedSources.contains(name) ? .checked : .unchecked
+                }
+                let on = modelNames.filter { checkedModels.contains($0) }.count
+                if on == 0 { return .unchecked }
+                if on == modelNames.count { return .checked }
+                return .partial
+            case .model(_, let name):
+                return checkedModels.contains(name) ? .checked : .unchecked
+            default:
+                return .notApplicable
             }
         }()
         HoverableRow(isSelected: selection == item.id) { isHovering in
@@ -2180,7 +2274,7 @@ private struct DesignMockSidebar: View {
                 selection = item.id
             } label: {
                 HStack(spacing: 6) {
-                    rowIcon(item: item, toggle: toggle, isChecked: isChecked)
+                    rowIcon(item: item, toggle: toggle, state: state)
                         .frame(width: 16, alignment: .center)
                     VStack(alignment: .leading, spacing: 1) {
                         Text(item.title)
@@ -2235,33 +2329,65 @@ private struct DesignMockSidebar: View {
         }
     }
 
+    /// Tri-state checkbox indicator for the sidebar's source / model
+    /// rows. `notApplicable` is the path for non-checkbox rows
+    /// (Library / Bookmarks / archive.db) so they keep their plain
+    /// decorative-icon rendering.
+    enum CheckState { case checked, partial, unchecked, notApplicable }
+
     /// Render the leading icon for a sidebar row. For checkbox-capable
     /// rows (sources, models) the icon is wrapped in a Button whose
     /// hit area is just the glyph, so a click on the dot toggles the
     /// multi-select inclusion without firing the row-wide selection
-    /// the parent Button handles. The colour cue mirrors the typical
-    /// macOS checkbox semantic — on = the source's brand colour,
-    /// off = a quiet secondary tint — without adding a separate
-    /// checkmark glyph that would crowd the row.
-    @ViewBuilder
+    /// the parent Button handles. Three colour cues:
+    ///   - .checked → the source's brand colour at full intensity
+    ///   - .partial → the brand colour at reduced opacity, signalling
+    ///     "some children on, some off" (the indeterminate state of
+    ///     a standard hierarchical checkbox)
+    ///   - .unchecked → a quiet secondary tint
     private func rowIcon(
         item: DesignMockSidebarItem,
         toggle: (() -> Void)?,
-        isChecked: Bool
-    ) -> some View {
-        let style: AnyShapeStyle = (toggle != nil && !isChecked)
-            ? AnyShapeStyle(Color.secondary.opacity(0.55))
-            : item.iconStyle
+        state: CheckState
+    ) -> AnyView {
+        // Plain (non-ViewBuilder) body so the imperative state →
+        // style mapping below isn't fed through `buildExpression`.
+        // Returns `AnyView` because the two branches (Button-wrapped
+        // vs raw Image) have different concrete types and we want
+        // them to share a slot.
+        let resolvedStyle: AnyShapeStyle
+        let resolvedOpacity: Double
+        switch state {
+        case .checked, .notApplicable:
+            resolvedStyle = item.iconStyle
+            resolvedOpacity = 1.0
+        case .partial:
+            resolvedStyle = item.iconStyle
+            resolvedOpacity = 0.45
+        case .unchecked:
+            resolvedStyle = AnyShapeStyle(Color.secondary.opacity(0.55))
+            resolvedOpacity = 1.0
+        }
         let glyph = Image(systemName: item.systemImage)
-            .foregroundStyle(style)
+            .foregroundStyle(resolvedStyle)
+            .opacity(resolvedOpacity)
         if let toggle {
-            Button(action: toggle) {
-                glyph.contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help(isChecked ? "Remove from filter" : "Add to filter")
+            let helpText: String = {
+                switch state {
+                case .checked, .partial: return "Remove from filter"
+                case .unchecked: return "Add to filter"
+                case .notApplicable: return ""
+                }
+            }()
+            return AnyView(
+                Button(action: toggle) {
+                    glyph.contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(helpText)
+            )
         } else {
-            glyph
+            return AnyView(glyph)
         }
     }
 
@@ -4532,6 +4658,23 @@ private enum DesignMockQueryLanguage {
         let pieces = text.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
         let kept = pieces.filter { !$0.lowercased().hasPrefix(target) }
         return kept.joined(separator: " ")
+    }
+
+    /// Force a `key:value` directive into the desired present /
+    /// absent state in `text`. Removes every prior occurrence and
+    /// (when `present == true`) appends exactly one canonical
+    /// instance. Used by the hierarchical-checkbox toggle paths
+    /// where the caller knows the target state explicitly and
+    /// doesn't want toggle's ambiguity ("does another click flip me
+    /// back?").
+    static func setDirective(key: String, value: String, present: Bool, in text: String) -> String {
+        let target = "\(key.lowercased()):\(value)"
+        let pieces = text.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+        var out = pieces.filter { $0.lowercased() != target.lowercased() }
+        if present {
+            out.append(target)
+        }
+        return out.joined(separator: " ")
     }
 
     /// Toggle a single `key:value` directive in `text`. If the exact
