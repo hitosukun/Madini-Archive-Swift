@@ -416,13 +416,47 @@ private struct LoadedConversationDetailView: View {
                                         }
                                     }
                                 )
-                                .contentShape(Rectangle())
-                                .onTapGesture {
-                                    guard message.isUser else {
-                                        return
+                                // Sync the outline cursor to a clicked
+                                // user message — but only via a
+                                // `.simultaneousGesture` so the system's
+                                // text-selection drag isn't pre-empted.
+                                // The previous `.onTapGesture` here ate
+                                // every mouse-down on the bubble area
+                                // (`.contentShape(Rectangle())` extended
+                                // the hit shape across the whole row),
+                                // which made dragging across rendered
+                                // text feel sticky and frequently
+                                // dropped the selection on click-up.
+                                // SimultaneousGesture lets both
+                                // recognisers win — the tap fires when
+                                // the user genuinely clicks, drag-
+                                // select still produces a selection
+                                // when they press and move.
+                                .simultaneousGesture(
+                                    TapGesture()
+                                        .onEnded {
+                                            guard message.isUser else { return }
+                                            selectedPromptID = message.id
+                                        }
+                                )
+                                .contextMenu {
+                                    // Browser-style "Copy as Markdown".
+                                    // The message body is stored as the
+                                    // original markdown source on
+                                    // `message.content`; rendered Text
+                                    // copies as plain prose with all
+                                    // formatting flattened, which is
+                                    // useless for piping a snippet back
+                                    // into another LLM. This item bypasses
+                                    // the rendering layer and writes the
+                                    // raw source straight to the system
+                                    // pasteboard.
+                                    Button("Copy as Markdown") {
+                                        copyMessageAsMarkdown(message)
                                     }
-
-                                    selectedPromptID = message.id
+                                    Button("Copy Message") {
+                                        copyMessagePlain(message)
+                                    }
                                 }
 
                                 // Within-turn spacer between this message
@@ -876,6 +910,49 @@ private struct LoadedConversationDetailView: View {
     /// programmatic-scroll lock while the animation runs so the
     /// scroll-position observer can't repopulate `selectedPromptID`
     /// with the first prompt crossing the threshold mid-flight.
+    /// Write the message's raw source to the system pasteboard. The
+    /// renderer rebuilds bubbles from `AttributedString(markdown:)`,
+    /// and `.textSelection(.enabled)` copies whatever the rendered
+    /// text reads as — bullets, code fences, bold markers all
+    /// disappear in the round-trip. The user's actual ask was "I
+    /// want to paste this into another LLM" / "I want it as md", so
+    /// drop one rung in the rendering ladder and copy the original.
+    private func copyMessageAsMarkdown(_ message: Message) {
+        writeToPasteboard(message.content)
+    }
+
+    /// Plain-text fallback. Most assistants return prose-shaped
+    /// markdown so the difference is small, but the explicit pair
+    /// makes the menu's intent unambiguous: "as Markdown" preserves
+    /// the source, "Copy Message" gives you what reads as the
+    /// conversation. Implementation strips the few non-prose markers
+    /// readers paste-share most often complain about (table pipes,
+    /// fenced code header lines).
+    private func copyMessagePlain(_ message: Message) {
+        var text = message.content
+        // Drop markdown link wrappers `[label](url)` → `label (url)`
+        // so the URL stays accessible after copy without the bracket
+        // chrome surrounding it. Code fences and bullets pass
+        // through; users wanting completely raw markdown have the
+        // dedicated item above.
+        text = text.replacingOccurrences(
+            of: #"\[(.*?)\]\((.*?)\)"#,
+            with: "$1 ($2)",
+            options: .regularExpression
+        )
+        writeToPasteboard(text)
+    }
+
+    private func writeToPasteboard(_ text: String) {
+        #if os(macOS)
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(text, forType: .string)
+        #else
+        UIPasteboard.general.string = text
+        #endif
+    }
+
     private func performScrollToTop(using proxy: ScrollViewProxy) {
         let token = UUID()
         programmaticScrollLock = token
