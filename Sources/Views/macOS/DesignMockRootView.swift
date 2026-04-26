@@ -2870,7 +2870,14 @@ private struct DesignMockExpandedPromptList: View {
         // avoid nested scrolling.
         ScrollViewReader { proxy in
         ScrollView {
-            VStack(alignment: .leading, spacing: 2) {
+            // `LazyVStack` instead of plain `VStack`: long
+            // conversations carry hundreds of prompts and the eager
+            // stack instantiated all rows up front, blocking the main
+            // thread on first paint and re-evaluating every row body
+            // on every selection / hover state change. Lazy
+            // materialization caps the cost to whatever's actually
+            // in the viewport.
+            LazyVStack(alignment: .leading, spacing: 2) {
                 if isLoading && prompts.isEmpty {
                     ProgressView()
                         .controlSize(.small)
@@ -3055,50 +3062,107 @@ private struct DesignMockExpandedPromptList: View {
 
     @ViewBuilder
     private func promptRow(_ prompt: DesignMockPrompt) -> some View {
-        let isPinned = store.isPromptBookmarked(prompt.id)
+        // Hand the row plain scalars (`isSelected`, `isHovered`,
+        // `isPinned`) instead of letting it close over the parent's
+        // `selectedPromptID` / `hoveredPromptID` / `store`. SwiftUI
+        // diffs `Equatable` view inputs and skips body re-evaluation
+        // for rows whose scalars didn't change — so a selection move
+        // re-paints exactly two rows (the previous one + the new
+        // one) instead of every prompt in the outline. With
+        // hundreds of prompts that's the difference between "snappy"
+        // and "molasses on every keystroke".
+        DesignMockPromptRow(
+            prompt: prompt,
+            isSelected: selectedPromptID == prompt.id,
+            isHovered: hoveredPromptID == prompt.id,
+            isPinned: store.isPromptBookmarked(prompt.id),
+            onSelect: {
+                onSelectPrompt(prompt.id)
+                selectedPromptID = prompt.id
+                isPromptListFocused = true
+            },
+            onTogglePin: { [conversation] in
+                Task {
+                    await store.togglePromptBookmark(
+                        promptID: prompt.id,
+                        conversationID: conversation.id,
+                        snippet: prompt.snippet,
+                        threadTitle: conversation.title,
+                        services: services
+                    )
+                }
+            },
+            onHoverChanged: { hovering in
+                if hovering {
+                    hoveredPromptID = prompt.id
+                } else if hoveredPromptID == prompt.id {
+                    hoveredPromptID = nil
+                }
+            }
+        )
+        // `.equatable()` makes SwiftUI honour the row's `==`
+        // implementation for diffing. Without it the framework
+        // falls back to "always re-evaluate" for `View`s, and the
+        // performance gain from short-circuiting unchanged rows
+        // disappears.
+        .equatable()
+    }
+}
+
+/// One row in the expanded prompt outline. Deliberately a value-typed
+/// `View` whose stored properties are all scalars — that way SwiftUI's
+/// view diffing can short-circuit on rows whose inputs didn't change
+/// during a selection / hover transition. Long conversations make this
+/// matter: a `selectedPromptID` flip used to re-evaluate every row's
+/// body because they all closed over the same `@State`; now only the
+/// two rows whose `isSelected` actually changed get re-rendered.
+private struct DesignMockPromptRow: View, Equatable {
+    let prompt: DesignMockPrompt
+    let isSelected: Bool
+    let isHovered: Bool
+    let isPinned: Bool
+    let onSelect: () -> Void
+    let onTogglePin: () -> Void
+    let onHoverChanged: (Bool) -> Void
+
+    static func == (lhs: DesignMockPromptRow, rhs: DesignMockPromptRow) -> Bool {
+        // Closures are reference-comparable but unstable across
+        // parent body passes; keep the equality narrowly on the
+        // visible-state inputs so SwiftUI gets to skip the body
+        // re-eval whenever those scalars stayed put. A selection
+        // move flips exactly two rows' `isSelected`; this method
+        // returns `true` for every other row and SwiftUI skips
+        // their bodies entirely.
+        return lhs.prompt.id == rhs.prompt.id
+            && lhs.prompt.index == rhs.prompt.index
+            && lhs.prompt.snippet == rhs.prompt.snippet
+            && lhs.isSelected == rhs.isSelected
+            && lhs.isHovered == rhs.isHovered
+            && lhs.isPinned == rhs.isPinned
+    }
+
+    var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 6) {
-            // Sequence number sits on the LEADING edge instead of
-            // the trailing edge, and the previous `text.bubble`
-            // glyph is retired — the number alone already
-            // identifies "which prompt", and the icon was just
-            // decorative chrome that stole horizontal budget at
-            // narrow widths. Right-aligned within a fixed-width
-            // gutter so single-, double- and triple-digit rows
-            // line up vertically (1 / 10 / 100).
+            // Sequence number sits on the LEADING edge — single-,
+            // double- and triple-digit prompt indices line up
+            // vertically thanks to the fixed gutter width.
             Text("\(prompt.index + 1)")
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .frame(width: 20, alignment: .trailing)
 
-            // Main click target — scroll-to-prompt. Kept as an explicit
-            // Button so the row responds to keyboard focus and taps,
-            // while the pin toggle below stays independently hit-testable
-            // (a .simultaneousGesture-style approach would swallow the
-            // pin tap into the row scroll action).
-            Button {
-                // Fire the id — the shell relays it to the reader so it
-                // scrolls to the matching message. `ConversationDetailView`
-                // clears its incoming binding to nil after applying, so a
-                // repeat-tap on the same row still triggers a fresh scroll.
-                onSelectPrompt(prompt.id)
-                selectedPromptID = prompt.id
-                // Clicking a prompt row should leave keyboard
-                // focus on the prompt list so the user can
-                // immediately hit ↑/↓ to step through. Without
-                // this explicit re-claim, the Button's tap would
-                // transfer first-responder to the Button itself
-                // and our `@FocusState` wrapper would lose its
-                // key routing.
-                isPromptListFocused = true
-            } label: {
-                // `lineLimit(2)` instead of 1: at narrow center-pane
-                // widths (the user drags the pane down to ~180pt,
-                // per the split-view min), a single-line snippet
-                // truncates to one or two characters — effectively
-                // hiding the prompt text. Two lines give enough
-                // room for a Japanese title to survive truncation
-                // while keeping the row compact enough that a long
-                // outline still reads as a list.
+            // Main click target — relays selection up so the reader
+            // pane scrolls to the matching message. Kept as an
+            // explicit Button (not a tap gesture) so the row
+            // responds to keyboard focus and taps in the same
+            // standard way.
+            Button(action: onSelect) {
+                // `lineLimit(2)` instead of 1: at narrow center-
+                // pane widths (drag-down to ~180pt) a single-line
+                // snippet truncates to one or two characters,
+                // effectively hiding the prompt text. Two lines
+                // keep Japanese titles legible while the row stays
+                // list-compact.
                 Text(prompt.snippet)
                     .font(.subheadline)
                     .lineLimit(2)
@@ -3109,55 +3173,35 @@ private struct DesignMockExpandedPromptList: View {
             }
             .buttonStyle(.plain)
 
-            // Pin toggle. Only visible on hover or when already pinned —
-            // unpinned + unhovered rows stay visually quiet so the
-            // prompt list doesn't turn into a wall of bookmark icons.
-            pinButton(for: prompt, isPinned: isPinned)
-                .opacity(isPinned || hoveredPromptID == prompt.id ? 1 : 0)
+            // Pin toggle. Only visible on hover or when already
+            // pinned — unpinned + unhovered rows stay visually
+            // quiet so the outline doesn't turn into a wall of
+            // bookmark icons.
+            Button(action: onTogglePin) {
+                Image(systemName: isPinned ? "bookmark.fill" : "bookmark")
+                    .font(.subheadline)
+                    .foregroundStyle(isPinned ? Color.yellow : Color.secondary)
+                    .frame(width: 14)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(isPinned ? "Unpin prompt" : "Pin prompt")
+            .opacity(isPinned || isHovered ? 1 : 0)
         }
         .padding(.vertical, 6)
         .padding(.horizontal, 4)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
-            rowBackground(for: prompt),
+            rowBackground,
             in: RoundedRectangle(cornerRadius: 6, style: .continuous)
         )
         .contentShape(Rectangle())
-        .onHover { hovering in
-            hoveredPromptID = hovering ? prompt.id : (hoveredPromptID == prompt.id ? nil : hoveredPromptID)
-        }
+        .onHover(perform: onHoverChanged)
     }
 
-    @ViewBuilder
-    private func pinButton(for prompt: DesignMockPrompt, isPinned: Bool) -> some View {
-        Button {
-            Task {
-                await store.togglePromptBookmark(
-                    promptID: prompt.id,
-                    conversationID: conversation.id,
-                    snippet: prompt.snippet,
-                    threadTitle: conversation.title,
-                    services: services
-                )
-            }
-        } label: {
-            Image(systemName: isPinned ? "bookmark.fill" : "bookmark")
-                .font(.subheadline)
-                .foregroundStyle(isPinned ? Color.yellow : Color.secondary)
-                .frame(width: 14)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .help(isPinned ? "Unpin prompt" : "Pin prompt")
-    }
-
-    private func rowBackground(for prompt: DesignMockPrompt) -> Color {
-        if selectedPromptID == prompt.id {
-            return Color.accentColor.opacity(0.22)
-        }
-        if hoveredPromptID == prompt.id {
-            return Color.primary.opacity(0.06)
-        }
+    private var rowBackground: Color {
+        if isSelected { return Color.accentColor.opacity(0.22) }
+        if isHovered { return Color.primary.opacity(0.06) }
         return Color.clear
     }
 }
