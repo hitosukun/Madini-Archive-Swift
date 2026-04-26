@@ -4535,12 +4535,13 @@ private enum DesignMockQueryLanguage {
                 continue
             }
 
-            // A leading `-` flips the directive to negation
-            // (GitHub-style `-source:foo`). Stripped before key
-            // matching so `-source:` and `source:` route through the
-            // same switch with the negation flag carried along.
+            // A leading `-` or `¬` flips the directive to negation.
+            // The hyphen is the GitHub-ish form ("-source:foo");
+            // `¬` is the logical-not symbol used in the canonical
+            // compact rendering. Both are accepted on input so the
+            // user can type either.
             var key = token[..<colonIx].lowercased()
-            let isNegated = key.hasPrefix("-")
+            let isNegated = key.hasPrefix("-") || key.hasPrefix("¬")
             if isNegated {
                 key = String(key.dropFirst())
             }
@@ -4553,44 +4554,49 @@ private enum DesignMockQueryLanguage {
                 continue
             }
 
-            // First directive of each key wins. Subsequent duplicates
-            // become no-ops so stale trailing tokens can't clobber the
-            // one the user just typed in front.
+            // The compact rendering joins multiple values for the
+            // same (negated, key) pair with commas — `¬model:a,b,c`
+            // instead of three separate tokens. Split here so each
+            // value lands in the same downstream bucket as if it
+            // had been typed as its own atom.
+            let values = rawValue.split(separator: ",", omittingEmptySubsequences: true).map(String.init)
+
+            // First directive of each key wins for single-value
+            // slots (`sort`, `tag`, `bookmark`). Multi-value slots
+            // (`source`, `model`) accumulate.
             switch key {
             case "sort":
-                // `sort:` has no negative form — `-sort:foo` parses as
-                // an unknown directive and falls through to free text.
                 guard !isNegated else {
                     freeWords.append(token)
                     continue
                 }
-                if parsed.sortToken == nil {
-                    parsed.sortToken = rawValue.lowercased()
+                if parsed.sortToken == nil, let first = values.first {
+                    parsed.sortToken = first.lowercased()
                 }
             case "source":
                 // Default state of each source is "on" (icon coloured),
                 // so the sidebar toggle writes the negative form
-                // `-source:NAME` to grey it out. The positive form is
+                // `¬source:NAME` to grey it out. The positive form is
                 // kept as a legacy hand-typed channel meaning "show
                 // ONLY these sources" — the two channels coexist and
                 // composedQuery picks the one that's set, with
                 // positive winning when both happen to carry data.
                 let bucket = isNegated ? \Parsed.excludedSources : \Parsed.sourceFilters
-                if !parsed[keyPath: bucket].contains(rawValue) {
-                    parsed[keyPath: bucket].append(rawValue)
+                for value in values where !parsed[keyPath: bucket].contains(value) {
+                    parsed[keyPath: bucket].append(value)
                 }
             case "model":
                 let bucket = isNegated ? \Parsed.excludedModels : \Parsed.modelFilters
-                if !parsed[keyPath: bucket].contains(rawValue) {
-                    parsed[keyPath: bucket].append(rawValue)
+                for value in values where !parsed[keyPath: bucket].contains(value) {
+                    parsed[keyPath: bucket].append(value)
                 }
             case "tag":
                 guard !isNegated else {
                     freeWords.append(token)
                     continue
                 }
-                if parsed.tagFilter == nil {
-                    parsed.tagFilter = rawValue
+                if parsed.tagFilter == nil, let first = values.first {
+                    parsed.tagFilter = first
                 }
             case "bookmark", "is":
                 // `bookmark:true` / `bookmark:false` and the GitHub-ish
@@ -4625,86 +4631,144 @@ private enum DesignMockQueryLanguage {
     /// chatgpt" — the keyword they typed stays visible, only the
     /// conflicting source filter goes away. Returns the trimmed
     /// string with single-space separators rebuilt.
-    static func stripSidebarConflictingDirectives(from text: String) -> String {
-        let pieces = text.split(separator: " ", omittingEmptySubsequences: true)
-            .map(String.init)
-        let out = pieces.filter { piece in
-            guard let colonIx = piece.firstIndex(of: ":") else { return true }
-            // Normalise off any leading `-` so the strip catches both
-            // positive `source:foo` and negative `-source:foo` — the
-            // sidebar's single-select pick supersedes whichever side
-            // of the multi-select channel was active before.
-            var key = piece[..<colonIx].lowercased()
-            if key.hasPrefix("-") { key = String(key.dropFirst()) }
-            switch key {
-            case "source", "model", "tag", "bookmark", "is":
-                return false
-            default:
-                return true
-            }
-        }
-        return out.joined(separator: " ")
+    // MARK: - Atom-based serialization
+
+    /// Internal representation of a single directive value. Re-emitting
+    /// always passes through this shape so we can compact runs of
+    /// same-key atoms back into a single comma-joined token (e.g.
+    /// `¬model:a,b,c`) — the verbose `¬model:a ¬model:b ¬model:c`
+    /// the user reported as cluttered visible text.
+    fileprivate struct Atom: Equatable {
+        let negated: Bool
+        let key: String   // lowercased
+        let value: String // case preserved
     }
 
-    /// Drop every directive with a given key from `text`, regardless of
-    /// value. Used when the icon-driven negation channel takes over
-    /// from a hand-typed positive set so the two don't clash —
-    /// clicking a source dot wipes any lingering positive `source:X`
-    /// before adding the negation, which keeps the visible "include
-    /// set" computation strictly negation-driven from that point on.
-    /// Pass `key` exactly as it appears (`"source"`, `"-source"`).
-    static func stripDirectives(key: String, from text: String) -> String {
-        let target = key.lowercased() + ":"
-        let pieces = text.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
-        let kept = pieces.filter { !$0.lowercased().hasPrefix(target) }
-        return kept.joined(separator: " ")
-    }
-
-    /// Force a `key:value` directive into the desired present /
-    /// absent state in `text`. Removes every prior occurrence and
-    /// (when `present == true`) appends exactly one canonical
-    /// instance. Used by the hierarchical-checkbox toggle paths
-    /// where the caller knows the target state explicitly and
-    /// doesn't want toggle's ambiguity ("does another click flip me
-    /// back?").
-    static func setDirective(key: String, value: String, present: Bool, in text: String) -> String {
-        let target = "\(key.lowercased()):\(value)"
-        let pieces = text.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
-        var out = pieces.filter { $0.lowercased() != target.lowercased() }
-        if present {
-            out.append(target)
-        }
-        return out.joined(separator: " ")
-    }
-
-    /// Toggle a single `key:value` directive in `text`. If the exact
-    /// `key:value` token is already present, every occurrence is
-    /// removed; otherwise one is appended at the end with a leading
-    /// space so it sits clear of existing tokens. Used by the
-    /// sidebar's checkbox icons so a click on the chatgpt dot writes
-    /// (or strips) `source:chatgpt` in the toolbar field — the
-    /// search query string is the canonical home for the multi-
-    /// select state, and the icon's color just reflects what's
-    /// already there.
-    static func toggleDirective(key: String, value: String, in text: String) -> String {
-        let target = "\(key.lowercased()):\(value)"
-        let pieces = text.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
-        var found = false
-        var out: [String] = []
-        for piece in pieces {
-            if piece.lowercased() == target.lowercased() {
-                found = true
+    /// Decompose a free-text query into (free words, directive
+    /// atoms). Accepts both `-key:` and `¬key:` for negation, and
+    /// both single-value (`key:foo`) and comma-separated multi-value
+    /// (`key:foo,bar`) tokens — typing either form by hand is fine,
+    /// the canonical compact form is what gets re-emitted.
+    fileprivate static func decompose(_ text: String) -> (free: [String], atoms: [Atom]) {
+        var freeWords: [String] = []
+        var atoms: [Atom] = []
+        for raw in text.split(separator: " ", omittingEmptySubsequences: true) {
+            let token = String(raw)
+            guard let colonIx = token.firstIndex(of: ":") else {
+                freeWords.append(token)
                 continue
             }
-            out.append(piece)
+            var keyPart = String(token[..<colonIx])
+            let isNegated = keyPart.hasPrefix("-") || keyPart.hasPrefix("¬")
+            if isNegated { keyPart = String(keyPart.dropFirst()) }
+            let key = keyPart.lowercased()
+            let valuePart = String(token[token.index(after: colonIx)...])
+            guard !valuePart.isEmpty else {
+                freeWords.append(token)
+                continue
+            }
+            for v in valuePart.split(separator: ",", omittingEmptySubsequences: true) {
+                atoms.append(Atom(negated: isNegated, key: key, value: String(v)))
+            }
         }
-        if found {
-            return out.joined(separator: " ")
+        return (freeWords, atoms)
+    }
+
+    /// Inverse of `decompose`: emit a canonical compact string from
+    /// the (free, atoms) pair. Atoms with the same (negated, key)
+    /// fold into one token with comma-joined values, in order of
+    /// first appearance — `-model:a,b,c` rather than three separate
+    /// `-model:` tokens. Negation uses the plain hyphen prefix
+    /// (GitHub-style) so the field stays typeable from a normal
+    /// keyboard; the parser still accepts the `¬` form on input
+    /// for users who prefer it but the writer always emits `-`.
+    fileprivate static func serialize(free: [String], atoms: [Atom]) -> String {
+        var groupOrder: [(negated: Bool, key: String)] = []
+        var seenGroup: Set<String> = []
+        var values: [String: [String]] = [:]
+        for atom in atoms {
+            let gid = "\(atom.negated ? "1" : "0")|\(atom.key)"
+            if seenGroup.insert(gid).inserted {
+                groupOrder.append((atom.negated, atom.key))
+                values[gid] = []
+            }
+            if !values[gid]!.contains(atom.value) {
+                values[gid]!.append(atom.value)
+            }
         }
-        // Append. Single-space join handles the empty-prefix case
-        // cleanly so we never produce a leading space.
-        out.append(target)
+        var out = free
+        for (neg, key) in groupOrder {
+            let gid = "\(neg ? "1" : "0")|\(key)"
+            let vs = values[gid] ?? []
+            guard !vs.isEmpty else { continue }
+            let prefix = neg ? "-" : ""
+            out.append("\(prefix)\(key):\(vs.joined(separator: ","))")
+        }
         return out.joined(separator: " ")
+    }
+
+    /// Strip every directive whose normalised key is one of
+    /// `source` / `model` / `tag` / `bookmark` / `is` — both the
+    /// positive and negative variants — without touching free text
+    /// or `sort` / `title` / `content`. Used by the sidebar
+    /// single-select setter so a user click on a Library / Sources
+    /// row resets the multi-select state to its default.
+    static func stripSidebarConflictingDirectives(from text: String) -> String {
+        let (free, atoms) = decompose(text)
+        let conflictKeys: Set<String> = ["source", "model", "tag", "bookmark", "is"]
+        let kept = atoms.filter { !conflictKeys.contains($0.key) }
+        return serialize(free: free, atoms: kept)
+    }
+
+    /// Drop every directive with a given key (in the polarity
+    /// indicated by the prefix). Pass `key` exactly as it appears at
+    /// call-sites: `"source"` strips positives, `"-source"` /
+    /// `"¬source"` strips negatives. The other polarity is left
+    /// alone — the sidebar's icon path strips only the positive
+    /// channel before installing a negation, so a hand-typed
+    /// `source:` doesn't clash with the dot-toggle output.
+    static func stripDirectives(key: String, from text: String) -> String {
+        var keyNorm = key.lowercased()
+        let isNegated = keyNorm.hasPrefix("-") || keyNorm.hasPrefix("¬")
+        if isNegated { keyNorm = String(keyNorm.dropFirst()) }
+        let (free, atoms) = decompose(text)
+        let kept = atoms.filter { !($0.key == keyNorm && $0.negated == isNegated) }
+        return serialize(free: free, atoms: kept)
+    }
+
+    /// Force a `(key, value)` atom into the desired present / absent
+    /// state. The canonical re-serialization handles coalescing
+    /// (`¬model:a,b` instead of separate tokens) so the visible
+    /// query stays compact regardless of how many calls land for
+    /// the same key.
+    static func setDirective(key: String, value: String, present: Bool, in text: String) -> String {
+        var keyNorm = key.lowercased()
+        let isNegated = keyNorm.hasPrefix("-") || keyNorm.hasPrefix("¬")
+        if isNegated { keyNorm = String(keyNorm.dropFirst()) }
+        var (free, atoms) = decompose(text)
+        atoms.removeAll { $0.key == keyNorm && $0.negated == isNegated && $0.value == value }
+        if present {
+            atoms.append(Atom(negated: isNegated, key: keyNorm, value: value))
+        }
+        return serialize(free: free, atoms: atoms)
+    }
+
+    /// Flip the `(key, value)` atom's presence — remove if present,
+    /// add if absent. Matches the click-to-toggle gesture; the
+    /// canonical compact form falls out automatically from the
+    /// shared serializer.
+    static func toggleDirective(key: String, value: String, in text: String) -> String {
+        var keyNorm = key.lowercased()
+        let isNegated = keyNorm.hasPrefix("-") || keyNorm.hasPrefix("¬")
+        if isNegated { keyNorm = String(keyNorm.dropFirst()) }
+        var (free, atoms) = decompose(text)
+        let target = Atom(negated: isNegated, key: keyNorm, value: value)
+        if atoms.contains(target) {
+            atoms.removeAll { $0 == target }
+        } else {
+            atoms.append(target)
+        }
+        return serialize(free: free, atoms: atoms)
     }
 
     /// Rewrite `text` so its sort directive becomes `sort:\(token)`, or
