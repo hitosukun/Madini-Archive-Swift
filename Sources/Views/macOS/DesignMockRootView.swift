@@ -2060,20 +2060,12 @@ struct DesignMockRootView: View {
         return filter
     }
 
-    /// Toolbar search field placeholder. Flips with the layout mode so the
-    /// affordance tells the user what the field currently does — library
-    /// filter vs. in-thread finder. `.default` joins `.viewer` on the
-    /// in-thread side since both modes have a reader pane visible and
-    /// share a single "find in the open thread" semantic; only `.table`
-    /// (no reader) still uses the field for library-wide keyword
-    /// filtering.
+    /// Toolbar search field placeholder. The toolbar search is now a
+    /// library narrow in every layout mode (in-thread find moved to
+    /// the ⌘F floating bar in the reader), so this stays constant —
+    /// no layout-mode flip back to "このスレッド内を検索" any more.
     private var searchPrompt: String {
-        switch selectedLayoutMode {
-        case .table:
-            return "ライブラリを検索"
-        case .default, .viewer:
-            return "このスレッド内を検索"
-        }
+        return "ライブラリを検索"
     }
 
     /// True when the sidebar points at archive.db. The consolidated
