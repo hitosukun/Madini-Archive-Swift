@@ -2828,6 +2828,18 @@ private struct DesignMockExpandedPromptList: View {
     /// highlight immediately if we reused it.
     @State private var selectedPromptID: String?
     @State private var hoveredPromptID: String?
+    /// Pending debounced "scroll the reader to this prompt" write. The
+    /// outline's plain ↑/↓ updates `selectedPromptID` immediately for
+    /// instant highlight feedback, but defers the cross-pane reader
+    /// scroll until the user pauses for ~120ms. Holding ↓ used to hit
+    /// the reader with one programmatic-scroll request per keystroke
+    /// (~30Hz auto-repeat); each request started a 30-iteration
+    /// convergence loop on the reader's NSScrollView, the loops piled
+    /// up, and the prompt outline's selection highlight visibly
+    /// chattered as SwiftUI's render cycle fought the back-pressure.
+    /// Coalescing means rapid key presses produce at most one reader
+    /// scroll for the final resting position.
+    @State private var pendingPromptScrollTask: Task<Void, Never>?
     /// Focus flag for the prompt list's keyboard handler. Set to true
     /// on appear so ⌘→ (drill-in from state 2 to state 3) lands the
     /// user directly in a prompt-navigable surface — they don't have
@@ -3004,19 +3016,29 @@ private struct DesignMockExpandedPromptList: View {
             return
         }
         selectedPromptID = nextID
-        pendingPromptID = nextID
-        // Plain `scrollTo(id)` (nil anchor) — let SwiftUI compute the
-        // minimal scroll to bring the row into view. Holding ↓ (or
-        // ↑) at the macOS auto-repeat rate would otherwise queue a
-        // 0.18s `withAnimation` block per keystroke; the animations
-        // overlap on the same NSScrollView and produce visible
-        // chatter / overshoot of the selected highlight as the
-        // interpolations fight. Dropping the animation block also
-        // avoids re-centering on every step — once the row is
-        // already on-screen, `scrollTo(id)` is a no-op, which reads
-        // as a calm, snappy walk down the outline rather than the
-        // viewport bouncing to keep the row centered.
+        // Outline scroll is local + cheap — bring the highlighted row
+        // into view immediately. `nil` anchor = minimal scroll so an
+        // already-visible row doesn't trigger a re-center, which
+        // smooths held-key scrolling.
         proxy.scrollTo(nextID)
+        // Debounce the cross-pane reader scroll. Holding ↓ at macOS
+        // auto-repeat (~30Hz) would otherwise hit the reader with one
+        // request per keystroke; each kicks off a 30-iteration
+        // convergence loop on its NSScrollView, the loops pile up,
+        // and the back-pressure manifests as visible chatter in this
+        // outline's selection highlight (SwiftUI re-evaluates the
+        // shared parent on every binding write). Coalesce instead:
+        // schedule the reader scroll for ~120ms after the latest
+        // press, cancel-and-reschedule on every new press, so a held
+        // arrow produces exactly one reader scroll — to the final
+        // resting prompt — when the user pauses.
+        pendingPromptScrollTask?.cancel()
+        let target = nextID
+        pendingPromptScrollTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 120_000_000)
+            guard !Task.isCancelled else { return }
+            pendingPromptID = target
+        }
     }
 
     @ViewBuilder
