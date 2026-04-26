@@ -138,6 +138,10 @@ struct ShellCommandActions {
     /// confirmation-alert flow the context menu's "Delete snapshot…"
     /// uses. Nil disables the menu item (SwiftUI renders it grey).
     let deleteSelectedSnapshot: (() -> Void)?
+    /// Toggle the browser-style find-in-page bar in the reader.
+    /// Bound to ⌘F. Nil when no reader is mounted (archive
+    /// inspector / mock-empty modes) so the menu item disables.
+    let toggleFindInPage: (() -> Void)?
 }
 
 struct ShellCommandsKey: FocusedValueKey {
@@ -364,6 +368,18 @@ struct AppCommands: Commands {
             }
             .keyboardShortcut("r", modifiers: .command)
             .disabled(shell == nil)
+        }
+
+        // ⌘F — toggle the reader's browser-style find bar. Slotted
+        // into the standard Edit menu's text-editing group so it
+        // sits next to "Find Next" / "Find Previous" in the place
+        // a user would scan for it.
+        CommandGroup(after: .textEditing) {
+            Button("Find") {
+                shell?.toggleFindInPage?()
+            }
+            .keyboardShortcut("f", modifiers: .command)
+            .disabled(shell?.toggleFindInPage == nil)
         }
 
         // Archive menu — drop-folder access and snapshot deletion.

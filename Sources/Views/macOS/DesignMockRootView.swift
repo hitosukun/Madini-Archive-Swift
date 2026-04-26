@@ -697,6 +697,25 @@ struct DesignMockRootView: View {
     /// `requestedPromptID` binding even when the user taps the same
     /// prompt twice.
     @State private var pendingPromptID: String?
+    /// "Sticky" cache of the last conversation the user actively
+    /// opened in the reader. Survives library-filter changes so a
+    /// keystroke in the toolbar search doesn't blank the reader
+    /// when the open thread happens to fall outside the filtered
+    /// page. Reader resolves through this if the live store no
+    /// longer carries the selected id.
+    @State private var displayedConversation: DesignMockConversation?
+    /// Browser-style find-in-page state for the reader. `findBarVisible`
+    /// is toggled by `Edit > Find` (⌘F) — when true, the reader
+    /// floats a Safari-shaped bar at its top edge with its own text
+    /// field and prev/next buttons. The toolbar search field is now
+    /// purely a library narrow regardless of layout mode; in-thread
+    /// find lives here so typing in the toolbar never replaces the
+    /// reader content.
+    @State private var findBarVisible: Bool = false
+    @State private var findBarQuery: String = ""
+    /// One-shot Enter pulse for the floating find bar so re-pressing
+    /// Enter on the same query still steps to the next match.
+    @State private var findBarNextToken: UUID?
     /// Shared library view-model. Hoisted to the shell (rather than
     /// scoped to the reader) so the reader pane and the saved-filter
     /// history list observe the same state. Tag UI was removed in the
@@ -803,10 +822,11 @@ struct DesignMockRootView: View {
         // otherwise be a no-op that the observer still has to wake
         // for. The reader side decides whether there's a reader
         // mounted (`stepMatch` bails if `matchLocations` is empty).
-        .onSubmit(of: .search) {
-            guard !searchText.isEmpty else { return }
-            findNextToken = UUID()
-        }
+        // Toolbar search no longer drives in-thread find. ⌘F opens
+        // a dedicated floating bar that handles its own Enter
+        // stepping; pressing Enter in this field would otherwise
+        // fire a phantom "step to next match" against an empty
+        // reader query. Drop the .onSubmit binding entirely.
         .navigationTitle("")
         .toolbar {
             // Toolbar sort picker removed — sort direction is now chosen
@@ -920,12 +940,11 @@ struct DesignMockRootView: View {
             // paused ≥400ms) is recorded. `saveRecentFilter` still
             // dedupes by filter_hash on top of this, so pinning the
             // same query twice never double-writes.
-            // Record into the library-filter history when the search
-            // field acts as a library narrow — that's `.table` and
-            // `.default`. Only `.viewer` repurposes the field as
-            // in-thread find-in-page; that history rides the separate
-            // `.onChange(of: searchText)` below.
-            guard selectedLayoutMode != .viewer else { return }
+            // The toolbar search is a library narrow in every layout
+            // mode now (the dedicated ⌘F bar owns in-thread find).
+            // Record into the unified history regardless of layout —
+            // there's no longer a "this keystroke meant something
+            // else" branch to skip.
             recordRecentSearchTask?.cancel()
             let capturedQuery = newQuery
             recordRecentSearchTask = Task { @MainActor in
@@ -936,27 +955,19 @@ struct DesignMockRootView: View {
                 )
             }
         }
-        // Thread-mode (`.viewer` only) history recording. In viewer
-        // the search field is a find-in-page over the open thread,
-        // so the user's keystrokes never flow into `composedQuery`
-        // (the library filter). Observe `searchText` directly,
-        // debounce by 400ms just like the library path, and route
-        // the settled substring into `recentInThreadQueriesStore`
-        // so the `.searchSuggestions` dropdown has something to
-        // offer on subsequent focuses.
-        .onChange(of: searchText) { _, newText in
-            guard selectedLayoutMode == .viewer else { return }
+        // In-thread query history mirrors the floating find bar's
+        // text instead of the toolbar field. Recording fires on a
+        // 400ms debounce so a fast typing burst lands as one entry.
+        .onChange(of: findBarQuery) { _, newText in
+            guard findBarVisible else { return }
             recordRecentSearchTask?.cancel()
-            let capturedText = newText
+            let captured = newText
             recordRecentSearchTask = Task { @MainActor in
                 try? await Task.sleep(nanoseconds: 400_000_000)
                 guard !Task.isCancelled else { return }
-                // Strip DSL directives (`sort:`, `source:`, …) the
-                // same way the reader's `effectiveQuery` does, so
-                // the history stores only the substring that was
-                // actually matched.
-                let parsed = DesignMockQueryLanguage.parse(capturedText)
-                recentInThreadQueriesStore.record(parsed.keyword)
+                let trimmed = captured.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { return }
+                recentInThreadQueriesStore.record(trimmed)
             }
         }
         // Keep one canonical "currently displayed" conversation across
@@ -971,9 +982,14 @@ struct DesignMockRootView: View {
         // single source of truth.
         .onChange(of: store.conversations.map(\.id)) { _, newIDs in
             repairSelectionIfNeeded(currentIDs: newIDs)
+            refreshDisplayedConversationCache()
+        }
+        .onChange(of: selectedConversationIDs) { _, _ in
+            refreshDisplayedConversationCache()
         }
         .onAppear {
             repairSelectionIfNeeded(currentIDs: store.conversations.map(\.id))
+            refreshDisplayedConversationCache()
         }
         // Publish shell-scoped actions for the main menu. The struct
         // is rebuilt on every body recompute so `currentLayout`,
@@ -1288,7 +1304,22 @@ struct DesignMockRootView: View {
                 NSWorkspace.shared.open(capturedServices.intakeDirURL)
                 #endif
             },
-            deleteSelectedSnapshot: deleteClosure
+            deleteSelectedSnapshot: deleteClosure,
+            toggleFindInPage: { [self] in
+                // Toggle visibility. On open, leave the existing
+                // query so re-pressing ⌘F re-shows the previous
+                // search; on close, clear so the next session
+                // starts blank. ⌘F-on-already-open also pulls the
+                // bar's text field to first-responder via the
+                // `findBarVisible` change → `.task(id:)` in the
+                // bar's view body.
+                if findBarVisible {
+                    findBarVisible = false
+                    findBarQuery = ""
+                } else {
+                    findBarVisible = true
+                }
+            }
         )
     }
 
@@ -1342,11 +1373,35 @@ struct DesignMockRootView: View {
     /// selection in the Set means the reader pops back to the same
     /// thread automatically when it becomes visible again — no
     /// destructive clear.
+    /// Refresh `displayedConversation` from the live store whenever a
+    /// fresh row matching the current selection lands. Done as an
+    /// effect (not in the `selectedConversation` getter) because
+    /// SwiftUI getters can't write `@State`. The cache then carries
+    /// the user across filter changes that would otherwise prune
+    /// the open id from `store.conversations`.
+    private func refreshDisplayedConversationCache() {
+        guard let id = selectedConversationIDs.first else { return }
+        if let live = store.conversations.first(where: { $0.id == id }) {
+            displayedConversation = live
+        }
+    }
+
     private func repairSelectionIfNeeded(currentIDs: [DesignMockConversation.ID]) {
         guard !currentIDs.isEmpty else { return }
-        let intersected = selectedConversationIDs.intersection(currentIDs)
+        var intersected = selectedConversationIDs.intersection(currentIDs)
+        // Preserve the explicitly-opened thread even when the live
+        // page no longer carries it — typing in the toolbar
+        // shouldn't blank the reader on the user. The id sticks in
+        // `selectedConversationIDs` (so the table-row resolver
+        // `selectedConversation` keeps returning the cached row);
+        // the visual highlight in the table / card list naturally
+        // disappears anyway because the row isn't materialized in
+        // the filtered page.
+        if let openID = displayedConversation?.id,
+           selectedConversationIDs.contains(openID) {
+            intersected.insert(openID)
+        }
         guard !intersected.isEmpty else { return }
-        // Drop stale ids but keep the user's multi-select intent.
         if intersected != selectedConversationIDs {
             selectedConversationIDs = intersected
         }
@@ -1443,7 +1498,13 @@ struct DesignMockRootView: View {
             NavigationSplitView {
                 sidebar
             } detail: {
-                readerPane(inThreadSearch: $searchText)
+                // Viewer mode no longer repurposes the toolbar field
+                // as in-thread find — typing there used to overwrite
+                // the reader's substring scan and made every library
+                // search blank the whole pane. ⌘F now drives the
+                // browser-style floating find bar instead; the
+                // toolbar field is purely a library narrow.
+                readerPane(inThreadSearch: nil)
             }
         }
     }
@@ -1550,22 +1611,30 @@ struct DesignMockRootView: View {
     /// built — until then we show a placeholder so the reader, which
     /// needs the VM via environment, doesn't crash on first mount.
     @ViewBuilder
-    private func readerPane(inThreadSearch: Binding<String>?) -> some View {
+    private func readerPane(inThreadSearch unused: Binding<String>?) -> some View {
+        // The toolbar search field never threads in-thread find any
+        // more — that role moved to the floating ⌘F bar so a typed
+        // library narrow doesn't blank the reader. We expose
+        // `findBarQuery` as the in-thread substring whenever the
+        // bar is visible; closing it nils the binding and the
+        // reader strips its highlight.
+        let findBinding: Binding<String>? = findBarVisible ? $findBarQuery : nil
         if let libraryViewModel {
             DesignMockReaderPane(
                 conversation: selectedConversation,
                 pendingPromptID: $pendingPromptID,
                 libraryViewModel: libraryViewModel,
-                inThreadSearch: inThreadSearch,
-                // Gate Enter-to-step-match on whether this call site is
-                // actually running an in-thread search. `.default` and
-                // `.viewer` both pass a non-nil binding → Enter steps
-                // matches. The now-orphan `inThreadSearch == nil` branch
-                // is only taken by call sites that don't surface the
-                // in-thread finder (e.g. future embeds / previews) so
-                // pressing Enter in the toolbar field there is a silent
-                // no-op rather than a hijacked reader step.
-                findNextToken: inThreadSearch == nil ? nil : $findNextToken
+                inThreadSearch: findBinding,
+                // Enter routes to "step to next match" only while
+                // the find bar is open. Outside that window the
+                // returns key has no in-reader meaning — the only
+                // surface that would have used it (the toolbar
+                // search) is no longer wired into find-in-page.
+                findNextToken: findBarVisible ? $findBarNextToken : nil,
+                onCloseFindBar: findBarVisible ? {
+                    findBarVisible = false
+                    findBarQuery = ""
+                } : nil
             )
         } else {
             ProgressView()
@@ -1822,19 +1891,24 @@ struct DesignMockRootView: View {
     }
 
     private var selectedConversation: DesignMockConversation? {
-        // Reader + share button still want a single "currently displayed"
-        // thread even though the middle pane is multi-selection. Pick
-        // the first entry of the selection set that still exists in the
-        // current list.
-        //
-        // Earlier revisions fell back to `store.conversations.first`
-        // so the reader always had *something* to render, but that
-        // silently opened the top thread every time the sidebar
-        // filter changed — the user saw random threads slide into
-        // the reader without their consent. Returning nil when no
-        // selected id is visible lets the reader render its empty
-        // state; the user explicitly picks a thread to open it.
-        return store.conversations.first { selectedConversationIDs.contains($0.id) }
+        // Two-tier resolution:
+        //   1. Live row from the store — picks up fresh metadata
+        //      (title rename, refreshed model count, etc.) after a
+        //      re-fetch.
+        //   2. The sticky `displayedConversation` cache when the
+        //      live store no longer carries the open id (typical
+        //      cause: the user typed into the toolbar search and
+        //      the open thread now falls outside the filtered page
+        //      — but they still want to keep reading it).
+        if let id = selectedConversationIDs.first,
+           let live = store.conversations.first(where: { $0.id == id }) {
+            return live
+        }
+        if let cached = displayedConversation,
+           selectedConversationIDs.contains(cached.id) {
+            return cached
+        }
+        return nil
     }
 
     /// Query strings to surface in the search field's suggestion
@@ -1861,11 +1935,12 @@ struct DesignMockRootView: View {
     /// is the same order of magnitude Safari / Spotlight show and
     /// fits on-screen without resizing).
     private var searchQuerySuggestions: [String] {
-        if selectedLayoutMode == .viewer {
-            return inThreadSearchQuerySuggestions
-        } else {
-            return librarySearchQuerySuggestions
-        }
+        // The toolbar search is always a library narrow now — the
+        // ⌘F floating bar owns its own (separate) suggestion
+        // surface for in-thread find. Older revisions branched on
+        // layout mode here when viewer-mode toolbar input was
+        // repurposed; that ambiguity is gone.
+        return librarySearchQuerySuggestions
     }
 
     private var librarySearchQuerySuggestions: [String] {
@@ -1903,22 +1978,13 @@ struct DesignMockRootView: View {
         var query = DesignMockDataStore.FetchQuery()
         let parsed = DesignMockQueryLanguage.parse(searchText)
         // Only `.table` mode (no reader pane) treats the free-text
-        // keyword as a library filter. `.table` and `.default` both
-        // keep the middle pane visible, so the search field acts as a
-        // library narrow in those modes — the user can drill from
-        // "filtered list" to "filtered list + reader" without losing
-        // their query. `.viewer` is the only mode where the middle
-        // pane is hidden; there the field switches to in-thread
-        // find-in-page since there's no library list to scope.
-        // (Earlier this code unified `.default` with `.viewer` per
-        // request "デフォルトビューのときはフォーカスビューと同様に
-        // スレッド検索で統一して"; that was reverted because opening
-        // a thread from `.table` was wiping the table's filter and
-        // the user could no longer reach the rows they'd narrowed
-        // down to.)
-        if selectedLayoutMode != .viewer {
-            query.keyword = parsed.keyword.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
+        // The toolbar search is always a library narrow — viewer
+        // mode used to repurpose it as in-thread find but that was
+        // also confusing (typing a library query in viewer would
+        // unmount the open thread). ⌘F now drives the in-thread
+        // find bar in any layout mode, so the toolbar field can
+        // route its keyword into `composedQuery` unconditionally.
+        query.keyword = parsed.keyword.trimmingCharacters(in: .whitespacesAndNewlines)
         query.sortKey = DesignMockQueryLanguage.dbSortKey(from: parsed.sortToken)
         // Start from sidebar-derived filters so a plain sidebar pick
         // still scopes the library without any typing.
@@ -3497,6 +3563,10 @@ private struct DesignMockReaderPane: View {
     /// Reader observes this and advances to the next in-thread match
     /// when it fires.
     var findNextToken: Binding<UUID?>? = nil
+    /// Dismiss callback for the floating find bar. The shell flips
+    /// `findBarVisible` to false and clears the query — without it,
+    /// the close button could only nuke the text, not the bar.
+    var onCloseFindBar: (() -> Void)? = nil
     @EnvironmentObject private var services: AppServices
 
     var body: some View {
@@ -3509,7 +3579,8 @@ private struct DesignMockReaderPane: View {
             libraryViewModel: libraryViewModel,
             pendingPromptID: $pendingPromptID,
             inThreadSearch: inThreadSearch,
-            findNextToken: findNextToken
+            findNextToken: findNextToken,
+            onCloseFindBar: onCloseFindBar
         )
     }
 }
@@ -3540,6 +3611,9 @@ private struct DesignMockReaderPaneContent: View {
     /// One-shot Enter-key signal from the toolbar search field. When
     /// it rotates to a fresh UUID we step to the next match.
     private let findNextToken: Binding<UUID?>?
+    /// Dismiss callback wired up only when the floating find bar is
+    /// in use; nil for legacy embeds where the host owned dismissal.
+    private let onCloseFindBar: (() -> Void)?
 
     /// Every individual keyword occurrence across the thread, in
     /// transcript order. Each entry is "message M, occurrence N" — so a
@@ -3577,7 +3651,8 @@ private struct DesignMockReaderPaneContent: View {
         libraryViewModel: LibraryViewModel,
         pendingPromptID: Binding<String?>,
         inThreadSearch: Binding<String>? = nil,
-        findNextToken: Binding<UUID?>? = nil
+        findNextToken: Binding<UUID?>? = nil,
+        onCloseFindBar: (() -> Void)? = nil
     ) {
         self.conversation = conversation
         self.services = services
@@ -3585,6 +3660,7 @@ private struct DesignMockReaderPaneContent: View {
         _pendingPromptID = pendingPromptID
         self.inThreadSearch = inThreadSearch
         self.findNextToken = findNextToken
+        self.onCloseFindBar = onCloseFindBar
     }
 
     var body: some View {
@@ -3621,19 +3697,21 @@ private struct DesignMockReaderPaneContent: View {
                 .environment(libraryViewModel)
                 .environment(\.promptBookmarkBridge, promptBookmarkBridge(for: conversation))
                 .overlay(alignment: .top) {
-                    // Only surface the nav strip when the user has
-                    // actually typed something — otherwise it'd float at
-                    // the top of the reader doing nothing. The text
-                    // field itself lives in the toolbar regardless of
-                    // mode, so the search-window position never shifts
-                    // between library browsing and focus reading.
-                    if let binding = inThreadSearch, !effectiveQuery.isEmpty {
+                    // Browser-style find bar — visible whenever the
+                    // shell has a non-nil `inThreadSearch` binding
+                    // wired through (the shell only does that while
+                    // ⌘F is toggled on). The bar itself owns its
+                    // text field; the toolbar search isn't piped in
+                    // any more, so a library-narrow keystroke never
+                    // mounts or dismounts this view.
+                    if let binding = inThreadSearch {
                         FindInPageNavStrip(
                             text: binding,
                             matchCount: matchLocations.count,
                             currentIndex: currentMatchIndex,
                             onPrev: { stepMatch(by: -1) },
-                            onNext: { stepMatch(by: 1) }
+                            onNext: { stepMatch(by: 1) },
+                            onClose: onCloseFindBar
                         )
                         .padding(.top, 8)
                         .transition(.move(edge: .top).combined(with: .opacity))
@@ -3945,11 +4023,39 @@ private struct FindInPageNavStrip: View {
     let currentIndex: Int
     let onPrev: () -> Void
     let onNext: () -> Void
+    /// Optional close handler — when present, the strip renders a
+    /// trailing dismiss button. Used when the strip is the
+    /// dedicated browser-style find bar (⌘F-toggled overlay) so
+    /// the user has a one-click escape; nil for the legacy embed
+    /// where the toolbar field still owned the dismissal.
+    var onClose: (() -> Void)? = nil
+    @FocusState private var fieldFocused: Bool
 
     var body: some View {
         HStack(spacing: 8) {
+            // Search-glass + text field. Browsers (Safari, Chrome,
+            // Preview) put the input first, the match counter
+            // next to it, so the eye lands on the field first when
+            // the bar appears.
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+                .font(.callout)
+
+            TextField("スレッド内を検索", text: $text)
+                .textFieldStyle(.plain)
+                .focused($fieldFocused)
+                .frame(minWidth: 180)
+                .onSubmit {
+                    // Enter steps to next match — same affordance
+                    // browsers offer. Empty text is a no-op.
+                    guard !text.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+                    onNext()
+                }
+
             Group {
-                if matchCount == 0 {
+                if text.trimmingCharacters(in: .whitespaces).isEmpty {
+                    EmptyView()
+                } else if matchCount == 0 {
                     Text("一致なし")
                 } else {
                     Text("\(currentIndex + 1) / \(matchCount)")
@@ -3975,17 +4081,26 @@ private struct FindInPageNavStrip: View {
             .keyboardShortcut("g", modifiers: .command)
             .help("次の一致（⌘G）")
 
-            Divider()
-                .frame(height: 14)
-
-            Button {
-                text = ""
-            } label: {
-                Image(systemName: "xmark.circle.fill")
-                    .foregroundStyle(.secondary)
+            if let onClose {
+                Divider().frame(height: 14)
+                Button(action: onClose) {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.borderless)
+                .keyboardShortcut(.escape, modifiers: [])
+                .help("閉じる（Esc）")
+            } else {
+                Divider().frame(height: 14)
+                Button {
+                    text = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.borderless)
+                .help("検索文字列をクリア")
             }
-            .buttonStyle(.borderless)
-            .help("検索文字列をクリア")
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
@@ -4000,6 +4115,14 @@ private struct FindInPageNavStrip: View {
         .shadow(color: .black.opacity(0.15), radius: 6, y: 3)
         .animation(.easeInOut(duration: 0.15), value: matchCount)
         .animation(.easeInOut(duration: 0.15), value: currentIndex)
+        .onAppear {
+            // Pull the field to first responder when the bar
+            // appears. ⌘F-driven open lands here; the user can
+            // start typing immediately without an extra click.
+            Task { @MainActor in
+                fieldFocused = true
+            }
+        }
     }
 }
 
