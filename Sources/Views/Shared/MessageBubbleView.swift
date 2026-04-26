@@ -4,6 +4,7 @@ import AppKit
 #else
 import UIKit
 #endif
+import NaturalLanguage
 import SwiftMath
 
 /// Describes an in-thread search that bubbles should paint keyword-level
@@ -117,6 +118,7 @@ struct MessageBubbleView: View, Equatable {
         lhs.message == rhs.message
             && lhs.displayMode == rhs.displayMode
             && lhs.identityContext == rhs.identityContext
+            && lhs.conversationPrimaryLanguage == rhs.conversationPrimaryLanguage
     }
 
     private enum Layout {
@@ -164,6 +166,14 @@ struct MessageBubbleView: View, Equatable {
     let message: Message
     let displayMode: DisplayMode
     let identityContext: MessageIdentityContext?
+    /// Conversation-level primary language detected up-front by
+    /// `ConversationDetailView` (or `nil` if undetermined). Threaded
+    /// through to the foreign-language grouper so its "is this run
+    /// foreign?" check compares against the thread's actual native
+    /// language, not the system locale — Japanese-primary threads
+    /// rendered on an English-locale Mac were getting their
+    /// Japanese answers folded into a "translate" disclosure.
+    let conversationPrimaryLanguage: NLLanguage?
     @Environment(IdentityPreferencesStore.self) private var identityPreferences
     /// Optional find-in-page spec. SwiftUI tracks this as an environment
     /// dependency of `body`, so even though `.equatable()` short-circuits
@@ -932,21 +942,23 @@ struct MessageBubbleView: View, Equatable {
     /// grouping pass is itself non-trivial (NL detection per block) and
     /// `body` is re-evaluated on parent updates.
     private var renderItems: [MessageRenderItem] {
-        // Cache key is (message.id, collapseFlag) because the same
-        // message rendered under two different source profiles would
-        // produce different item arrays. In practice every message in
-        // a conversation shares one profile, but keying on the flag
-        // makes the cache safe if the profile ever varies within a
-        // run (e.g. import-time source correction) and costs nothing.
+        // Cache key folds in `collapseFlag` and the conversation's
+        // detected primary language: the same blocks rendered under
+        // a different "what counts as foreign?" baseline produce
+        // different grouping output, so a Japanese thread on an
+        // English-locale Mac mustn't return cached items computed
+        // before the primary-language signal arrived.
         let profile = renderProfile
         let collapse = profile.collapsesForeignLanguageRuns
-        let key = "\(message.id)#\(collapse ? 1 : 0)" as NSString
+        let nativeLang = conversationPrimaryLanguage?.rawValue ?? ""
+        let key = "\(message.id)#\(collapse ? 1 : 0)#\(nativeLang)" as NSString
         if let cached = Self.renderItemsCache.object(forKey: key) {
             return cached.items
         }
         let items = ForeignLanguageGrouping.items(
             from: contentBlocks,
-            collapseForeignRuns: collapse
+            collapseForeignRuns: collapse,
+            nativeLanguage: conversationPrimaryLanguage
         )
         Self.renderItemsCache.setObject(RenderItemsBox(items), forKey: key)
         return items
@@ -1007,7 +1019,8 @@ struct MessageBubbleView: View, Equatable {
     /// sync as the markdown parser / grouper evolves.
     static func searchableBlocks(
         for message: Message,
-        profile: MessageRenderProfile = .passthrough
+        profile: MessageRenderProfile = .passthrough,
+        nativeLanguage: NLLanguage? = nil
     ) -> [(text: String, anchorID: String)] {
         if message.isUser {
             return [(message.content, message.id)]
@@ -1016,10 +1029,13 @@ struct MessageBubbleView: View, Equatable {
         // MUST mirror the grouping decision `renderItems` makes, or
         // the per-block occurrence indices produced here will not line
         // up with `applyingSearchHighlight`'s render-time scan. Take
-        // the same path by routing through the profile-gated helper.
+        // the same path by routing through the profile-gated helper —
+        // including the conversation-level native language so the two
+        // views agree on which runs are foreign.
         let items = ForeignLanguageGrouping.items(
             from: parsed,
-            collapseForeignRuns: profile.collapsesForeignLanguageRuns
+            collapseForeignRuns: profile.collapsesForeignLanguageRuns,
+            nativeLanguage: nativeLanguage
         )
         return items.enumerated().map { offset, item in
             let anchorID = searchBlockAnchorID(

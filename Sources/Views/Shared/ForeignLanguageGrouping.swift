@@ -37,18 +37,28 @@ enum ForeignLanguageGrouping {
     /// `[MessageRenderItem]`) but no grouping is applied. Callers that
     /// know their source always wants grouping (or never wants it) can
     /// skip this and call `group(_:)` / build trivially directly.
+    ///
+    /// `nativeLanguage` lets the caller override what counts as
+    /// "not foreign". Pass the conversation's detected primary
+    /// language so a Japanese-primary thread treats Japanese as
+    /// native even when the user's macOS locale is English. `nil`
+    /// falls back to the system locale.
     static func items(
         from blocks: [ContentBlock],
-        collapseForeignRuns: Bool
+        collapseForeignRuns: Bool,
+        nativeLanguage: NLLanguage? = nil
     ) -> [MessageRenderItem] {
         guard collapseForeignRuns else {
             return blocks.map { .block($0) }
         }
-        return group(blocks)
+        return group(blocks, nativeLanguage: nativeLanguage)
     }
 
-    static func group(_ blocks: [ContentBlock]) -> [MessageRenderItem] {
-        let system = systemLanguage
+    static func group(
+        _ blocks: [ContentBlock],
+        nativeLanguage: NLLanguage? = nil
+    ) -> [MessageRenderItem] {
+        let system = nativeLanguage ?? systemLanguage
         var result: [MessageRenderItem] = []
         var pending: (language: NLLanguage, blocks: [ContentBlock])?
 
@@ -75,6 +85,50 @@ enum ForeignLanguageGrouping {
         }
         flush()
         return result
+    }
+
+    /// Detect the dominant language of a conversation by sampling
+    /// text from its messages. Returns `nil` for inputs too short
+    /// or too mixed to call confidently — caller falls back to
+    /// `systemLanguage` in that case. Used so a Japanese-primary
+    /// thread treats Japanese as native (no collapsed-block
+    /// affordance over plain Japanese) even when the user's macOS
+    /// locale is English. The reverse holds for English-primary
+    /// threads on a Japanese system.
+    ///
+    /// Concatenates message text up to `sampleLimit` characters
+    /// then runs one `NLLanguageRecognizer` pass — language
+    /// recognition is global over the whole window, not per-block,
+    /// so noise from short or mixed paragraphs averages out.
+    static func primaryLanguage(
+        ofMessageTexts texts: [String],
+        sampleLimit: Int = 5_000,
+        minCharacters: Int = 200,
+        minimumConfidence: Double = 0.6
+    ) -> NLLanguage? {
+        var combined = ""
+        for text in texts {
+            if combined.count >= sampleLimit { break }
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            if !combined.isEmpty { combined.append("\n\n") }
+            let remaining = sampleLimit - combined.count
+            if trimmed.count <= remaining {
+                combined.append(trimmed)
+            } else {
+                combined.append(String(trimmed.prefix(remaining)))
+            }
+        }
+        let trimmedAll = combined.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmedAll.count >= minCharacters else { return nil }
+        let recognizer = NLLanguageRecognizer()
+        recognizer.processString(trimmedAll)
+        let hyps = recognizer.languageHypotheses(withMaximum: 1)
+        guard let (language, confidence) = hyps.first,
+              confidence >= minimumConfidence else {
+            return nil
+        }
+        return language
     }
 
     /// System-preferred language as `NLLanguage`. Falls back to

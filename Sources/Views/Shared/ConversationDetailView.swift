@@ -1,3 +1,4 @@
+import NaturalLanguage
 import SwiftUI
 import UniformTypeIdentifiers
 #if os(macOS)
@@ -298,6 +299,17 @@ private struct LoadedConversationDetailView: View {
     /// self-healing even if a scroll is interrupted.
     @State private var programmaticScrollLock: UUID?
 
+    /// Conversation-level dominant language detected up-front from
+    /// the loaded messages. Threaded to every `MessageBubbleView`
+    /// so the foreign-language grouper compares against the
+    /// thread's actual native language (e.g. Japanese) instead of
+    /// the macOS locale (which may be set to English) — that
+    /// mismatch was folding plain Japanese answers into a
+    /// "translate this" disclosure on Claude threads. `nil` when
+    /// the thread is too short to call confidently; the grouper
+    /// then falls back to system locale.
+    @State private var conversationPrimaryLanguage: NLLanguage?
+
     /// Cached copy of the most-recent `PromptTopYPreferenceKey`
     /// dictionary. `handlePromptOffsetChange` ignores it while a
     /// programmatic scroll is in flight, but `performProgrammaticScroll`
@@ -378,7 +390,8 @@ private struct LoadedConversationDetailView: View {
                                     identityContext: MessageIdentityContext(
                                         source: detail.summary.source,
                                         model: detail.summary.model
-                                    )
+                                    ),
+                                    conversationPrimaryLanguage: conversationPrimaryLanguage
                                 )
                                 .equatable()
                                 .id(message.id)
@@ -452,6 +465,27 @@ private struct LoadedConversationDetailView: View {
                     )
                     .onPreferenceChange(ReaderViewportSizePreferenceKey.self) { h in
                         readerViewportHeight = h
+                    }
+                    .task(id: detail.summary.id) {
+                        // Detect once per conversation. Sampling +
+                        // recognition runs on a background priority
+                        // task because `NLLanguageRecognizer` is fast
+                        // but isn't free at multi-thousand-character
+                        // inputs, and we don't want to delay first
+                        // paint waiting for it. The `nil` initial
+                        // state means the grouper falls back to the
+                        // system locale; the `@State` write below
+                        // replaces that with the detected value once
+                        // the work finishes.
+                        let texts = detail.messages.map(\.content)
+                        let detected = await Task.detached(priority: .utility) {
+                            ForeignLanguageGrouping.primaryLanguage(
+                                ofMessageTexts: texts
+                            )
+                        }.value
+                        await MainActor.run {
+                            conversationPrimaryLanguage = detected
+                        }
                     }
                     .scrollContentBackground(.hidden)
                     // Reserve scroll-overshoot room at the bottom equal to
