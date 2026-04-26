@@ -2530,7 +2530,7 @@ private struct DesignMockThreadListPane: View {
             // the pane edge.
             DesignMockExpandedPromptList(
                 conversation: conversation,
-                pendingPromptID: $pendingPromptID
+                onSelectPrompt: { id in pendingPromptID = id }
             )
             .padding(.horizontal, 12)
             .padding(.top, 10)
@@ -2816,7 +2816,19 @@ private struct DesignMockThreadTablePane: View {
 /// right-pane reader scrolls to that prompt's anchor in the transcript.
 private struct DesignMockExpandedPromptList: View {
     let conversation: DesignMockConversation
-    @Binding var pendingPromptID: String?
+    /// Callback fired when the user picks a prompt (click or arrow key).
+    /// The shell wraps this so the reader gets a fresh `pendingPromptID`
+    /// write. Previously the prompt list held the binding directly, but
+    /// that meant every reader-side clear (`pendingPromptID = nil`,
+    /// scheduled via `Task @MainActor` after the reader scrolled)
+    /// re-rendered the prompt list — including the focus claim and
+    /// the `.task(id: conversation.id)` re-evaluation. Held arrow
+    /// keys piled up dozens of those round-trips per second and the
+    /// outline's selection highlight chattered while SwiftUI's render
+    /// cycle fought the back-pressure. A closure decouples the
+    /// directions: the prompt list never observes the reader's
+    /// clearing write.
+    let onSelectPrompt: (String) -> Void
     @EnvironmentObject private var services: AppServices
     @EnvironmentObject private var store: DesignMockDataStore
     @State private var prompts: [DesignMockPrompt] = []
@@ -2999,7 +3011,7 @@ private struct DesignMockExpandedPromptList: View {
         }
         if currentSelected == target.id { return }
         selectedPromptID = target.id
-        pendingPromptID = target.id
+        onSelectPrompt(target.id)
         withAnimation(.easeOut(duration: 0.18)) {
             proxy.scrollTo(target.id, anchor: .center)
         }
@@ -3037,7 +3049,7 @@ private struct DesignMockExpandedPromptList: View {
         pendingPromptScrollTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 120_000_000)
             guard !Task.isCancelled else { return }
-            pendingPromptID = target
+            onSelectPrompt(target)
         }
     }
 
@@ -3064,11 +3076,11 @@ private struct DesignMockExpandedPromptList: View {
             // (a .simultaneousGesture-style approach would swallow the
             // pin tap into the row scroll action).
             Button {
-                // Fire the id — the reader observes this binding and scrolls to
-                // the matching message. `ConversationDetailView` clears the
-                // binding back to nil after applying, so reassigning the same
-                // id later still triggers a fresh scroll.
-                pendingPromptID = prompt.id
+                // Fire the id — the shell relays it to the reader so it
+                // scrolls to the matching message. `ConversationDetailView`
+                // clears its incoming binding to nil after applying, so a
+                // repeat-tap on the same row still triggers a fresh scroll.
+                onSelectPrompt(prompt.id)
                 selectedPromptID = prompt.id
                 // Clicking a prompt row should leave keyboard
                 // focus on the prompt list so the user can
