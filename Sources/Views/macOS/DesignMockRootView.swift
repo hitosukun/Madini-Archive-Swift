@@ -800,6 +800,12 @@ struct DesignMockRootView: View {
         // reuses this very field as the in-thread finder; only the
         // prev/next + N/M nav strip lives inside the reader.
         .searchable(text: $searchText, prompt: searchPrompt)
+        // Publish the parsed library keyword to descendants so list
+        // rows (table titles, card titles, prompt-outline snippets)
+        // and the reader can paint a yellow wash on matched
+        // substrings — visual confirmation that the row earned its
+        // place in the filtered set.
+        .environment(\.libraryHighlightQuery, libraryHighlightQuery)
         // Query history lives inside the search field's own dropdown —
         // `.searchSuggestions` renders a list beneath the field whenever
         // it has focus. Keeps each surface focused on one job: sidebar =
@@ -2068,6 +2074,16 @@ struct DesignMockRootView: View {
         return "ライブラリを検索"
     }
 
+    /// Free-text portion of the toolbar query (DSL directives like
+    /// `source:` / `-model:` stripped). Surfaced to descendants via
+    /// `EnvironmentValues.libraryHighlightQuery` so titles and
+    /// prompt snippets can highlight matched substrings.
+    private var libraryHighlightQuery: String {
+        DesignMockQueryLanguage.parse(searchText)
+            .keyword
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     /// True when the sidebar points at archive.db. The consolidated
     /// surface (Drop-folder header + intake timeline + file list)
     /// takes over the whole split — we don't try to preserve the
@@ -2933,10 +2949,10 @@ private struct DesignMockThreadTablePane: View {
         Table(rows, selection: $selection, sortOrder: $sortOrder) {
             TableColumn("Title", value: \DesignMockConversation.title) { conversation in
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(conversation.title)
+                    HighlightedText(source: conversation.title)
                         .lineLimit(1)
                     if let snippet = conversation.snippet {
-                        Text(snippet)
+                        HighlightedText(source: snippet)
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
@@ -3495,7 +3511,7 @@ private struct DesignMockPromptRow: View, Equatable {
                 // effectively hiding the prompt text. Two lines
                 // keep Japanese titles legible while the row stays
                 // list-compact.
-                Text(prompt.snippet)
+                HighlightedText(source: prompt.snippet)
                     .font(.subheadline)
                     .lineLimit(2)
                     .multilineTextAlignment(.leading)
@@ -3594,6 +3610,13 @@ private struct DesignMockReaderPaneContent: View {
     /// the enclosing view re-evaluates — which happens because we
     /// listen via `@EnvironmentObject`).
     @EnvironmentObject private var store: DesignMockDataStore
+    /// Library-narrow keyword from the toolbar. The reader uses
+    /// this as a fallback for keyword-level highlighting when the
+    /// ⌘F find bar is closed — clicking through to a thread that
+    /// matched on a substring keeps the substring visually marked
+    /// inside the open thread, so the user can scan to "where the
+    /// match earned its place" without reopening the find bar.
+    @Environment(\.libraryHighlightQuery) private var libraryHighlightQuery
     @Binding var pendingPromptID: String?
     /// Two-way binding into the shell's search text — non-nil only in
     /// focus mode. When present the reader renders a find-in-page bar
@@ -3816,15 +3839,29 @@ private struct DesignMockReaderPaneContent: View {
     /// currently-centered keyword — not the whole message — is drawn
     /// in the hotter color.
     private var currentSearchHighlight: SearchHighlightSpec? {
-        let q = effectiveQuery
-        guard !q.isEmpty else { return nil }
-        let location: MatchLocation? = matchLocations.indices.contains(currentMatchIndex)
-            ? matchLocations[currentMatchIndex]
-            : nil
+        // Prefer the find bar's query (it has match locations + an
+        // active "N / M" cursor, so the reader can paint the hot
+        // colour on the centered hit). Fall back to the toolbar's
+        // library narrow when the bar is closed so the substring
+        // that earned this thread its place in the filtered list
+        // stays visually marked.
+        let findQuery = effectiveQuery
+        if !findQuery.isEmpty {
+            let location: MatchLocation? = matchLocations.indices.contains(currentMatchIndex)
+                ? matchLocations[currentMatchIndex]
+                : nil
+            return SearchHighlightSpec(
+                query: findQuery,
+                activeAnchorID: location?.anchorID,
+                activeOccurrenceInBlock: location?.occurrenceInBlock
+            )
+        }
+        let libQuery = libraryHighlightQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !libQuery.isEmpty else { return nil }
         return SearchHighlightSpec(
-            query: q,
-            activeAnchorID: location?.anchorID,
-            activeOccurrenceInBlock: location?.occurrenceInBlock
+            query: libQuery,
+            activeAnchorID: nil,
+            activeOccurrenceInBlock: nil
         )
     }
 
@@ -4132,7 +4169,7 @@ private struct DesignMockConversationListRow: View {
             // aggressively to share the line with the date.
             ViewThatFits(in: .horizontal) {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(conversation.title)
+                    HighlightedText(source: conversation.title)
                         .font(.callout.weight(.medium))
                         .lineLimit(1)
 
@@ -4150,7 +4187,7 @@ private struct DesignMockConversationListRow: View {
                 // Title gets a second line of headroom so the whole
                 // card is readable even when the pane is squeezed.
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(conversation.title)
+                    HighlightedText(source: conversation.title)
                         .font(.callout.weight(.medium))
                         .lineLimit(2)
                     Text(conversation.updated)
@@ -4163,7 +4200,7 @@ private struct DesignMockConversationListRow: View {
             if let snippet = conversation.snippet {
                 // FTS match snippet — shown only when the user has typed a
                 // keyword, so cards in browse mode stay compact.
-                Text(snippet)
+                HighlightedText(source: snippet)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
