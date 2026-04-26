@@ -1601,7 +1601,28 @@ struct DesignMockRootView: View {
                 selectedSidebarItemID = newValue
             }
         )
+        // Default visual state is "every source colour-on" — a
+        // source's icon greys out only when its name appears in the
+        // exclusion list. The positive `source:` channel is treated
+        // as a legacy override: when the user has typed it by hand,
+        // we narrow the checked set to those names (otherwise the
+        // dots would all read as "checked" while the actual fetch
+        // shows just the typed one).
         let parsedDSL = DesignMockQueryLanguage.parse(searchText)
+        let allSourceNames = Set(store.sources.map(\.name))
+        let allModelNames = Set(store.sources.flatMap { $0.models.map(\.name) })
+        let checkedSources: Set<String> = {
+            if !parsedDSL.sourceFilters.isEmpty {
+                return Set(parsedDSL.sourceFilters)
+            }
+            return allSourceNames.subtracting(parsedDSL.excludedSources)
+        }()
+        let checkedModels: Set<String> = {
+            if !parsedDSL.modelFilters.isEmpty {
+                return Set(parsedDSL.modelFilters)
+            }
+            return allModelNames.subtracting(parsedDSL.excludedModels)
+        }()
         return DesignMockSidebar(
             selection: sidebarSelection,
             sources: store.sources,
@@ -1609,17 +1630,44 @@ struct DesignMockRootView: View {
             databaseInfo: store.databaseInfo,
             totalCount: store.totalCount,
             libraryViewModel: libraryViewModel,
-            checkedSources: Set(parsedDSL.sourceFilters),
-            checkedModels: Set(parsedDSL.modelFilters),
+            checkedSources: checkedSources,
+            checkedModels: checkedModels,
             onToggleSource: { name in
-                searchText = DesignMockQueryLanguage.toggleDirective(
-                    key: "source", value: name, in: searchText
+                // Toggling an icon switches into multi-select mode —
+                // reset the sidebar's single-select highlight to
+                // "All Threads" so the visible filter matches the
+                // DSL-driven dot states. Without this, clicking a
+                // dot while a source row was single-selected would
+                // produce a confusing "this dot is on but the
+                // sidebar's still showing only the other source"
+                // state.
+                if selectedSidebarItemID != DesignMockSidebarItem.allThreads.id {
+                    selectedSidebarItemID = DesignMockSidebarItem.allThreads.id
+                }
+                // Strip any hand-typed positive `source:` directives
+                // before flipping the negation, so the include-set
+                // computation falls cleanly to the "all − excluded"
+                // branch instead of staying pinned to a stale
+                // positive list.
+                var text = DesignMockQueryLanguage.stripDirectives(
+                    key: "source", from: searchText
                 )
+                text = DesignMockQueryLanguage.toggleDirective(
+                    key: "-source", value: name, in: text
+                )
+                searchText = text
             },
             onToggleModel: { name in
-                searchText = DesignMockQueryLanguage.toggleDirective(
-                    key: "model", value: name, in: searchText
+                if selectedSidebarItemID != DesignMockSidebarItem.allThreads.id {
+                    selectedSidebarItemID = DesignMockSidebarItem.allThreads.id
+                }
+                var text = DesignMockQueryLanguage.stripDirectives(
+                    key: "model", from: searchText
                 )
+                text = DesignMockQueryLanguage.toggleDirective(
+                    key: "-model", value: name, in: text
+                )
+                searchText = text
             }
         )
         // Finder-parity minimum (~150pt). All sidebar row kinds —
@@ -1827,11 +1875,25 @@ struct DesignMockRootView: View {
         // still points at a different row. Each typed `source:` /
         // `model:` directive contributes to a union filter via the
         // parser's `sourceFilters` / `modelFilters` arrays.
+        // Two channels can populate the source filter:
+        //   - Positive `source:` → "show only these" (legacy hand-
+        //     typed syntax). Wins when present.
+        //   - Negative `-source:` → "exclude these from the default
+        //     all-on set" (the channel the sidebar checkbox icons
+        //     write through). Resolves to `allSources - excluded` so
+        //     the visible list defaults to every source on first
+        //     open and shrinks as the user clicks dots off.
         if !parsed.sourceFilters.isEmpty {
             query.sources = Set(parsed.sourceFilters)
+        } else if !parsed.excludedSources.isEmpty {
+            let allSourceNames = Set(store.sources.map(\.name))
+            query.sources = allSourceNames.subtracting(parsed.excludedSources)
         }
         if !parsed.modelFilters.isEmpty {
             query.models = Set(parsed.modelFilters)
+        } else if !parsed.excludedModels.isEmpty {
+            let allModelNames = Set(store.sources.flatMap { $0.models.map(\.name) })
+            query.models = allModelNames.subtracting(parsed.excludedModels)
         }
         if let tag = parsed.tagFilter { query.tagName = tag }
         if parsed.bookmarksOnly { query.bookmarksOnly = true }
@@ -4307,17 +4369,25 @@ private enum DesignMockQueryLanguage {
         /// Canonical value of the matched `sort:` token (e.g.
         /// `"updated-desc"`). Nil when no sort directive was typed.
         var sortToken: String?
-        /// All `source:` values typed in the field, in order of first
-        /// appearance and de-duplicated. The sidebar's checkbox
-        /// toggles hand the same name straight in / out of this set,
-        /// and the fetch composes the union — empty means "no source
-        /// restriction", non-empty means "match any of these".
-        /// Case is preserved from the typed value because downstream
-        /// comparisons against stored source names are case-sensitive.
+        /// Positive `source:` directives — kept for users who type
+        /// the GitHub-ish syntax by hand to mean "show ONLY these
+        /// sources". Empty in the common case because the sidebar
+        /// checkboxes write through the negation channel below
+        /// instead. Order-preserving, de-duplicated, case-preserving.
         var sourceFilters: [String] = []
-        /// All `model:` values, same shape and rationale as
-        /// `sourceFilters`.
+        /// Positive `model:` directives. Same shape as `sourceFilters`.
         var modelFilters: [String] = []
+        /// Negative `-source:` directives — the channel the sidebar's
+        /// checkbox icons write through. Default state is "every
+        /// source colour-on", so a click on a coloured dot adds
+        /// `-source:NAME` to the field (greying it) and a click on a
+        /// greyed dot removes the same token (re-colouring it). The
+        /// "include set" is then computed as `allSources - excluded`
+        /// at the fetch layer.
+        var excludedSources: [String] = []
+        /// Negative `-model:` directives. Same shape as
+        /// `excludedSources`.
+        var excludedModels: [String] = []
         /// Value of the matched `tag:` token.
         var tagFilter: String?
         /// True when `bookmark:true` / `is:bookmarked` was typed.
@@ -4339,7 +4409,15 @@ private enum DesignMockQueryLanguage {
                 continue
             }
 
-            let key = token[..<colonIx].lowercased()
+            // A leading `-` flips the directive to negation
+            // (GitHub-style `-source:foo`). Stripped before key
+            // matching so `-source:` and `source:` route through the
+            // same switch with the negation flag carried along.
+            var key = token[..<colonIx].lowercased()
+            let isNegated = key.hasPrefix("-")
+            if isNegated {
+                key = String(key.dropFirst())
+            }
             let rawValue = String(token[token.index(after: colonIx)...])
             guard !rawValue.isEmpty else {
                 // `sort:` with no value is ambiguous — treat as garbage
@@ -4354,26 +4432,37 @@ private enum DesignMockQueryLanguage {
             // one the user just typed in front.
             switch key {
             case "sort":
+                // `sort:` has no negative form — `-sort:foo` parses as
+                // an unknown directive and falls through to free text.
+                guard !isNegated else {
+                    freeWords.append(token)
+                    continue
+                }
                 if parsed.sortToken == nil {
                     parsed.sortToken = rawValue.lowercased()
                 }
             case "source":
-                // Multi-select: every `source:` directive accumulates
-                // into the set so toggling more than one source from
-                // the sidebar (or typing them by hand) composes a
-                // union filter. Order-preserving + dedup keeps the
-                // round-trip stable when the toolbar field is
-                // re-rendered from this state.
-                if !parsed.sourceFilters.contains(rawValue) {
-                    parsed.sourceFilters.append(rawValue)
+                // Default state of each source is "on" (icon coloured),
+                // so the sidebar toggle writes the negative form
+                // `-source:NAME` to grey it out. The positive form is
+                // kept as a legacy hand-typed channel meaning "show
+                // ONLY these sources" — the two channels coexist and
+                // composedQuery picks the one that's set, with
+                // positive winning when both happen to carry data.
+                let bucket = isNegated ? \Parsed.excludedSources : \Parsed.sourceFilters
+                if !parsed[keyPath: bucket].contains(rawValue) {
+                    parsed[keyPath: bucket].append(rawValue)
                 }
             case "model":
-                // Same shape as `source`: every `model:` directive
-                // contributes to a union.
-                if !parsed.modelFilters.contains(rawValue) {
-                    parsed.modelFilters.append(rawValue)
+                let bucket = isNegated ? \Parsed.excludedModels : \Parsed.modelFilters
+                if !parsed[keyPath: bucket].contains(rawValue) {
+                    parsed[keyPath: bucket].append(rawValue)
                 }
             case "tag":
+                guard !isNegated else {
+                    freeWords.append(token)
+                    continue
+                }
                 if parsed.tagFilter == nil {
                     parsed.tagFilter = rawValue
                 }
@@ -4415,7 +4504,12 @@ private enum DesignMockQueryLanguage {
             .map(String.init)
         let out = pieces.filter { piece in
             guard let colonIx = piece.firstIndex(of: ":") else { return true }
-            let key = piece[..<colonIx].lowercased()
+            // Normalise off any leading `-` so the strip catches both
+            // positive `source:foo` and negative `-source:foo` — the
+            // sidebar's single-select pick supersedes whichever side
+            // of the multi-select channel was active before.
+            var key = piece[..<colonIx].lowercased()
+            if key.hasPrefix("-") { key = String(key.dropFirst()) }
             switch key {
             case "source", "model", "tag", "bookmark", "is":
                 return false
@@ -4424,6 +4518,20 @@ private enum DesignMockQueryLanguage {
             }
         }
         return out.joined(separator: " ")
+    }
+
+    /// Drop every directive with a given key from `text`, regardless of
+    /// value. Used when the icon-driven negation channel takes over
+    /// from a hand-typed positive set so the two don't clash —
+    /// clicking a source dot wipes any lingering positive `source:X`
+    /// before adding the negation, which keeps the visible "include
+    /// set" computation strictly negation-driven from that point on.
+    /// Pass `key` exactly as it appears (`"source"`, `"-source"`).
+    static func stripDirectives(key: String, from text: String) -> String {
+        let target = key.lowercased() + ":"
+        let pieces = text.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+        let kept = pieces.filter { !$0.lowercased().hasPrefix(target) }
+        return kept.joined(separator: " ")
     }
 
     /// Toggle a single `key:value` directive in `text`. If the exact
