@@ -86,8 +86,17 @@ fileprivate final class DesignMockDataStore: ObservableObject {
     /// executor, so it doesn't need to debounce or diff on its own.
     struct FetchQuery: Equatable {
         var keyword: String = ""
-        var source: String? = nil
-        var model: String? = nil
+        /// Source-name multi-select. Replaced the earlier `String?`
+        /// when the sidebar gained checkbox toggles per source dot —
+        /// the user can now pick "chatgpt + claude" and the fetch
+        /// composes both into a single `sources IN (?, ?)` filter.
+        /// Empty set = no source restriction (sidebar single-select
+        /// fills this when it picks a single row, DSL `source:` tokens
+        /// from the toolbar override on top).
+        var sources: Set<String> = []
+        /// Model-name multi-select. Same shape and rationale as
+        /// `sources` — checkbox per CPU-icon row in the sidebar.
+        var models: Set<String> = []
         var bookmarksOnly: Bool = false
         var tagName: String? = nil
         var sortKey: ConversationSortKey = .dateDesc
@@ -504,12 +513,8 @@ fileprivate final class DesignMockDataStore: ObservableObject {
 
     private static func buildFilter(from query: FetchQuery) -> ArchiveSearchFilter {
         var filter = ArchiveSearchFilter(keyword: query.keyword)
-        if let source = query.source {
-            filter.sources = [source]
-        }
-        if let model = query.model {
-            filter.models = [model]
-        }
+        filter.sources = query.sources
+        filter.models = query.models
         if query.bookmarksOnly {
             filter.bookmarkedOnly = true
         }
@@ -1596,13 +1601,26 @@ struct DesignMockRootView: View {
                 selectedSidebarItemID = newValue
             }
         )
+        let parsedDSL = DesignMockQueryLanguage.parse(searchText)
         return DesignMockSidebar(
             selection: sidebarSelection,
             sources: store.sources,
             promptBookmarks: store.promptBookmarks,
             databaseInfo: store.databaseInfo,
             totalCount: store.totalCount,
-            libraryViewModel: libraryViewModel
+            libraryViewModel: libraryViewModel,
+            checkedSources: Set(parsedDSL.sourceFilters),
+            checkedModels: Set(parsedDSL.modelFilters),
+            onToggleSource: { name in
+                searchText = DesignMockQueryLanguage.toggleDirective(
+                    key: "source", value: name, in: searchText
+                )
+            },
+            onToggleModel: { name in
+                searchText = DesignMockQueryLanguage.toggleDirective(
+                    key: "model", value: name, in: searchText
+                )
+            }
         )
         // Finder-parity minimum (~150pt). All sidebar row kinds —
         // `sidebarRow` (icon + title + optional subtitle) and the
@@ -1791,22 +1809,30 @@ struct DesignMockRootView: View {
         case .all, .archiveDB, .unknown:
             break
         case .source(let source):
-            query.source = source
+            query.sources = [source]
         case .model(let source, let model):
-            query.source = source
-            query.model = model
+            query.sources = [source]
+            query.models = [model]
         case .bookmarks:
             query.bookmarksOnly = true
         case .tag(let name):
             query.tagName = name
         }
         // Explicit DSL tokens take precedence over the sidebar — the
-        // reasoning is that typing is a deliberate act, sidebar picks
-        // get "sticky" during long sessions, and the user would
-        // reasonably expect `model:gpt-4o` to narrow the visible list
-        // even when the sidebar still points at a different source.
-        if let source = parsed.sourceFilter { query.source = source }
-        if let model = parsed.modelFilter { query.model = model }
+        // reasoning is that typing (or toggling a checkbox, which
+        // writes the same DSL) is a deliberate act, sidebar single-
+        // select picks get "sticky" during long sessions, and the
+        // user would reasonably expect "chatgpt + claude checked"
+        // to narrow the list even when the single-select highlight
+        // still points at a different row. Each typed `source:` /
+        // `model:` directive contributes to a union filter via the
+        // parser's `sourceFilters` / `modelFilters` arrays.
+        if !parsed.sourceFilters.isEmpty {
+            query.sources = Set(parsed.sourceFilters)
+        }
+        if !parsed.modelFilters.isEmpty {
+            query.models = Set(parsed.modelFilters)
+        }
         if let tag = parsed.tagFilter { query.tagName = tag }
         if parsed.bookmarksOnly { query.bookmarksOnly = true }
         return query
@@ -1828,12 +1854,8 @@ struct DesignMockRootView: View {
     /// side means the eviction pass has nothing new to clean up.
     private func archiveFilter(from query: DesignMockDataStore.FetchQuery) -> ArchiveSearchFilter {
         var filter = ArchiveSearchFilter(keyword: query.keyword)
-        if let source = query.source {
-            filter.sources.insert(source)
-        }
-        if let model = query.model {
-            filter.models.insert(model)
-        }
+        filter.sources = query.sources
+        filter.models = query.models
         if query.bookmarksOnly {
             filter.bookmarkedOnly = true
         }
@@ -1902,6 +1924,23 @@ private struct DesignMockSidebar: View {
     /// the shell; Phase-4 prompt-bookmark surfaces and other sidebar-
     /// adjacent features read from it.
     let libraryViewModel: LibraryViewModel?
+    /// Source / model names currently in the multi-select set. The
+    /// dot / CPU icon next to each row paints in the source's colour
+    /// when its name appears here, and washes out to a gray
+    /// secondary tint otherwise — that's the on/off cue. The shell
+    /// keeps both sets in lockstep with the toolbar's `source:` /
+    /// `model:` directives so the search field doubles as the
+    /// canonical state for the multi-select.
+    let checkedSources: Set<String>
+    let checkedModels: Set<String>
+    /// Toggle callbacks fired when the user clicks the icon (only).
+    /// Row text clicks still drive the existing single-select
+    /// behaviour via `selection`. Keeping the icon hit area small
+    /// keeps the row-vs-icon distinction discoverable — the row
+    /// pill is wide and selects, the icon is the size of the dot
+    /// itself and toggles inclusion.
+    let onToggleSource: (String) -> Void
+    let onToggleModel: (String) -> Void
     /// Which sources are currently expanded. We seed from `sources` on
     /// first appear *and* whenever the source list changes shape (e.g. a
     /// real-data fetch finally lands), so newly-visible multi-model
@@ -2055,14 +2094,31 @@ private struct DesignMockSidebar: View {
         isExpanded: Bool = false,
         onToggleDisclosure: (() -> Void)? = nil
     ) -> some View {
+        // Source / model rows surface a checkbox affordance: clicking
+        // just the icon toggles the row's name in the multi-select
+        // set without disturbing the single-select highlight. Other
+        // row kinds keep the plain decorative-icon path.
+        let toggle: (() -> Void)? = {
+            switch item.kind {
+            case .source(let name): return { onToggleSource(name) }
+            case .model(_, let name): return { onToggleModel(name) }
+            default: return nil
+            }
+        }()
+        let isChecked: Bool = {
+            switch item.kind {
+            case .source(let name): return checkedSources.contains(name)
+            case .model(_, let name): return checkedModels.contains(name)
+            default: return false
+            }
+        }()
         HoverableRow(isSelected: selection == item.id) { isHovering in
             let fill = selectionFill(for: item.id, isHovering: isHovering)
             Button {
                 selection = item.id
             } label: {
                 HStack(spacing: 6) {
-                    Image(systemName: item.systemImage)
-                        .foregroundStyle(item.iconStyle)
+                    rowIcon(item: item, toggle: toggle, isChecked: isChecked)
                         .frame(width: 16, alignment: .center)
                     VStack(alignment: .leading, spacing: 1) {
                         Text(item.title)
@@ -2114,6 +2170,36 @@ private struct DesignMockSidebar: View {
             }
             .buttonStyle(.plain)
             .focusEffectDisabled()
+        }
+    }
+
+    /// Render the leading icon for a sidebar row. For checkbox-capable
+    /// rows (sources, models) the icon is wrapped in a Button whose
+    /// hit area is just the glyph, so a click on the dot toggles the
+    /// multi-select inclusion without firing the row-wide selection
+    /// the parent Button handles. The colour cue mirrors the typical
+    /// macOS checkbox semantic — on = the source's brand colour,
+    /// off = a quiet secondary tint — without adding a separate
+    /// checkmark glyph that would crowd the row.
+    @ViewBuilder
+    private func rowIcon(
+        item: DesignMockSidebarItem,
+        toggle: (() -> Void)?,
+        isChecked: Bool
+    ) -> some View {
+        let style: AnyShapeStyle = (toggle != nil && !isChecked)
+            ? AnyShapeStyle(Color.secondary.opacity(0.55))
+            : item.iconStyle
+        let glyph = Image(systemName: item.systemImage)
+            .foregroundStyle(style)
+        if let toggle {
+            Button(action: toggle) {
+                glyph.contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(isChecked ? "Remove from filter" : "Add to filter")
+        } else {
+            glyph
         }
     }
 
@@ -4221,14 +4307,17 @@ private enum DesignMockQueryLanguage {
         /// Canonical value of the matched `sort:` token (e.g.
         /// `"updated-desc"`). Nil when no sort directive was typed.
         var sortToken: String?
-        /// Value of the matched `source:` token (e.g. `"chatgpt"`) —
-        /// case is preserved from the typed value because downstream
-        /// `FetchQuery.source` comparisons are case-sensitive against
-        /// the stored source name.
-        var sourceFilter: String?
-        /// Value of the matched `model:` token. Same case-preservation
-        /// rationale as `sourceFilter`.
-        var modelFilter: String?
+        /// All `source:` values typed in the field, in order of first
+        /// appearance and de-duplicated. The sidebar's checkbox
+        /// toggles hand the same name straight in / out of this set,
+        /// and the fetch composes the union — empty means "no source
+        /// restriction", non-empty means "match any of these".
+        /// Case is preserved from the typed value because downstream
+        /// comparisons against stored source names are case-sensitive.
+        var sourceFilters: [String] = []
+        /// All `model:` values, same shape and rationale as
+        /// `sourceFilters`.
+        var modelFilters: [String] = []
         /// Value of the matched `tag:` token.
         var tagFilter: String?
         /// True when `bookmark:true` / `is:bookmarked` was typed.
@@ -4269,12 +4358,20 @@ private enum DesignMockQueryLanguage {
                     parsed.sortToken = rawValue.lowercased()
                 }
             case "source":
-                if parsed.sourceFilter == nil {
-                    parsed.sourceFilter = rawValue
+                // Multi-select: every `source:` directive accumulates
+                // into the set so toggling more than one source from
+                // the sidebar (or typing them by hand) composes a
+                // union filter. Order-preserving + dedup keeps the
+                // round-trip stable when the toolbar field is
+                // re-rendered from this state.
+                if !parsed.sourceFilters.contains(rawValue) {
+                    parsed.sourceFilters.append(rawValue)
                 }
             case "model":
-                if parsed.modelFilter == nil {
-                    parsed.modelFilter = rawValue
+                // Same shape as `source`: every `model:` directive
+                // contributes to a union.
+                if !parsed.modelFilters.contains(rawValue) {
+                    parsed.modelFilters.append(rawValue)
                 }
             case "tag":
                 if parsed.tagFilter == nil {
@@ -4326,6 +4423,36 @@ private enum DesignMockQueryLanguage {
                 return true
             }
         }
+        return out.joined(separator: " ")
+    }
+
+    /// Toggle a single `key:value` directive in `text`. If the exact
+    /// `key:value` token is already present, every occurrence is
+    /// removed; otherwise one is appended at the end with a leading
+    /// space so it sits clear of existing tokens. Used by the
+    /// sidebar's checkbox icons so a click on the chatgpt dot writes
+    /// (or strips) `source:chatgpt` in the toolbar field — the
+    /// search query string is the canonical home for the multi-
+    /// select state, and the icon's color just reflects what's
+    /// already there.
+    static func toggleDirective(key: String, value: String, in text: String) -> String {
+        let target = "\(key.lowercased()):\(value)"
+        let pieces = text.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+        var found = false
+        var out: [String] = []
+        for piece in pieces {
+            if piece.lowercased() == target.lowercased() {
+                found = true
+                continue
+            }
+            out.append(piece)
+        }
+        if found {
+            return out.joined(separator: " ")
+        }
+        // Append. Single-space join handles the empty-prefix case
+        // cleanly so we never produce a leading space.
+        out.append(target)
         return out.joined(separator: " ")
     }
 
