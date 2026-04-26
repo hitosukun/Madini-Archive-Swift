@@ -3005,13 +3005,18 @@ private struct DesignMockExpandedPromptList: View {
         }
         selectedPromptID = nextID
         pendingPromptID = nextID
-        // Keep the highlighted row visible as we walk off the
-        // top/bottom edges of the viewport. `.center` matches the
-        // card-list / table behaviour for consistency across
-        // levels.
-        withAnimation(.easeOut(duration: 0.18)) {
-            proxy.scrollTo(nextID, anchor: .center)
-        }
+        // Plain `scrollTo(id)` (nil anchor) — let SwiftUI compute the
+        // minimal scroll to bring the row into view. Holding ↓ (or
+        // ↑) at the macOS auto-repeat rate would otherwise queue a
+        // 0.18s `withAnimation` block per keystroke; the animations
+        // overlap on the same NSScrollView and produce visible
+        // chatter / overshoot of the selected highlight as the
+        // interpolations fight. Dropping the animation block also
+        // avoids re-centering on every step — once the row is
+        // already on-screen, `scrollTo(id)` is a no-op, which reads
+        // as a calm, snappy walk down the outline rather than the
+        // viewport bouncing to keep the row centered.
+        proxy.scrollTo(nextID)
     }
 
     @ViewBuilder
