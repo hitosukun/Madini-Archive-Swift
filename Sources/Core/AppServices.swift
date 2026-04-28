@@ -556,6 +556,66 @@ final class AppServices: ObservableObject {
                     """)
                 try db.execute(sql: "PRAGMA user_version = 2")
             }
+
+            // Migration 3: index timestamp columns + the primary_time
+            // COALESCE expression itself.
+            //
+            // `primary_time` is not a stored column — it's a SELECT-time
+            // COALESCE over (source_created_at → imported_at → date_str)
+            // defined verbatim as `primaryTimeSQL` in
+            // GRDBConversationRepository / GRDBSearchRepository (and,
+            // once the next commit lands, in `SearchFilterSQL`). Date-
+            // range predicates in the existing WHERE assembly and the
+            // upcoming Stats aggregations both compare against this
+            // exact expression.
+            //
+            // EXPLAIN QUERY PLAN (verified against an in-memory schema
+            // clone with 5,000 conversations / 10,000 messages):
+            //  - Indexing only the underlying columns leaves the planner
+            //    doing SCAN conversations for COALESCE-bound predicates
+            //    — the NULLIF/TRIM/COALESCE wrapper hides the column
+            //    lookup.
+            //  - An *expression* index whose key matches the COALESCE
+            //    expression byte-for-byte gets picked up
+            //    (SEARCH ... USING INDEX (<expr>>? AND <expr><?)).
+            //
+            // We register all three:
+            //   - idx_conversations_primary_time_expr is the one Stats
+            //     and date-range queries actually use; its key string
+            //     MUST stay byte-for-byte in sync with
+            //     `GRDBConversationRepository.primaryTimeSQL`. If the
+            //     COALESCE expression in that constant changes, register
+            //     a new migration that drops / recreates this index in
+            //     the same commit — do NOT modify Migration 3 in place.
+            //   - idx_conversations_source_created_at /
+            //     idx_conversations_imported_at cover direct-column
+            //     predicates. Current code does not query the columns
+            //     directly, but they're the natural sort keys for
+            //     future Stats axes and for any planner path that
+            //     prefers a covering index over the expression index.
+            //   - date_str is left unindexed — last-resort fallback,
+            //     write cost outweighs the benefit.
+            if userVersion < 3 {
+                try db.execute(sql: """
+                    CREATE INDEX IF NOT EXISTS idx_conversations_primary_time_expr
+                    ON conversations(
+                        COALESCE(
+                            NULLIF(TRIM(source_created_at), ''),
+                            NULLIF(TRIM(imported_at), ''),
+                            NULLIF(TRIM(date_str), '')
+                        )
+                    )
+                    """)
+                try db.execute(sql: """
+                    CREATE INDEX IF NOT EXISTS idx_conversations_source_created_at
+                    ON conversations(source_created_at)
+                    """)
+                try db.execute(sql: """
+                    CREATE INDEX IF NOT EXISTS idx_conversations_imported_at
+                    ON conversations(imported_at)
+                    """)
+                try db.execute(sql: "PRAGMA user_version = 3")
+            }
         }
     }
 
