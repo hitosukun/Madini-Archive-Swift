@@ -723,6 +723,13 @@ struct DesignMockRootView: View {
     /// because it still drives viewer-mode data, saved filters, and
     /// the (upcoming) prompt-level bookmark surface.
     @State private var libraryViewModel: LibraryViewModel?
+    /// Stats view-model. Built in the same lazy `.task` that owns
+    /// `libraryViewModel`; consumes `services.stats` plus the
+    /// `libraryViewModel.filter` snapshot so the Dashboard scope
+    /// stays in lockstep with the conversation list scope. Refresh
+    /// is debounced through `StatsViewModel.filter`'s `didSet`, so
+    /// flipping ⌘1↔⌘4 doesn't burn duplicate aggregates.
+    @State private var statsViewModel: StatsViewModel?
     /// Rolling list of find-in-page queries the user ran inside an
     /// open thread. Feeds `.searchSuggestions` when the search field
     /// is acting as a thread-scoped finder (`.default` / `.viewer`
@@ -898,6 +905,14 @@ struct DesignMockRootView: View {
         // every reassertion for as long as this view is mounted.
         .background(WindowTitlebarSeparatorHider())
         .environmentObject(store)
+        // Keep the Stats VM's filter in lockstep with the library
+        // filter. When the user narrows via sidebar / search, the
+        // Dashboard re-aggregates to match — same scope, same answer.
+        .onChange(of: libraryViewModel?.filter) { _, newFilter in
+            if let newFilter {
+                statsViewModel?.filter = newFilter
+            }
+        }
         .task {
             // Build the shared library VM lazily — `@EnvironmentObject`
             // isn't available in `init`, so we can't construct it in a
@@ -910,6 +925,16 @@ struct DesignMockRootView: View {
                     bookmarkRepository: services.bookmarks,
                     viewService: services.views,
                     tagRepository: services.tags
+                )
+            }
+            // Build the Stats VM in the same .task. Seed with the
+            // current library filter so the user's first ⌘4 doesn't
+            // momentarily render an empty Dashboard before the
+            // .onChange below catches up.
+            if statsViewModel == nil {
+                statsViewModel = StatsViewModel(
+                    stats: services.stats,
+                    filter: libraryViewModel?.filter ?? ArchiveSearchFilter()
                 )
             }
             if archiveInspectorVM == nil {
@@ -1521,30 +1546,43 @@ struct DesignMockRootView: View {
                 readerPane(inThreadSearch: nil)
             }
         case .stats:
-            // Phase 2 commit 4: scaffolding only. The real
-            // `StatsContentPane` lands in commit 5; for now the
-            // middle column shows an explicit placeholder so the
-            // exhaustive switch compiles and ⌘4 has somewhere
-            // visible to land while the chart UI is still under
-            // construction.
+            // Dashboard / Stats. The middle column hosts
+            // StatsContentPane (5 bounded aggregates over the active
+            // ArchiveSearchFilter — sourceBreakdown, modelBreakdown,
+            // monthlyBreakdown, dailyHeatmap, hourWeekdayHeatmap),
+            // the right column keeps the regular reader pane so the
+            // user can leave a conversation open while glancing at
+            // the dashboard. The .id makes SwiftUI hold the chart
+            // pane's identity stable across other layout switches
+            // (Picker position, scroll, etc. survive a brief ⌘1
+            // detour).
             NavigationSplitView {
                 sidebar
             } content: {
-                ContentUnavailableView(
-                    "Dashboard",
-                    systemImage: "chart.bar.xaxis",
-                    description: Text("StatsContentPane wires up in the next commit.")
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .navigationSplitViewColumnWidth(
-                    min: Self.centerWidthMin,
-                    ideal: currentCenterIdeal,
-                    max: Self.centerWidthMax
-                )
+                statsContent
+                    .navigationSplitViewColumnWidth(
+                        min: Self.centerWidthMin,
+                        ideal: currentCenterIdeal,
+                        max: Self.centerWidthMax
+                    )
             } detail: {
                 readerPane(inThreadSearch: nil)
             }
             .id("stats")
+        }
+    }
+
+    /// Middle-pane content for `.stats`. Falls back to a spinner only
+    /// during the single-frame window between view mount and the
+    /// first run of the lazy-init `.task` that owns `statsViewModel`
+    /// — every subsequent render hits the populated branch.
+    @ViewBuilder
+    private var statsContent: some View {
+        if let viewModel = statsViewModel {
+            StatsContentPane(viewModel: viewModel)
+        } else {
+            ProgressView()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
