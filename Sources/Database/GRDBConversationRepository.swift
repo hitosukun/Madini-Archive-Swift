@@ -261,13 +261,10 @@ final class GRDBConversationRepository: ConversationRepository, @unchecked Senda
         }
     }
 
-    private static let primaryTimeSQL = """
-    COALESCE(
-        NULLIF(TRIM(c.source_created_at), ''),
-        NULLIF(TRIM(c.imported_at), ''),
-        NULLIF(TRIM(c.date_str), '')
-    )
-    """
+    /// Forwarded to the shared expression in `SearchFilterSQL` so the
+    /// column projection here, the WHERE-builder, and the migration-3
+    /// expression index all read the same `primary_time` definition.
+    private static let primaryTimeSQL = SearchFilterSQL.primaryTimeSQL
 
     private static let headlinePromptSQL = """
     (
@@ -306,111 +303,25 @@ final class GRDBConversationRepository: ConversationRepository, @unchecked Senda
     )
     """
 
+    /// Thin façade over `SearchFilterSQL.makeWhereClause` that
+    /// preserves the legacy parameter shape used by the rest of this
+    /// file. The actual predicate translation lives in
+    /// `Database/SearchFilterSQL.swift` so the conversation list,
+    /// search, and Stats paths share one implementation.
     private static func makeConversationWhereClause(
         filter: ArchiveSearchFilter,
         excludingSources: Bool = false,
         excludingModels: Bool = false,
         excludingSourceFiles: Bool = false
     ) -> (String, StatementArguments) {
-        var filters: [String] = []
-        var arguments = StatementArguments()
-
-        // Markdown import 会話は当面 render しない方針のため、DB アクセスの
-        // 段階で常時除外する。サイドバー facet / 検索 / 一覧すべてに効く。
-        filters.append("COALESCE(c.source, '') != 'markdown'")
-
-        if !excludingSources, !filter.sources.isEmpty {
-            let sortedSources = Array(filter.sources).sorted()
-            let placeholders = Array(repeating: "?", count: sortedSources.count).joined(separator: ", ")
-            filters.append("c.source IN (\(placeholders))")
-            for source in sortedSources {
-                arguments += [source]
-            }
-        }
-
-        if !excludingModels, !filter.models.isEmpty {
-            let sortedModels = Array(filter.models).sorted()
-            let placeholders = Array(repeating: "?", count: sortedModels.count).joined(separator: ", ")
-            filters.append("c.model IN (\(placeholders))")
-            for model in sortedModels {
-                arguments += [model]
-            }
-        }
-
-        if !excludingSourceFiles, !filter.sourceFiles.isEmpty {
-            let sortedFiles = Array(filter.sourceFiles).sorted()
-            let placeholders = Array(repeating: "?", count: sortedFiles.count).joined(separator: ", ")
-            filters.append("c.source_file IN (\(placeholders))")
-            for file in sortedFiles {
-                arguments += [file]
-            }
-        }
-
-        if filter.bookmarkedOnly {
-            // Phase 4: "bookmarked threads" = "threads with at least one
-            // pinned prompt". Mirrors `bookmarkStatusSQL` above so the
-            // filter and the `is_bookmarked` flag agree on semantics.
-            filters.append("""
-                EXISTS(
-                    SELECT 1
-                    FROM bookmarks b
-                    WHERE b.target_type = 'prompt'
-                      AND b.target_id LIKE c.id || ':%'
-                )
-                """)
-        }
-
-        if let dateFrom = filter.dateFrom?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !dateFrom.isEmpty {
-            filters.append("\(primaryTimeSQL) >= ?")
-            arguments += [dateFrom]
-        }
-
-        if let dateTo = filter.dateTo?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !dateTo.isEmpty {
-            filters.append("\(primaryTimeSQL) <= ?")
-            arguments += [dateTo]
-        }
-
-        if !filter.bookmarkTags.isEmpty {
-            let tagPlaceholders = Array(repeating: "?", count: filter.bookmarkTags.count).joined(separator: ", ")
-            filters.append("""
-                EXISTS(
-                    SELECT 1
-                    FROM bookmarks b
-                    JOIN bookmark_tag_links tl ON tl.bookmark_id = b.id
-                    JOIN bookmark_tags t ON t.id = tl.tag_id
-                    WHERE t.name COLLATE NOCASE IN (\(tagPlaceholders))
-                      AND b.target_type = 'thread'
-                      AND b.target_id = c.id
-                )
-                """)
-            for tag in filter.bookmarkTags {
-                arguments += [tag]
-            }
-        }
-
-        if !filter.roles.isEmpty {
-            let sortedRoles = filter.roles.map(\.rawValue).sorted()
-            let placeholders = Array(repeating: "?", count: sortedRoles.count).joined(separator: ", ")
-            filters.append("""
-                EXISTS(
-                    SELECT 1
-                    FROM messages m
-                    WHERE m.conv_id = c.id
-                      AND lower(COALESCE(m.role, '')) IN (\(placeholders))
-                )
-                """)
-            for role in sortedRoles {
-                arguments += [role]
-            }
-        }
-
-        if filters.isEmpty {
-            return ("", arguments)
-        }
-
-        return ("WHERE " + filters.joined(separator: " AND "), arguments)
+        SearchFilterSQL.makeWhereClause(
+            filter: filter,
+            options: SearchFilterSQL.Options(
+                excludingSources: excludingSources,
+                excludingModels: excludingModels,
+                excludingSourceFiles: excludingSourceFiles
+            )
+        )
     }
 
     private static func makeSummary(_ row: Row) -> ConversationSummary {
