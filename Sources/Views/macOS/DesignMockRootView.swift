@@ -723,6 +723,13 @@ struct DesignMockRootView: View {
     /// because it still drives viewer-mode data, saved filters, and
     /// the (upcoming) prompt-level bookmark surface.
     @State private var libraryViewModel: LibraryViewModel?
+    /// Stats view-model. Built in the same lazy `.task` that owns
+    /// `libraryViewModel`; consumes `services.stats` plus the
+    /// `libraryViewModel.filter` snapshot so the Dashboard scope
+    /// stays in lockstep with the conversation list scope. Refresh
+    /// is debounced through `StatsViewModel.filter`'s `didSet`, so
+    /// flipping ⌘1↔⌘4 doesn't burn duplicate aggregates.
+    @State private var statsViewModel: StatsViewModel?
     /// Rolling list of find-in-page queries the user ran inside an
     /// open thread. Feeds `.searchSuggestions` when the search field
     /// is acting as a thread-scoped finder (`.default` / `.viewer`
@@ -898,6 +905,14 @@ struct DesignMockRootView: View {
         // every reassertion for as long as this view is mounted.
         .background(WindowTitlebarSeparatorHider())
         .environmentObject(store)
+        // Keep the Stats VM's filter in lockstep with the library
+        // filter. When the user narrows via sidebar / search, the
+        // Dashboard re-aggregates to match — same scope, same answer.
+        .onChange(of: libraryViewModel?.filter) { _, newFilter in
+            if let newFilter {
+                statsViewModel?.filter = newFilter
+            }
+        }
         .task {
             // Build the shared library VM lazily — `@EnvironmentObject`
             // isn't available in `init`, so we can't construct it in a
@@ -910,6 +925,16 @@ struct DesignMockRootView: View {
                     bookmarkRepository: services.bookmarks,
                     viewService: services.views,
                     tagRepository: services.tags
+                )
+            }
+            // Build the Stats VM in the same .task. Seed with the
+            // current library filter so the user's first ⌘4 doesn't
+            // momentarily render an empty Dashboard before the
+            // .onChange below catches up.
+            if statsViewModel == nil {
+                statsViewModel = StatsViewModel(
+                    stats: services.stats,
+                    filter: libraryViewModel?.filter ?? ArchiveSearchFilter()
                 )
             }
             if archiveInspectorVM == nil {
@@ -1270,6 +1295,14 @@ struct DesignMockRootView: View {
             drillOutClosure = {
                 layoutBinding.wrappedValue = .default
             }
+
+        case .stats:
+            // Dashboard sits outside the drill chain entirely. ⌘← /
+            // ⌘→ have no meaning here — exiting Stats is always
+            // explicit (⌘1 / ⌘2 / ⌘3 to switch layout, or sidebar
+            // navigation to a non-Dashboard row).
+            drillInClosure = nil
+            drillOutClosure = nil
         }
 
         // Enable "Delete Snapshot…" only when:
@@ -1512,6 +1545,44 @@ struct DesignMockRootView: View {
                 // toolbar field is purely a library narrow.
                 readerPane(inThreadSearch: nil)
             }
+        case .stats:
+            // Dashboard / Stats. The middle column hosts
+            // StatsContentPane (5 bounded aggregates over the active
+            // ArchiveSearchFilter — sourceBreakdown, modelBreakdown,
+            // monthlyBreakdown, dailyHeatmap, hourWeekdayHeatmap),
+            // the right column keeps the regular reader pane so the
+            // user can leave a conversation open while glancing at
+            // the dashboard. The .id makes SwiftUI hold the chart
+            // pane's identity stable across other layout switches
+            // (Picker position, scroll, etc. survive a brief ⌘1
+            // detour).
+            NavigationSplitView {
+                sidebar
+            } content: {
+                statsContent
+                    .navigationSplitViewColumnWidth(
+                        min: Self.centerWidthMin,
+                        ideal: currentCenterIdeal,
+                        max: Self.centerWidthMax
+                    )
+            } detail: {
+                readerPane(inThreadSearch: nil)
+            }
+            .id("stats")
+        }
+    }
+
+    /// Middle-pane content for `.stats`. Falls back to a spinner only
+    /// during the single-frame window between view mount and the
+    /// first run of the lazy-init `.task` that owns `statsViewModel`
+    /// — every subsequent render hits the populated branch.
+    @ViewBuilder
+    private var statsContent: some View {
+        if let viewModel = statsViewModel {
+            StatsContentPane(viewModel: viewModel)
+        } else {
+            ProgressView()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
@@ -4518,6 +4589,15 @@ enum DesignMockLayoutMode: String, CaseIterable, Identifiable {
     case table
     case `default`
     case viewer
+    /// Dashboard / Stats — bounded aggregates over the active filter.
+    /// Reached from the toolbar picker, ⌘4 (View → Layout menu), and
+    /// (eventually) the sidebar `Dashboard` row. Sits outside the
+    /// `table → default → viewer → focus` swipe cascade — the
+    /// `MiddlePaneMode` companion enum keeps `.stats` idempotent for
+    /// `stepTowardFocus` / `stepTowardOverview`, and this layout
+    /// mirrors that policy: the user enters / leaves Dashboard via a
+    /// named action, never via a horizontal swipe.
+    case stats
 
     var id: String { rawValue }
 
@@ -4526,6 +4606,7 @@ enum DesignMockLayoutMode: String, CaseIterable, Identifiable {
         case .table: return "Table"
         case .default: return "Default"
         case .viewer: return "Viewer"
+        case .stats: return "Dashboard"
         }
     }
 
@@ -4534,6 +4615,7 @@ enum DesignMockLayoutMode: String, CaseIterable, Identifiable {
         case .table: return "tablecells"
         case .default: return "rectangle.split.3x1"
         case .viewer: return "doc.plaintext"
+        case .stats: return "chart.bar.xaxis"
         }
     }
 }

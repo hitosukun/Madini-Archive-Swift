@@ -267,13 +267,11 @@ final class GRDBSearchRepository: SearchRepository, @unchecked Sendable {
         }
     }
 
-    private static let primaryTimeSQL = """
-    COALESCE(
-        NULLIF(TRIM(c.source_created_at), ''),
-        NULLIF(TRIM(c.imported_at), ''),
-        NULLIF(TRIM(c.date_str), '')
-    )
-    """
+    /// Forwarded to the shared expression in `SearchFilterSQL` so the
+    /// column projection, the WHERE-builder's date-range predicate,
+    /// and the migration-3 expression index all read the same
+    /// `primary_time` definition.
+    private static let primaryTimeSQL = SearchFilterSQL.primaryTimeSQL
 
     private static let headlinePromptSQL = """
     (
@@ -352,135 +350,64 @@ final class GRDBSearchRepository: SearchRepository, @unchecked Sendable {
             || !query.filter.bookmarkTags.isEmpty
     }
 
+    /// Thin façade over `SearchFilterSQL.makeWhereClause` that
+    /// injects the FTS5 `MATCH` predicate when the search query
+    /// carries text. Predicate translation lives in
+    /// `Database/SearchFilterSQL.swift` so the conversation list,
+    /// search, and Stats paths share one implementation.
+    ///
+    /// `includePagination` is kept on the signature for backwards
+    /// compatibility with callers that pass it; the WHERE clause
+    /// itself does not depend on pagination — LIMIT / OFFSET live on
+    /// the outer query string.
     static func makeSearchWhereClause(
         query: SearchQuery,
         includePagination: Bool = true
     ) -> (String, StatementArguments) {
-        var filters: [String] = []
-        var arguments = StatementArguments()
-
-        // Markdown import 会話は render 未対応として全面除外。
-        // `GRDBConversationRepository.makeConversationWhereClause` と揃える。
-        filters.append("COALESCE(c.source, '') != 'markdown'")
-
-        if !query.normalizedText.isEmpty,
-           let match = SearchQueryParser.parse(query.normalizedText).ftsMatchExpression {
-            filters.append("search_idx MATCH ?")
-            arguments += [match]
-        }
-
-        let (nonTextSQL, nonTextArgs) = makeNonTextFiltersClause(query: query)
-        if !nonTextSQL.isEmpty {
-            filters.append(nonTextSQL)
-            arguments += nonTextArgs
-        }
-
-        let whereSQL = filters.isEmpty ? "" : "WHERE " + filters.joined(separator: " AND ")
-        return (whereSQL, arguments)
+        let term = query.normalizedText.isEmpty
+            ? nil
+            : SearchQueryParser.parse(query.normalizedText).ftsMatchExpression
+        return SearchFilterSQL.makeWhereClause(
+            filter: query.filter,
+            options: SearchFilterSQL.Options(ftsMatchTerm: term)
+        )
     }
 
-    /// All conversation-level filters (sources, models, dates, bookmarks,
-    /// roles, tags) packaged as a single AND-joined SQL fragment without
-    /// the leading `WHERE`. Shared between the FTS path and the LIKE
-    /// fallback so the two routes stay in lockstep when the filter
-    /// surface grows.
+    /// All conversation-level filters (sources, models, dates,
+    /// bookmarks, roles, tags) packaged as a single AND-joined SQL
+    /// fragment without the leading `WHERE` and without the markdown
+    /// exclusion. Shared between the FTS path
+    /// (`makeSearchWhereClause`) and the LIKE fallback
+    /// (`makeLikeWhereClause`) so the two routes stay in lockstep
+    /// when the filter surface grows.
+    ///
+    /// Implementation: delegates to `SearchFilterSQL.makeWhereClause`
+    /// (the same helper the conversation list and Stats paths use)
+    /// and strips the leading `WHERE COALESCE(c.source,'') !=
+    /// 'markdown' AND ` prefix. The LIKE caller adds its own
+    /// markdown predicate explicitly, so dropping it here avoids
+    /// emitting it twice.
     private static func makeNonTextFiltersClause(
         query: SearchQuery
     ) -> (String, StatementArguments) {
-        var filters: [String] = []
-        var arguments = StatementArguments()
-
-        if !query.filter.sources.isEmpty {
-            let sortedSources = Array(query.filter.sources).sorted()
-            let placeholders = Array(repeating: "?", count: sortedSources.count).joined(separator: ", ")
-            filters.append("c.source IN (\(placeholders))")
-            for source in sortedSources {
-                arguments += [source]
-            }
+        let (full, args) = SearchFilterSQL.makeWhereClause(filter: query.filter)
+        // SearchFilterSQL always emits the markdown predicate first,
+        // and never binds an argument for it (it's a constant). When
+        // no other predicate fires we get back the markdown-only
+        // WHERE — return an empty fragment so the caller skips the
+        // AND glue entirely.
+        let markdownOnly = "WHERE COALESCE(c.source, '') != 'markdown'"
+        if full == markdownOnly {
+            return ("", args)
         }
-
-        if !query.filter.models.isEmpty {
-            let sortedModels = Array(query.filter.models).sorted()
-            let placeholders = Array(repeating: "?", count: sortedModels.count).joined(separator: ", ")
-            filters.append("c.model IN (\(placeholders))")
-            for model in sortedModels {
-                arguments += [model]
-            }
+        let prefix = markdownOnly + " AND "
+        if full.hasPrefix(prefix) {
+            let body = String(full.dropFirst(prefix.count))
+            return ("(\(body))", args)
         }
-
-        if !query.filter.sourceFiles.isEmpty {
-            let sortedFiles = Array(query.filter.sourceFiles).sorted()
-            let placeholders = Array(repeating: "?", count: sortedFiles.count).joined(separator: ", ")
-            filters.append("c.source_file IN (\(placeholders))")
-            for file in sortedFiles {
-                arguments += [file]
-            }
-        }
-
-        if query.filter.bookmarkedOnly {
-            // Phase 4: "bookmarked threads" = "threads with at least one
-            // pinned prompt". Kept in lockstep with
-            // `GRDBConversationRepository.bookmarkStatusSQL`.
-            filters.append("""
-                EXISTS(
-                    SELECT 1
-                    FROM bookmarks b
-                    WHERE b.target_type = 'prompt'
-                      AND b.target_id LIKE c.id || ':%'
-                )
-                """)
-        }
-
-        if let dateFrom = query.filter.dateFrom?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !dateFrom.isEmpty {
-            filters.append("\(primaryTimeSQL) >= ?")
-            arguments += [dateFrom]
-        }
-
-        if let dateTo = query.filter.dateTo?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !dateTo.isEmpty {
-            filters.append("\(primaryTimeSQL) <= ?")
-            arguments += [dateTo]
-        }
-
-        if !query.filter.bookmarkTags.isEmpty {
-            let tagPlaceholders = Array(repeating: "?", count: query.filter.bookmarkTags.count).joined(separator: ", ")
-            filters.append("""
-                EXISTS(
-                    SELECT 1
-                    FROM bookmarks b
-                    JOIN bookmark_tag_links tl ON tl.bookmark_id = b.id
-                    JOIN bookmark_tags t ON t.id = tl.tag_id
-                    WHERE t.name COLLATE NOCASE IN (\(tagPlaceholders))
-                      AND b.target_type = 'thread'
-                      AND b.target_id = c.id
-                )
-                """)
-            for tag in query.filter.bookmarkTags {
-                arguments += [tag]
-            }
-        }
-
-        if !query.filter.roles.isEmpty {
-            let placeholders = Array(repeating: "?", count: query.filter.roles.count).joined(separator: ", ")
-            filters.append("""
-                EXISTS(
-                    SELECT 1
-                    FROM messages m
-                    WHERE m.conv_id = c.id
-                      AND lower(COALESCE(m.role, '')) IN (\(placeholders))
-                )
-                """)
-            for role in query.filter.roles {
-                arguments += [role.rawValue]
-            }
-        }
-
-        // Combined as a single AND-joined fragment. Empty when no
-        // non-text filters are set, so callers can decide whether to
-        // append it or skip the AND glue entirely.
-        let combined = filters.isEmpty ? "" : "(" + filters.joined(separator: " AND ") + ")"
-        return (combined, arguments)
+        // Defensive fallback — shouldn't happen given the
+        // SearchFilterSQL contract.
+        return (full, args)
     }
 
 }

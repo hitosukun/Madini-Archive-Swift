@@ -70,9 +70,12 @@ This is the SwiftUI implementation, and **it is the canonical version**. macOS i
 | `ConversationRepository` | Paginated listing, detail fetch, filter options | `GRDBConversationRepository` |
 | `SearchRepository` | Keyword search (FTS5-first) | `GRDBSearchRepository` |
 | `BookmarkRepository` | Bookmark CRUD, tag membership | `GRDBBookmarkRepository` |
+| `StatsRepository` | Bounded aggregations for the Dashboard / `.stats` mode (source / model / monthly / daily / hour×weekday). Pure derived view — no caching, no persisted intermediates. | `GRDBStatsRepository` |
 | `RawSourceRepository` | Raw source and provenance access | `GRDBRawSourceRepository` |
 | `ViewService` | Virtual Thread build, Saved View CRUD, Recent Filter | `GRDBViewService` |
 | `ImportService` | File parse + DB registration + raw source preservation | `GRDBImportService` |
+
+WHERE-clause assembly is centralized in `Database/SearchFilterSQL.swift` so the conversation-list, search, and Stats paths translate `ArchiveSearchFilter` through one helper. Add new repositories with the same call pattern (`SearchFilterSQL.makeWhereClause(filter:options:)`) to keep filter semantics consistent across the codebase.
 
 ### Adding a New Repository
 1. Define the protocol in `Core/Repositories.swift` with all necessary DTOs.
