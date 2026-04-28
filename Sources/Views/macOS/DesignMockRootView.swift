@@ -1059,6 +1059,31 @@ struct DesignMockRootView: View {
         .task(id: viewerOutlineLoadToken) {
             await loadViewerPromptOutlineIfNeeded()
         }
+        // Sidebar → layout sync, Phase 4. Sidebar `Dashboard` row
+        // and ⌘4 must converge on the same state: layout =
+        // `.stats`, sidebar selection = `.dashboard`. The setLayout
+        // closure inside `shellCommandActions` handles the layout →
+        // sidebar direction; this `.onChange` handles sidebar →
+        // layout. Each side short-circuits when the value is
+        // already what it would write, which prevents the two
+        // observers from ping-ponging when they fire on the same
+        // mutation.
+        .onChange(of: selectedSidebarItemID) { _, newID in
+            if newID == DesignMockSidebarItem.dashboard.id {
+                if selectedLayoutMode != .stats {
+                    selectedLayoutMode = .stats
+                }
+            } else if selectedLayoutMode == .stats {
+                // Leaving Dashboard from any non-Dashboard sidebar
+                // row drops the user back to the default layout.
+                // Picking a specific layout via ⌘1 / ⌘2 / ⌘3 has
+                // already done this through `setLayout`; this
+                // branch is the catch-all for clicks on other
+                // sidebar items (All Threads, source rows,
+                // archive.db, etc.).
+                selectedLayoutMode = .default
+            }
+        }
     }
 
     /// Composite key for the viewer-outline loader task. Changes
@@ -1323,10 +1348,31 @@ struct DesignMockRootView: View {
             deleteClosure = nil
         }
 
+        // Capture sidebar binding so setLayout can keep the sidebar
+        // selection in lockstep with the layout. Phase 4: ⌘4 (or any
+        // other entry to .stats) must also surface the Dashboard row
+        // in the sidebar, and ⌘1/⌘2/⌘3 must walk the user back to
+        // All Threads if they were on Dashboard.
+        let sidebarBinding = $selectedSidebarItemID
         return ShellCommandActions(
             currentLayout: selectedLayoutMode,
             setLayout: { newMode in
                 layoutBinding.wrappedValue = newMode
+                // Keep the sidebar / layout pair coherent. The
+                // sidebar's `.onChange` observer in the body
+                // already handles the inverse direction (sidebar
+                // → layout), so the two points of mutation
+                // converge on the same state without a
+                // ping-pong: each handler short-circuits when
+                // the value it would write is already current.
+                let currentSidebar = sidebarBinding.wrappedValue
+                if newMode == .stats {
+                    if currentSidebar != DesignMockSidebarItem.dashboard.id {
+                        sidebarBinding.wrappedValue = DesignMockSidebarItem.dashboard.id
+                    }
+                } else if currentSidebar == DesignMockSidebarItem.dashboard.id {
+                    sidebarBinding.wrappedValue = DesignMockSidebarItem.allThreads.id
+                }
             },
             reloadLibrary: {
                 Task { await capturedStore.refreshAll(services: capturedServices) }
@@ -1458,6 +1504,8 @@ struct DesignMockRootView: View {
         // clicked archive.db and landed here before the task fires.
         if showingArchiveInspector, let archiveVM = archiveInspectorVM {
             archiveInspectorSplit(vm: archiveVM)
+        } else if showingWikis {
+            wikisPlaceholderSplit
         } else {
             readerLayoutSplit
         }
@@ -2078,6 +2126,14 @@ struct DesignMockRootView: View {
             query.bookmarksOnly = true
         case .tag(let name):
             query.tagName = name
+        case .wikis, .dashboard:
+            // Wikis and Dashboard don't scope the library query —
+            // their middle-pane content is rendered independently
+            // (placeholder for Wikis, StatsContentPane via the
+            // .stats layout for Dashboard). Leave the FetchQuery
+            // untouched so re-selecting "All Threads" returns to
+            // the full unfiltered list.
+            break
         }
         // Explicit DSL tokens take precedence over the sidebar — the
         // reasoning is that typing (or toggling a checkbox, which
@@ -2167,6 +2223,38 @@ struct DesignMockRootView: View {
         return false
     }
 
+    /// Phase 4: Wikis is a sidebar entry without a real backend yet.
+    /// The middle pane shows a placeholder so the row has somewhere
+    /// to land; the real M.Wiki integration is on a later phase
+    /// backlog. Mirrors `showingArchiveInspector` so `rootSplitView`
+    /// can route through a dedicated split before falling back to
+    /// the reader-family layouts.
+    private var showingWikis: Bool {
+        let kind = DesignMockSidebarItem.kind(for: selectedSidebarItemID, sources: store.sources)
+        if case .wikis = kind { return true }
+        return false
+    }
+
+    /// Two-pane layout for the Wikis placeholder. Sidebar stays
+    /// user-controllable so the user can return via any other row;
+    /// the detail pane shows a `ContentUnavailableView` summarising
+    /// what Wikis will become. No content middle pane — when there's
+    /// nothing to scroll through, the chrome reads cleaner without
+    /// the third column.
+    @ViewBuilder
+    private var wikisPlaceholderSplit: some View {
+        NavigationSplitView {
+            sidebar
+        } detail: {
+            ContentUnavailableView(
+                "Wikis is coming soon",
+                systemImage: "books.vertical",
+                description: Text("M.Wiki 連携の入口になります。今は placeholder です。")
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
     /// Three-pane archive.db split. Renders identically regardless of
     /// `selectedLayoutMode` — the outer layout picker stays on the
     /// toolbar so the user can switch back by picking a thread row
@@ -2231,6 +2319,12 @@ private struct DesignMockSidebar: View {
     /// collapses of the ones they've already interacted with.
     @State private var expandedSources: Set<String> = []
     @State private var haveSeededExpansion: Bool = false
+    /// Whether the All Threads row's source-children disclosure is
+    /// open. Persists across launches via `@AppStorage` (default
+    /// `true`) so the user's expansion preference is preserved —
+    /// the source filters are the most-used sidebar surface in the
+    /// archive, defaulting to expanded keeps them one click away.
+    @AppStorage("designmock.allThreadsExpanded") private var allThreadsExpanded: Bool = true
 
     var body: some View {
         // "All" subtitle is driven by the live source totals so the sidebar
@@ -2280,29 +2374,60 @@ private struct DesignMockSidebar: View {
         // pattern the user pointed to in their Finder reference shots.
         return ScrollView {
             VStack(alignment: .leading, spacing: 14) {
-                sectionGroup("Library") {
-                    customRow(allItem)
+                // User section: items the user authors / curates.
+                // Wikis is a placeholder for the future M.Wiki
+                // integration; Bookmarks holds the per-prompt pin
+                // surface (subtitle reflects the live count);
+                // Dashboard flips the middle pane to .stats. The
+                // section is defined first because Phase 4's mental
+                // model is "things I made / things I want to look
+                // at" before "the structure of the imported files".
+                sectionGroup("User") {
+                    customRow(DesignMockSidebarItem.wikis)
                     customRow(bookmarksRow)
-                    customRow(archiveRow)
+                    customRow(DesignMockSidebarItem.dashboard)
                 }
 
-                sectionGroup("Sources") {
-                    if sources.isEmpty {
-                        Text("No sources yet")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .padding(.horizontal, 8)
-                    } else {
-                        ForEach(sources, id: \.name) { source in
-                            sourceBlock(source)
+                // Library section: imported-archive structure. The
+                // archive.db row leads (it's the file on disk), then
+                // All Threads which expands to expose per-source
+                // (and per-source-per-model) filter rows. The
+                // `disclosed` block uses the same `customRow(...,
+                // hasDisclosure:, isExpanded:)` chrome as multi-
+                // model source rows so the chevron column is
+                // consistent.
+                sectionGroup("Library") {
+                    customRow(archiveRow)
+
+                    customRow(
+                        allItem,
+                        hasDisclosure: !sources.isEmpty,
+                        isExpanded: allThreadsExpanded
+                    ) {
+                        allThreadsExpanded.toggle()
+                    }
+
+                    if allThreadsExpanded {
+                        if sources.isEmpty {
+                            Text("No sources yet")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 8)
+                                .padding(.leading, 18)
+                        } else {
+                            ForEach(sources, id: \.name) { source in
+                                sourceBlock(source)
+                                    .padding(.leading, 18)
+                            }
                         }
                     }
                 }
 
-                // Sidebar is strictly a library-scope narrower (Library
-                // → Sources → Bookmarks). Thread-reopening and recent-
-                // filter recall live elsewhere: toolbar search suggestions
-                // for query recall, ⌘⇧↑/⌘⇧↓ for edge-jump navigation.
+                // Sidebar is strictly a library-scope narrower (User
+                // → Library → Sources). Thread-reopening and recent-
+                // filter recall live elsewhere: toolbar search
+                // suggestions for query recall, ⌘⇧↑/⌘⇧↓ for edge-
+                // jump navigation.
             }
             .padding(.horizontal, 6)
             .padding(.top, 10)
@@ -4348,9 +4473,30 @@ private struct DesignMockSortPicker: View {
 private struct DesignMockLayoutModePicker: View {
     @Binding var selection: DesignMockLayoutMode
 
+    /// Cases the segmented picker exposes. Phase 4 dropped `.stats`
+    /// off the toolbar — Dashboard is no longer "another way to look
+    /// at the conversation list" in the way Table / Default / Viewer
+    /// are; it's a derived aggregate view. Splitting it out of the
+    /// picker (it's still reachable via the sidebar Dashboard row
+    /// and ⌘4) keeps the segmented control's mental model unified
+    /// around layout-of-the-conversation-list.
+    ///
+    /// Note: the Phase 4 spec mentioned `.focus` as a fourth picker
+    /// case, but `DesignMockLayoutMode` does not currently define
+    /// `.focus` — that case lives only on the canonical
+    /// `MiddlePaneMode` (Sources/Views/Shared/MiddlePaneMode.swift)
+    /// and is unimplemented in the production design-mock root.
+    /// Adding a `.focus` segment without rendering support would
+    /// produce a dead button. Keeping the picker at the three
+    /// implemented cases avoids that mismatch; the future
+    /// "implement .focus in DesignMock" task tracks separately.
+    private static let segmentedCases: [DesignMockLayoutMode] = [
+        .table, .default, .viewer
+    ]
+
     var body: some View {
         Picker("Layout", selection: $selection) {
-            ForEach(DesignMockLayoutMode.allCases) { mode in
+            ForEach(Self.segmentedCases) { mode in
                 Image(systemName: mode.symbol)
                     .accessibilityLabel(Text(mode.title))
                     .tag(mode)
@@ -4489,6 +4635,8 @@ private struct DesignMockSidebarItem: Identifiable {
         case all
         case archiveDB
         case bookmarks
+        case wikis
+        case dashboard
         case source(String)
         case model(source: String, model: String)
         case tag(String)
@@ -4517,6 +4665,35 @@ private struct DesignMockSidebarItem: Identifiable {
         kind: .bookmarks
     )
 
+    /// Future M.Wiki integration entry point. Phase 4 surfaces the row
+    /// in the sidebar's "User" section, but the middle pane only shows
+    /// a `ContentUnavailableView` placeholder — the real wiki UI is on
+    /// a later phase backlog. Sits next to Bookmarks because both are
+    /// "user-authored / user-curated" surfaces, distinct from the
+    /// imported-archive structure under Library.
+    static let wikis = DesignMockSidebarItem(
+        id: "wikis",
+        title: "Wikis",
+        subtitle: nil,
+        systemImage: "books.vertical",
+        kind: .wikis
+    )
+
+    /// Dashboard / Stats entry point. Clicking flips the middle pane
+    /// to `.stats` mode so the user lands on the chart stack
+    /// regardless of what layout they were in. ⌘4 is the keyboard
+    /// equivalent — both routes converge on the same selection +
+    /// layout state. Ships in the "User" section because it's a
+    /// derived view the user opens on demand, not a scoping facet
+    /// like the source filters under Library.
+    static let dashboard = DesignMockSidebarItem(
+        id: "dashboard",
+        title: "Dashboard",
+        subtitle: nil,
+        systemImage: "chart.bar.xaxis",
+        kind: .dashboard
+    )
+
     /// Consolidated archive entry point. Clicking it surfaces the
     /// Drop-folder configuration, the vault snapshot + intake timeline,
     /// and the per-snapshot file list in a single three-pane layout.
@@ -4539,6 +4716,8 @@ private struct DesignMockSidebarItem: Identifiable {
         guard let id else { return .unknown }
         if id == allThreads.id { return .all }
         if id == bookmarks.id { return .bookmarks }
+        if id == wikis.id { return .wikis }
+        if id == dashboard.id { return .dashboard }
         if id == archiveDB.id { return .archiveDB }
         if id.hasPrefix("tag-") {
             return .tag(String(id.dropFirst("tag-".count)))
