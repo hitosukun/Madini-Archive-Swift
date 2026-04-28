@@ -1270,6 +1270,14 @@ struct DesignMockRootView: View {
             drillOutClosure = {
                 layoutBinding.wrappedValue = .default
             }
+
+        case .stats:
+            // Dashboard sits outside the drill chain entirely. ⌘← /
+            // ⌘→ have no meaning here — exiting Stats is always
+            // explicit (⌘1 / ⌘2 / ⌘3 to switch layout, or sidebar
+            // navigation to a non-Dashboard row).
+            drillInClosure = nil
+            drillOutClosure = nil
         }
 
         // Enable "Delete Snapshot…" only when:
@@ -1512,6 +1520,31 @@ struct DesignMockRootView: View {
                 // toolbar field is purely a library narrow.
                 readerPane(inThreadSearch: nil)
             }
+        case .stats:
+            // Phase 2 commit 4: scaffolding only. The real
+            // `StatsContentPane` lands in commit 5; for now the
+            // middle column shows an explicit placeholder so the
+            // exhaustive switch compiles and ⌘4 has somewhere
+            // visible to land while the chart UI is still under
+            // construction.
+            NavigationSplitView {
+                sidebar
+            } content: {
+                ContentUnavailableView(
+                    "Dashboard",
+                    systemImage: "chart.bar.xaxis",
+                    description: Text("StatsContentPane wires up in the next commit.")
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .navigationSplitViewColumnWidth(
+                    min: Self.centerWidthMin,
+                    ideal: currentCenterIdeal,
+                    max: Self.centerWidthMax
+                )
+            } detail: {
+                readerPane(inThreadSearch: nil)
+            }
+            .id("stats")
         }
     }
 
@@ -4518,6 +4551,15 @@ enum DesignMockLayoutMode: String, CaseIterable, Identifiable {
     case table
     case `default`
     case viewer
+    /// Dashboard / Stats — bounded aggregates over the active filter.
+    /// Reached from the toolbar picker, ⌘4 (View → Layout menu), and
+    /// (eventually) the sidebar `Dashboard` row. Sits outside the
+    /// `table → default → viewer → focus` swipe cascade — the
+    /// `MiddlePaneMode` companion enum keeps `.stats` idempotent for
+    /// `stepTowardFocus` / `stepTowardOverview`, and this layout
+    /// mirrors that policy: the user enters / leaves Dashboard via a
+    /// named action, never via a horizontal swipe.
+    case stats
 
     var id: String { rawValue }
 
@@ -4526,6 +4568,7 @@ enum DesignMockLayoutMode: String, CaseIterable, Identifiable {
         case .table: return "Table"
         case .default: return "Default"
         case .viewer: return "Viewer"
+        case .stats: return "Dashboard"
         }
     }
 
@@ -4534,6 +4577,7 @@ enum DesignMockLayoutMode: String, CaseIterable, Identifiable {
         case .table: return "tablecells"
         case .default: return "rectangle.split.3x1"
         case .viewer: return "doc.plaintext"
+        case .stats: return "chart.bar.xaxis"
         }
     }
 }

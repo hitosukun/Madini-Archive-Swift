@@ -263,6 +263,12 @@ struct AppCommands: Commands {
             }
             .keyboardShortcut("3", modifiers: .command)
             .disabled(shell == nil)
+
+            Button("Dashboard Layout") {
+                shell?.setLayout(.stats)
+            }
+            .keyboardShortcut("4", modifiers: .command)
+            .disabled(shell == nil)
         }
 
         // Library menu — thread-level navigation + reload. Lives at
