@@ -514,6 +514,72 @@ struct SourceModelFacet: Sendable, Hashable {
     let count: Int
 }
 
+// MARK: - Stats / Dashboard DTOs
+//
+// All five Dashboard charts are bounded aggregates over the active
+// `ArchiveSearchFilter`. The DTOs are intentionally Plain Old Swift —
+// no GRDB types reach the view layer, matching the AGENTS.md
+// repository pattern.
+//
+// Date representation follows the existing repo convention: short ISO
+// 8601 strings (`"YYYY-MM-DD"` for daily buckets, `"YYYY-MM"` for
+// monthly). The Stats path computes both via SQLite's `date()` /
+// `strftime()` over the `primary_time` COALESCE expression with the
+// `'localtime'` modifier — the "blue tile" timezone bug the SPEC
+// calls out is structurally prevented by always passing through
+// `'localtime'` at the SQL boundary, never converting in Swift.
+
+/// One bucket in the source-distribution chart (Stats view).
+/// `label` is the canonical source name (`"chatgpt"`, `"claude"`,
+/// `"gemini"`); markdown rows are filtered out at the WHERE level
+/// because Dashboard treats markdown imports as non-conversational
+/// content.
+struct SourceCount: Sendable, Hashable {
+    let label: String
+    let count: Int
+}
+
+/// One bucket in the model-distribution chart (Stats view).
+/// `label` is the model name; conversations whose `model` column is
+/// NULL or whitespace collapse into the single label `"Unknown"` so
+/// the chart never grows an unbounded "blank" slice.
+struct ModelCount: Sendable, Hashable {
+    let label: String
+    let count: Int
+}
+
+/// One column in the monthly-totals bar chart (Stats view).
+/// `yearMonth` is `"YYYY-MM"`. Both metrics travel together on the
+/// same DTO so the view's series-toggle Picker can flip between
+/// "conversations / month" and "prompts / month" without re-querying.
+struct MonthlyCount: Sendable, Hashable {
+    let yearMonth: String
+    let conversationCount: Int
+    let promptCount: Int
+}
+
+/// One cell in the daily heatmap (GitHub-contributions style).
+/// `date` is `"YYYY-MM-DD"` in localtime. `promptCount` is `COUNT()`
+/// over `messages.role = 'user'` joined to the active conversation
+/// scope — the per-message timestamp gap (Phase 0 finding: messages
+/// has no timestamp column) means every prompt within a conversation
+/// is bucketed by the conversation's `primary_time`.
+struct DailyCount: Sendable, Hashable {
+    let date: String
+    let promptCount: Int
+}
+
+/// One cell in the hour × weekday heatmap (Stats view).
+/// `weekday` is `0…6` (Sunday = 0, matches `strftime('%w')`),
+/// `hour` is `0…23` in localtime. `count` follows the same
+/// "all prompts within a conversation share the conversation's
+/// primary_time" rule as `DailyCount`.
+struct HourWeekdayCount: Sendable, Hashable {
+    let weekday: Int
+    let hour: Int
+    let count: Int
+}
+
 enum ProjectOrigin: String, Codable, Hashable, Sendable {
     case canonicalImport = "canonical_import"
     case userCreated = "user_created"
@@ -840,6 +906,39 @@ protocol RawAssetResolver: Sendable {
         offset: Int,
         limit: Int
     ) async throws -> [RawAssetHit]
+}
+
+/// Aggregations over the active `ArchiveSearchFilter` for the
+/// Dashboard / Stats middle-pane mode. Every call returns a bounded
+/// list (top-N for category breakdowns, fixed shape for time-axis
+/// charts) so the view layer can render without virtualization.
+///
+/// All implementations must be pure aggregations — they never write
+/// to the DB, never persist intermediates. Per AGENTS.md, Stats is a
+/// derived view.
+protocol StatsRepository: Sendable {
+    /// Conversation count per source. Markdown is excluded at the
+    /// WHERE level (consistent with the conversation list and search
+    /// paths). Sorted by count desc, label asc as a tie-breaker.
+    func sourceBreakdown(filter: ArchiveSearchFilter) async throws -> [SourceCount]
+    /// Conversation + prompt count per `YYYY-MM`. Bounded to the
+    /// most recent 24 months in the result set so the view's bar
+    /// chart renders predictably; older buckets are still queried
+    /// but only the trailing 24 are returned.
+    func monthlyBreakdown(filter: ArchiveSearchFilter) async throws -> [MonthlyCount]
+    /// Prompt count per `YYYY-MM-DD` localtime. Bounded to the most
+    /// recent 365 days. Used for the GitHub-contributions style
+    /// daily heatmap.
+    func dailyHeatmap(filter: ArchiveSearchFilter) async throws -> [DailyCount]
+    /// Prompt count per (weekday, hour) localtime. Returns up to
+    /// 7 × 24 = 168 cells; missing cells are zero by convention
+    /// (the view fills them in).
+    func hourWeekdayHeatmap(filter: ArchiveSearchFilter) async throws -> [HourWeekdayCount]
+    /// Conversation count per model name, with NULL / blank model
+    /// folded into the `"Unknown"` bucket. Top 10 only — model names
+    /// have a long tail (every quarter ships new variants) and the
+    /// chart can't render 60+ rows usefully.
+    func modelBreakdown(filter: ArchiveSearchFilter) async throws -> [ModelCount]
 }
 
 protocol BookmarkRepository: Sendable {

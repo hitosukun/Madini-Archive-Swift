@@ -19,6 +19,7 @@ final class AppServices: ObservableObject {
     let bookmarks: any BookmarkRepository
     let tags: any TagRepository
     let views: any ViewService
+    let stats: any StatsRepository
     let dataSource: DataSource
 
     enum DataSource {
@@ -94,6 +95,7 @@ final class AppServices: ObservableObject {
         bookmarks: any BookmarkRepository,
         tags: any TagRepository,
         views: any ViewService,
+        stats: any StatsRepository,
         dataSource: DataSource
     ) {
         self.conversations = conversations
@@ -108,6 +110,7 @@ final class AppServices: ObservableObject {
         self.bookmarks = bookmarks
         self.tags = tags
         self.views = views
+        self.stats = stats
         self.dataSource = dataSource
     }
 
@@ -142,6 +145,7 @@ final class AppServices: ObservableObject {
                     bookmarks: GRDBBookmarkRepository(dbQueue: dbQueue),
                     tags: GRDBTagRepository(dbQueue: dbQueue),
                     views: GRDBViewService(dbQueue: dbQueue),
+                    stats: GRDBStatsRepository(dbQueue: dbQueue),
                     dataSource: .database(path: dbPath)
                 )
                 return
@@ -166,6 +170,7 @@ final class AppServices: ObservableObject {
             bookmarks: MockBookmarkRepository(),
             tags: MockTagRepository(),
             views: MockViewService(),
+            stats: MockStatsRepository(),
             dataSource: .mock
         )
     }
