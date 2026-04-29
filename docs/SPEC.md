@@ -220,9 +220,41 @@ def insertion_sort(a):
 
 ### 5.8 Dashboard (Stats モード)
 
-中ペインの 5 番目のモード `.stats`。検索バーとサイドバー選択を結合した `ArchiveSearchFilter` をスコープとして受け取り、その範囲で集計を可視化する。
+中ペインの 5 番目のモード `.stats`。他のレイアウト(`.table` / `.default` / `.viewer`)とは性質が異なる**例外状態**として扱う(Phase 6)。検索バーとサイドバー選択を結合した `ArchiveSearchFilter` をスコープとして受け取り、その範囲で集計を可視化するという点では他モードと同じ計算経路を共有するが、入退場の規約は別建て。
 
 **Phase 5 (γ) の UX**: Stats モードは中央ペインに 5 種類のチャートのコンパクトサマリを表示し、ユーザーが選択したチャートを右ペインに拡大表示する。サイドバーの複数選択チェックボックスや検索バー入力は中央と右ペインの両方に filter として反映される。Stats モードから会話一覧への遷移はサイドバー(All Threads / source 選択)経由のみ — チャート上のデータポイントクリックは表示の一部であって導線ではない(Phase 5 (β) でドリルダウンを実装したが、月別棒クリック → サイドバー操作のクラッシュおよびジェンナの意図と異なる UX 経路だったため、(γ) で削除済)。
+
+**Phase 6 — `.stats` モードの位置づけ(入退場ルール)**:
+
+`.stats` は他のレイアウトとは性質が異なる「例外状態」として扱う。
+
+入場ルール:
+
+- 他レイアウトから `.stats` への遷移時(⌘4 / サイドバー Dashboard クリック / View → Layout → Dashboard / レイアウトピッカー)、`composedQuery` を構成する **すべての filter を完全リセット** する:
+  - 検索バーの `searchText` 全体(キーワード、DSL ディレクティブ全部)
+  - `excludedSources` / `excludedModels`(サイドバーチェックボックス由来の `-source:` / `-model:` トークン)
+  - `bookmarksOnly`(`.bookmarks` 経路から引きずる可能性のあるフラグ)
+  - `tagName`、`sources`、`models` 等の `composedQuery` に流れる全 filter
+- これにより Bookmarks の `bookmarksOnly` や source 排除が引きずられて Stats が異常な集計を実行する事故を構造的に防ぐ
+- ユーザーは `.stats` モード内でサイドバーチェックボックスや検索バーを使って再度 narrow できる(filter チャネルは閉じていない、画面遷移チャネルだけが「リセット入場」)
+
+退場ルール(Stats ロック):
+
+- 中央チャート未選択時(`selectedStatsChart == nil`、右ペインがプレースホルダ)は、⌘1 / ⌘2 / ⌘3 やサイドバー項目クリックで他レイアウトへ通常通り遷移可能
+- 中央チャート選択中(`selectedStatsChart != nil`、右ペインが詳細表示中)は、すべてのレイアウト遷移操作を **無視** する:
+  - ⌘1 / ⌘2 / ⌘3 → 何も起きない
+  - View → Layout メニューの Stats 以外 → 何も起きない
+  - レイアウトピッカーの他セグメントクリック → 何も起きない
+  - サイドバーの Wikis / Bookmarks / archive.db / All Threads / source / model 行クリック → 何も起きない
+- サイドバーのチェックボックス操作(filter 反映)と検索バー入力は **ロック中も有効** — これらは `searchText` のみを書き換え、`selectedSidebarItemID` / `selectedLayoutMode` には触らないので構造的に画面遷移を起こさない
+- 中央チャートを再クリックすると `selectedStatsChart = nil` になり、ロックが即時解除される(Phase 5 γ 既存挙動)
+
+設計意図:
+
+- `.stats` は「集計を見るための独立画面」であり、他レイアウトの会話一覧と同じ filter スコープを共有しない
+- ユーザーが詳細チャートを見ている最中はその状態を保護する(意図しない離脱を防ぐ)
+- ロック中の遷移ブロックは **binding setter で吸収** する(`.onChange` の巻き戻しではない)。Phase 5.1 で発生した「state 連鎖を `.onChange` で打ち消すと SwiftUI のバッチング内で再帰してクラッシュ」を構造的に避ける
+- 視覚フィードバック(メニューのグレーアウト、トースト等)は出さない — Mac の慣習に準拠して「できない操作はそもそも反応しない」
 
 実装する集計 (Phase 2 で 5 種すべて実装済):
 
@@ -243,6 +275,7 @@ def insertion_sort(a):
 
 - **集計値は DB に保存しない**。フィルタが変わるたびにクエリで再生成する純粋な派生ビュー
 - **markdown source は常時除外**。Dashboard は「LLM 会話ログの集計ビュー」として意味づける
+- **集計の母集合は user prompt を持つ会話に限定**(Phase 7)。`messages` に `role='user'` の行が 1 件以上ある会話のみを 5 種チャートすべてで集計対象とする。`sourceBreakdown` / `modelBreakdown` / `monthlyBreakdown` には `EXISTS (SELECT 1 FROM messages mm WHERE mm.conv_id = c.id AND mm.role = 'user')` を WHERE に追加し、`dailyHeatmap` / `hourWeekdayHeatmap` は元から `m.role='user'` で JOIN しているため同じ母集合を共有する。`conversations` 側の正規データには触らず、純粋に集計時の母集合定義として除外する。**根拠**: assistant のみ(user prompt 不在)の会話レコードが混入していた場合、月別チャートのプロンプト数系列に `prompt_count = 0` のバーが現れ、macOS Tahoe 26.4.1 の SwiftUI Charts framework が `Charts: Falling back to a fixed dimension size for a mark.` を出して layout 再帰クラッシュ(trace trap)に陥る現象を実機で確認した。意味的にも「user prompt が無い」会話を「会話」として集計するのは不適切なので、構造的にも防御的にも正しい絞り込み
 - **グラフは Apple Swift Charts のみ使用**、外部依存なし
 - **タイムゾーンは常に `'localtime'`**。"青いタイル問題" (UTC ベースで深夜のメッセージが翌日のセルに流れる) の再発を構造的に防ぐ
 - **日付範囲フィルタが効いた時は Phase 0.5 の expression index を経由する**(EXPLAIN QUERY PLAN で確認済 — `idx_conversations_primary_time_expr`)。フィルタ無しの全件 GROUP BY は SCAN になるが、これは GROUP BY の本質的な制約で許容

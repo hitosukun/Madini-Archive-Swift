@@ -44,6 +44,25 @@ final class GRDBStatsRepository: StatsRepository, @unchecked Sendable {
             // Per the WHERE clause, markdown rows are already gone;
             // we additionally drop NULL / blank source rows here so
             // the chart's "label" axis stays meaningful.
+            //
+            // Phase 7: also drop conversations that don't have at
+            // least one `role='user'` message. The `daily` and
+            // `hourWeekday` queries already join on `m.role='user'`
+            // so they implicitly skip these rows; we mirror that
+            // filter here so all five charts share an identical
+            // "the conversation must contain a user prompt"
+            // mass-set definition. The trigger was a single
+            // ChatGPT export with `model='gpt-4o'` whose `messages`
+            // table held only an assistant row (user prompt
+            // missing from the source export). On macOS Tahoe
+            // 26.4.1 SwiftUI Charts the resulting "0-prompt" bucket
+            // sent the monthly bar's prompt-count series into a
+            // layout-recursion crash ("Charts: Falling back to a
+            // fixed dimension size for a mark." → trace trap). The
+            // canonical row stays in `conversations` (originals are
+            // preserved per AGENTS.md), it just no longer counts
+            // toward Stats — a "conversation" with no user prompt
+            // isn't a conversation by Stats's definition anyway.
             let rows = try Row.fetchAll(
                 db,
                 sql: """
@@ -54,6 +73,10 @@ final class GRDBStatsRepository: StatsRepository, @unchecked Sendable {
                     \(whereSQL)
                       AND c.source IS NOT NULL
                       AND TRIM(c.source) <> ''
+                      AND EXISTS (
+                          SELECT 1 FROM messages mm
+                          WHERE mm.conv_id = c.id AND mm.role = 'user'
+                      )
                     GROUP BY c.source
                     ORDER BY count DESC, label ASC
                     """,
@@ -78,6 +101,10 @@ final class GRDBStatsRepository: StatsRepository, @unchecked Sendable {
             // common). Top 10 cap keeps the chart legible — the
             // long tail of model variants would otherwise produce
             // 60+ slices.
+            // Phase 7: see `sourceBreakdown` for the rationale —
+            // exclude conversations with no `role='user'` message so
+            // the model breakdown shares the same mass-set as the
+            // user-prompt-driven heatmaps.
             let rows = try Row.fetchAll(
                 db,
                 sql: """
@@ -89,6 +116,10 @@ final class GRDBStatsRepository: StatsRepository, @unchecked Sendable {
                         COUNT(*) AS count
                     FROM conversations c
                     \(whereSQL)
+                      AND EXISTS (
+                          SELECT 1 FROM messages mm
+                          WHERE mm.conv_id = c.id AND mm.role = 'user'
+                      )
                     GROUP BY label
                     ORDER BY count DESC, label ASC
                     LIMIT 10
@@ -110,6 +141,16 @@ final class GRDBStatsRepository: StatsRepository, @unchecked Sendable {
             // LIMIT 24, then reverse in Swift so callers receive
             // chronological order — the chart x-axis reads
             // left-to-right.
+            // Phase 7: see `sourceBreakdown` for the rationale —
+            // exclude conversations with no `role='user'` message
+            // so the monthly chart's two series (`conversation_count`
+            // / `prompt_count`) share the same mass-set as the
+            // heatmaps, AND so no month can produce a `prompt_count
+            // = 0` bar from a conv that contributes only to the
+            // conversation count. The `prompt_count = 0` bar in the
+            // SwiftUI Charts prompt-count toggle was the specific
+            // input that triggered the macOS Tahoe 26.4.1 layout
+            // recursion crash.
             let rows = try Row.fetchAll(
                 db,
                 sql: """
@@ -121,6 +162,10 @@ final class GRDBStatsRepository: StatsRepository, @unchecked Sendable {
                     LEFT JOIN messages m ON m.conv_id = c.id
                     \(whereSQL)
                       AND \(SearchFilterSQL.primaryTimeSQL) IS NOT NULL
+                      AND EXISTS (
+                          SELECT 1 FROM messages mm
+                          WHERE mm.conv_id = c.id AND mm.role = 'user'
+                      )
                     GROUP BY year_month
                     ORDER BY year_month DESC
                     LIMIT 24
