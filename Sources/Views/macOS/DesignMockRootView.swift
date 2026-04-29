@@ -1081,8 +1081,8 @@ struct DesignMockRootView: View {
         .task(id: viewerOutlineLoadToken) {
             await loadViewerPromptOutlineIfNeeded()
         }
-        // Sidebar → layout sync, Phase 4. Sidebar `Dashboard` row
-        // and ⌘4 must converge on the same state: layout =
+        // Sidebar → layout sync, Phase 4 + Phase 6. Sidebar `Dashboard`
+        // row and ⌘4 must converge on the same state: layout =
         // `.stats`, sidebar selection = `.dashboard`. The setLayout
         // closure inside `shellCommandActions` handles the layout →
         // sidebar direction; this `.onChange` handles sidebar →
@@ -1090,9 +1090,36 @@ struct DesignMockRootView: View {
         // already what it would write, which prevents the two
         // observers from ping-ponging when they fire on the same
         // mutation.
+        //
+        // Phase 6 addition — when the user enters `.stats` via a
+        // sidebar Dashboard click, also wipe `searchText`. The
+        // sidebar-binding wrapper already strip-edits sidebar-
+        // conflicting DSL directives (`source:` / `-source:` etc.)
+        // when the click goes through it, but free-text keywords and
+        // tag tokens survive that strip — and any of those filters
+        // carrying into Stats was the mechanism behind the
+        // Bookmarks → Dashboard mismatch. Wiping the whole string
+        // here ensures every Dashboard entry path (mouse click here,
+        // ⌘4 / View menu / picker through `setLayout`) lands on an
+        // identical empty-filter baseline.
         .onChange(of: selectedSidebarItemID) { _, newID in
             if newID == DesignMockSidebarItem.dashboard.id {
+                if !searchText.isEmpty {
+                    searchText = ""
+                }
                 if selectedLayoutMode != .stats {
+                    // Phase 7+ — clear the Stats VM's cached
+                    // aggregations BEFORE flipping the layout. See
+                    // `StatsViewModel.resetForReentry()` for the
+                    // long-form rationale; in short, without this
+                    // the chart stack mounts with the previous
+                    // scope's data still cached, paints once, then
+                    // diffs against the freshly-fetched full-scope
+                    // data, and the SwiftUI Charts framework on
+                    // macOS Tahoe 26.4.1 hits a layout recursion on
+                    // that diff. Clearing first routes the first
+                    // paint through the loading state.
+                    statsViewModel?.resetForReentry()
                     selectedLayoutMode = .stats
                 }
             } else if selectedLayoutMode == .stats {
@@ -1102,7 +1129,13 @@ struct DesignMockRootView: View {
                 // already done this through `setLayout`; this
                 // branch is the catch-all for clicks on other
                 // sidebar items (All Threads, source rows,
-                // archive.db, etc.).
+                // archive.db, etc.). Phase 6: the Stats lock (chart
+                // pinned in detail pane) is enforced upstream in
+                // the `sidebarSelection` binding setter — by the
+                // time we observe `newID` here, the click has
+                // either been allowed through (no lock) or absorbed
+                // (lock engaged + non-Dashboard target), so this
+                // catch-all sees only valid transitions.
                 selectedLayoutMode = .default
             }
         }
@@ -1376,23 +1409,79 @@ struct DesignMockRootView: View {
         // in the sidebar, and ⌘1/⌘2/⌘3 must walk the user back to
         // All Threads if they were on Dashboard.
         let sidebarBinding = $selectedSidebarItemID
+        let searchBinding = $searchText
+        let currentChart = selectedStatsChart
+        let currentMode = selectedLayoutMode
+        // Phase 7+ — capture the Stats VM reference so the setLayout
+        // closure can clear its cached aggregations on Stats entry
+        // (see `StatsViewModel.resetForReentry()`). Capturing the
+        // optional snapshot here is safe because the VM is built
+        // once in the lazy `.task` and lives for app lifetime; if
+        // it's still nil on first ⌘4 (the lazy task hasn't fired
+        // yet), the optional-chained call no-ops and the StatsContent
+        // Pane's own `.task` will run `loadIfNeeded` instead.
+        let capturedStatsVM = statsViewModel
         return ShellCommandActions(
             currentLayout: selectedLayoutMode,
             setLayout: { newMode in
-                layoutBinding.wrappedValue = newMode
-                // Keep the sidebar / layout pair coherent. The
-                // sidebar's `.onChange` observer in the body
-                // already handles the inverse direction (sidebar
-                // → layout), so the two points of mutation
-                // converge on the same state without a
-                // ping-pong: each handler short-circuits when
-                // the value it would write is already current.
-                let currentSidebar = sidebarBinding.wrappedValue
+                // Phase 6 — Stats lock. While a chart is pinned in
+                // the detail pane, ⌘1/⌘2/⌘3 (and the picker, and the
+                // View menu) must not yank the user out of Stats. The
+                // captures above snapshot both the current mode and
+                // the chart selection at the moment ShellCommandActions
+                // was published; comparing here matches the user's
+                // mental model ("I'm looking at this chart, the menu
+                // shouldn't navigate away"). Re-clicking the chart
+                // card clears `selectedStatsChart` and re-publishes a
+                // ShellCommandActions with `currentChart == nil`,
+                // unblocking the menu without any extra wiring.
+                if currentMode == .stats && currentChart != nil
+                    && newMode != .stats {
+                    return
+                }
                 if newMode == .stats {
-                    if currentSidebar != DesignMockSidebarItem.dashboard.id {
-                        sidebarBinding.wrappedValue = DesignMockSidebarItem.dashboard.id
+                    // Phase 6 — entering `.stats` is a hard reset of
+                    // every conversation-list filter. Mirror the
+                    // `enterStatsMode()` write order (search bar →
+                    // sidebar → layout) so ⌘4 / View menu / picker
+                    // converge on the same state-machine path the
+                    // sidebar-Dashboard click takes. We can't call
+                    // the method directly because this closure
+                    // outlives `body`, so we operate on the captured
+                    // bindings instead — same effect, same order.
+                    if !searchBinding.wrappedValue.isEmpty {
+                        searchBinding.wrappedValue = ""
                     }
-                } else if currentSidebar == DesignMockSidebarItem.dashboard.id {
+                    if sidebarBinding.wrappedValue
+                        != DesignMockSidebarItem.dashboard.id {
+                        sidebarBinding.wrappedValue =
+                            DesignMockSidebarItem.dashboard.id
+                    }
+                    if layoutBinding.wrappedValue != .stats {
+                        // Phase 7+ — clear the Stats VM cache BEFORE
+                        // flipping the layout. See the matching call
+                        // in `.onChange(of: selectedSidebarItemID)`
+                        // and `StatsViewModel.resetForReentry()` for
+                        // the full rationale. Order matters: the
+                        // clear must precede the layout flip so
+                        // `StatsContentPane`'s first paint sees
+                        // `isEmpty == true` and routes through the
+                        // loading state rather than rendering with
+                        // the previous mode's filter scope cache.
+                        capturedStatsVM?.resetForReentry()
+                        layoutBinding.wrappedValue = .stats
+                    }
+                    return
+                }
+                // Leaving `.stats` for `.table / .default / .viewer`
+                // doesn't reset filters — the user kept them clean
+                // while in Stats (or re-narrowed there), and carrying
+                // that scope back into the conversation list is the
+                // natural continuation. Just flip the layout and
+                // walk the sidebar off Dashboard.
+                layoutBinding.wrappedValue = newMode
+                let currentSidebar = sidebarBinding.wrappedValue
+                if currentSidebar == DesignMockSidebarItem.dashboard.id {
                     sidebarBinding.wrappedValue = DesignMockSidebarItem.allThreads.id
                 }
             },
@@ -1835,6 +1924,27 @@ struct DesignMockRootView: View {
         let sidebarSelection = Binding<DesignMockSidebarItem.ID?>(
             get: { selectedSidebarItemID },
             set: { newValue in
+                // Phase 6 — Stats lock. When a chart is pinned in the
+                // detail pane (`statsLockEngaged`), sidebar clicks on
+                // anything other than Dashboard itself are absorbed
+                // here at the binding-write boundary. We deliberately
+                // block at the SET stage rather than letting the
+                // write land and then bouncing it back from
+                // `.onChange` — the bounce-back pattern was the
+                // structural cause of Phase 5.1's Dashboard-lock
+                // crashes (state ping-pong inside a single SwiftUI
+                // batch). Absorbing the write keeps the
+                // batched-mutation count at zero, which is the only
+                // way to be sure the connectivity stays stable
+                // through rapid clicks. Dashboard-targeted clicks
+                // and nil-clears (deselect) are still allowed
+                // through so the user can re-select the chart card
+                // they're already looking at without surprise.
+                if statsLockEngaged,
+                   let newValue,
+                   newValue != DesignMockSidebarItem.dashboard.id {
+                    return
+                }
                 if let newValue, newValue != selectedSidebarItemID {
                     searchText = DesignMockQueryLanguage
                         .stripSidebarConflictingDirectives(from: searchText)
@@ -2134,6 +2244,25 @@ struct DesignMockRootView: View {
         // dedup and move-to-top ordering at record time, so the only
         // work here is bounding the list for the dropdown.
         Array(recentInThreadQueriesStore.queries.prefix(12))
+    }
+
+    /// Phase 6 — guard helper for the "Stats lock". When the user has
+    /// pinned a chart in the detail pane (`selectedStatsChart != nil`)
+    /// the workspace treats `.stats` as locked: ⌘1 / ⌘2 / ⌘3 and
+    /// non-Dashboard sidebar clicks are ignored so the user can't
+    /// accidentally evict their detail view. Re-clicking the active
+    /// chart card clears `selectedStatsChart` (Phase 5 γ wiring) and
+    /// the lock lifts. No visual feedback (greyed menus, toast, etc.)
+    /// — the Mac convention is "operations that aren't currently
+    /// possible simply don't react".
+    ///
+    /// Note: filter operations (sidebar checkbox toggles, search bar
+    /// typing) are NOT blocked. Those write to `searchText` only —
+    /// they never touch `selectedSidebarItemID` or
+    /// `selectedLayoutMode`, so they can't navigate the user out of
+    /// `.stats`. The lock therefore protects navigation alone.
+    private var statsLockEngaged: Bool {
+        selectedLayoutMode == .stats && selectedStatsChart != nil
     }
 
     private var composedQuery: DesignMockDataStore.FetchQuery {

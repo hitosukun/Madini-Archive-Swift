@@ -77,6 +77,48 @@ final class StatsViewModel {
         scheduleRefresh()
     }
 
+    /// Phase 7+ — clear cached aggregations and force the next render
+    /// onto the loading state. Called from the layout-mode entry path
+    /// (`.default → .stats` or sidebar Dashboard click) BEFORE
+    /// `StatsContentPane` mounts, so the chart stack never paints
+    /// once with the previous mode's filter scope data and then
+    /// again with the freshly-fetched full-scope data.
+    ///
+    /// **Why this is necessary even with Phase 6's filter reset.**
+    /// Phase 6 wipes `searchText` / `bookmarksOnly` etc. so
+    /// `composedQuery` converges to the unfiltered baseline, and the
+    /// `composedQuery` `.onChange` listener writes the new filter
+    /// onto this VM, which kicks off a fresh fetch. But that fetch
+    /// is async — until it completes, this VM still holds the
+    /// PREVIOUS scope's cached arrays
+    /// (`sourceCounts`/`modelCounts`/...). When Phase 6 then sets
+    /// `selectedLayoutMode = .stats` in the same SwiftUI batch,
+    /// `StatsContentPane` mounts and its body's `isLoading &&
+    /// isEmpty` check evaluates to `false` (data isn't empty — it's
+    /// stale-but-present), so the body falls through to
+    /// `chartsList`. Charts render with the small Bookmarks-scope
+    /// dataset, then the async fetch completes with the full-scope
+    /// dataset, and the diff between the two renders sends the
+    /// macOS Tahoe 26.4.1 SwiftUI Charts framework into a layout
+    /// recursion (`Charts +0x2b6410` self-call, `Charts +0x290acc`
+    /// trace trap — exact same crash signature as the prompt-count
+    /// = 0 trigger Phase 7's EXISTS filter handles).
+    ///
+    /// Clearing here makes `isEmpty` true at mount time, which
+    /// routes the body to `loadingState`. The single subsequent
+    /// transition is `empty → full`, not `stale → full`, and Charts
+    /// has no diff to recurse on.
+    func resetForReentry() {
+        sourceCounts = []
+        modelCounts = []
+        monthlyCounts = []
+        dailyCounts = []
+        hourWeekdayCounts = []
+        isLoading = true
+        errorText = nil
+        scheduleRefresh()
+    }
+
     private func scheduleRefresh() {
         fetchGeneration += 1
         let generation = fetchGeneration
