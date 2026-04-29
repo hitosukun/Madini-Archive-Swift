@@ -220,20 +220,22 @@ def insertion_sort(a):
 
 中ペインの 5 番目のモード `.stats`。検索バーとサイドバー選択を結合した `ArchiveSearchFilter` をスコープとして受け取り、その範囲で集計を可視化する。
 
+**Phase 5 (γ) の UX**: Stats モードは中央ペインに 5 種類のチャートのコンパクトサマリを表示し、ユーザーが選択したチャートを右ペインに拡大表示する。サイドバーの複数選択チェックボックスや検索バー入力は中央と右ペインの両方に filter として反映される。Stats モードから会話一覧への遷移はサイドバー(All Threads / source 選択)経由のみ — チャート上のデータポイントクリックは表示の一部であって導線ではない(Phase 5 (β) でドリルダウンを実装したが、月別棒クリック → サイドバー操作のクラッシュおよびジェンナの意図と異なる UX 経路だったため、(γ) で削除済)。
+
 実装する集計 (Phase 2 で 5 種すべて実装済):
 
-1. **日付別ヒートマップ** — `primary_time` を `'localtime'` で日付化。プロンプト数 (role='user') を集計、過去 365 日上限
+1. **日付別ヒートマップ** — `primary_time` を `'localtime'` で日付化。プロンプト数 (role='user') を集計、過去 365 日上限。中央ペインは過去 90 日のコンパクト表示、右ペインで全 365 日
 2. **時刻 × 曜日ヒートマップ** — 7 行 × 24 列。1 つの会話の全プロンプトはその会話の代表時刻のセルに集計される (messages にメッセージ単位の時刻カラムが無い制約)
 3. **ソース別棒グラフ** — `conversations.source` で GROUP BY、ブランドカラー (`SourceAppearance`) 流用
-4. **モデル別棒グラフ** — `conversations.model` で GROUP BY、空欄は `"Unknown"` に集約、上位 10 件
+4. **モデル別棒グラフ** — `conversations.model` で GROUP BY、空欄は `"Unknown"` に集約。中央ペインは上位 10 件、右ペインは全件
 5. **月別棒グラフ** — `strftime('%Y-%m', primary_time, 'localtime')` で GROUP BY、会話数 / プロンプト数の 2 系列を Picker で切替、過去 24 ヶ月上限
 
 実装の入口:
 
 - Repository: `StatsRepository` (`Sources/Core/Repositories.swift`) + `GRDBStatsRepository` (`Sources/Database/GRDBStatsRepository.swift`)
 - ViewModel: `StatsViewModel` (`@Observable`、`Sources/ViewModels/StatsViewModel.swift`)
-- View: `StatsContentPane` (`Sources/Views/macOS/StatsContentPane.swift`)
-- WHERE 組み立ては `SearchFilterSQL.makeWhereClause` を経由(会話一覧 / 検索と完全共通)
+- View: `StatsContentPane`(中央コンパクト)+ `StatsDetailPane`(右ペイン詳細、Phase 5 で追加)— 共に `Sources/Views/macOS/StatsContentPane.swift`
+- WHERE 組み立ては `SearchFilterSQL.makeWhereClause` を経由(会話一覧 / 検索 / Stats 完全共通)
 
 設計上の決定:
 

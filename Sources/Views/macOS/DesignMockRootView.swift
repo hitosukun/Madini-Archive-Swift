@@ -724,12 +724,22 @@ struct DesignMockRootView: View {
     /// the (upcoming) prompt-level bookmark surface.
     @State private var libraryViewModel: LibraryViewModel?
     /// Stats view-model. Built in the same lazy `.task` that owns
-    /// `libraryViewModel`; consumes `services.stats` plus the
-    /// `libraryViewModel.filter` snapshot so the Dashboard scope
-    /// stays in lockstep with the conversation list scope. Refresh
-    /// is debounced through `StatsViewModel.filter`'s `didSet`, so
-    /// flipping ⌘1↔⌘4 doesn't burn duplicate aggregates.
+    /// `libraryViewModel`; consumes `services.stats` plus a
+    /// `composedQuery`-derived `ArchiveSearchFilter` snapshot so
+    /// the Dashboard scope stays in lockstep with the conversation
+    /// list scope. Refresh is debounced through
+    /// `StatsViewModel.filter`'s `didSet`, so flipping ⌘1↔⌘4
+    /// doesn't burn duplicate aggregates.
     @State private var statsViewModel: StatsViewModel?
+    /// Phase 5 (γ): which Stats chart the user has selected for
+    /// the detail (right) pane. Nil = detail pane shows a
+    /// placeholder prompting the user to pick a chart. Set by
+    /// clicking a compact card in the center pane; cleared by
+    /// re-clicking the active card. Read-only with respect to the
+    /// rest of the workspace — the detail pane is a visualization,
+    /// not a navigation surface (Phase 5 (β) had drill-down here
+    /// and it was retired after a crash report).
+    @State private var selectedStatsChart: StatsChartKind?
     /// Rolling list of find-in-page queries the user ran inside an
     /// open thread. Feeds `.searchSuggestions` when the search field
     /// is acting as a thread-scoped finder (`.default` / `.viewer`
@@ -912,6 +922,18 @@ struct DesignMockRootView: View {
             if let newFilter {
                 statsViewModel?.filter = newFilter
             }
+        }
+        // Phase 5 (γ): feed Stats from the actually-active
+        // conversation filter (`composedQuery`). The legacy
+        // `.onChange` above only catches mutations to
+        // `libraryViewModel.filter`, which the DesignMock shell
+        // rarely writes — toolbar / sidebar narrowing flows
+        // through `composedQuery` instead. Without this hook,
+        // narrowing the conversation list via the source dot
+        // checkboxes or the search bar would leave Stats showing
+        // the unfiltered archive.
+        .onChange(of: composedQuery) { _, newQuery in
+            statsViewModel?.filter = archiveFilter(from: newQuery)
         }
         .task {
             // Build the shared library VM lazily — `@EnvironmentObject`
@@ -1594,16 +1616,20 @@ struct DesignMockRootView: View {
                 readerPane(inThreadSearch: nil)
             }
         case .stats:
-            // Dashboard / Stats. The middle column hosts
-            // StatsContentPane (5 bounded aggregates over the active
-            // ArchiveSearchFilter — sourceBreakdown, modelBreakdown,
-            // monthlyBreakdown, dailyHeatmap, hourWeekdayHeatmap),
-            // the right column keeps the regular reader pane so the
-            // user can leave a conversation open while glancing at
-            // the dashboard. The .id makes SwiftUI hold the chart
-            // pane's identity stable across other layout switches
-            // (Picker position, scroll, etc. survive a brief ⌘1
-            // detour).
+            // Dashboard / Stats. Phase 5 (γ): center column hosts
+            // compact summary cards (`StatsContentPane`) and the
+            // detail (right) column hosts the zoomed-in version of
+            // whichever chart the user picked. Reader content is
+            // hidden in this layout — the user came to Dashboard
+            // to look at aggregates, not to read.
+            //
+            // No drill-down: the detail pane is read-only. Phase 5
+            // (β) wired per-data-point clicks back into the
+            // conversation list (with sidebar / layout / filter
+            // mutations) and that interaction triggered a crash on
+            // month-bar click → sidebar interaction. (γ) drops the
+            // wire entirely; filter narrowing happens via the
+            // sidebar / search bar like every other surface.
             NavigationSplitView {
                 sidebar
             } content: {
@@ -1614,7 +1640,7 @@ struct DesignMockRootView: View {
                         max: Self.centerWidthMax
                     )
             } detail: {
-                readerPane(inThreadSearch: nil)
+                statsDetailContent
             }
             .id("stats")
         }
@@ -1627,7 +1653,28 @@ struct DesignMockRootView: View {
     @ViewBuilder
     private var statsContent: some View {
         if let viewModel = statsViewModel {
-            StatsContentPane(viewModel: viewModel)
+            StatsContentPane(
+                viewModel: viewModel,
+                selectedChart: $selectedStatsChart
+            )
+        } else {
+            ProgressView()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    /// Right-pane content for `.stats`. Renders the zoomed-in
+    /// version of whichever chart the user has selected. Read-only
+    /// — no per-data-point clicks fire navigation. Placeholder
+    /// before any selection, mirroring the loading fallback in
+    /// `statsContent`.
+    @ViewBuilder
+    private var statsDetailContent: some View {
+        if let viewModel = statsViewModel {
+            StatsDetailPane(
+                viewModel: viewModel,
+                chart: selectedStatsChart
+            )
         } else {
             ProgressView()
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
