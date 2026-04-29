@@ -91,6 +91,8 @@ Library
 
 ソース子項目は **複数選択チェックボックス UI**。チェック状態に応じて `source IN (…)` の集合フィルタが中ペインに伝搬する。`others` は `source NOT IN ('chatgpt', 'claude', 'gemini')` のスコープ (`markdown` は別途常時除外、Dashboard 含む)。
 
+ソース行(chatgpt / gemini / claude / others)とモデル行(gpt-4o 等)のテキスト部分は **passive** で、クリックしても画面遷移しない。filter 操作はチェックボックスでのみ行う(行の頭の色丸アイコンが checkbox を兼ねる)— これによりチェックボックスを押そうとして誤って行のテキスト領域をクリックしても画面が切り替わらない。disclosure chevron のクリックは引き続き有効で、子モデル行の展開 / 折りたたみを切り替える。Stats モードを含むすべての中ペインモードで同じ挙動。
+
 ### 3.4 Repository パターン
 
 UI / ViewModel は **protocol 経由でのみ DB にアクセスする**。GRDB 型は `Database/GRDB*.swift` と `Core/AppServices.swift` 以外に import されない。

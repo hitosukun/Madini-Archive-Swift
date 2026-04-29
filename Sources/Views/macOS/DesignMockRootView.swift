@@ -2585,10 +2585,34 @@ private struct DesignMockSidebar: View {
                 return .notApplicable
             }
         }()
+        // Phase 5.2: source / model rows are passive on the
+        // text-area click. The outer Button is still rendered (so
+        // the inner checkbox + chevron Buttons keep their hit
+        // priority via SwiftUI's nested-Button event capture and
+        // the row keeps its layout / hover affordance), but its
+        // action is a no-op for `.source` / `.model` kinds. Reason:
+        // users were missing the small checkbox glyph and hitting
+        // the row body, which writes `selection = source-N` →
+        // composedQuery picks `.source(name)` → workspace flips to
+        // `.default` from wherever they were. Filter narrowing
+        // belongs to the checkbox channel; the row-text channel
+        // had become a footgun. Other row kinds (allThreads,
+        // wikis, bookmarks, dashboard, archiveDB) keep their
+        // selection-on-tap behaviour because those rows ARE
+        // navigation entry points — clicking them is the user
+        // saying "take me there".
+        let isPassiveRow: Bool = {
+            switch item.kind {
+            case .source, .model: return true
+            default: return false
+            }
+        }()
         HoverableRow(isSelected: selection == item.id) { isHovering in
             let fill = selectionFill(for: item.id, isHovering: isHovering)
             Button {
-                selection = item.id
+                if !isPassiveRow {
+                    selection = item.id
+                }
             } label: {
                 HStack(spacing: 6) {
                     rowIcon(item: item, toggle: toggle, state: state)
