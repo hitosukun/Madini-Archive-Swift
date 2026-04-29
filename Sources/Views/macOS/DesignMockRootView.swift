@@ -2005,7 +2005,26 @@ struct DesignMockRootView: View {
                 // produce a confusing "this dot is on but the
                 // sidebar's still showing only the other source"
                 // state.
-                if selectedSidebarItemID != DesignMockSidebarItem.allThreads.id {
+                //
+                // Phase 8 — skip the reset when the user is in
+                // `.stats` mode. The Phase 6 `sidebarSelection`
+                // wrapper protects navigation writes that go
+                // through the List binding, but THIS write happens
+                // directly from inside the toggle callback and
+                // bypasses the wrapper. Without this guard, every
+                // checkbox click in Dashboard mode wrote
+                // `selectedSidebarItemID = .allThreads.id`, which
+                // tripped the `.onChange` catch-all that bumps the
+                // layout to `.default` (line ~1125), evicting the
+                // user from Stats mid-narrowing. Suppressing the
+                // reset only when `.stats` is active leaves the
+                // Phase 5.2 multi-select rationale intact for
+                // every other layout (.table / .default / .viewer),
+                // and keeps the user inside Stats while the DSL
+                // edits below propagate through `composedQuery` to
+                // refetch the chart data.
+                if selectedLayoutMode != .stats,
+                   selectedSidebarItemID != DesignMockSidebarItem.allThreads.id {
                     selectedSidebarItemID = DesignMockSidebarItem.allThreads.id
                 }
                 // Determine the source's current visual state from
@@ -2040,7 +2059,14 @@ struct DesignMockRootView: View {
                 searchText = text
             },
             onToggleModel: { sourceName, modelName in
-                if selectedSidebarItemID != DesignMockSidebarItem.allThreads.id {
+                // Phase 8 — same `.stats`-mode skip as
+                // `onToggleSource` above. The model-row checkbox
+                // path also bypasses the `sidebarSelection` wrapper,
+                // so without this guard a Dashboard-mode model
+                // toggle drops the user out of Stats via the
+                // `.onChange` `.default` bump.
+                if selectedLayoutMode != .stats,
+                   selectedSidebarItemID != DesignMockSidebarItem.allThreads.id {
                     selectedSidebarItemID = DesignMockSidebarItem.allThreads.id
                 }
                 let parsed = DesignMockQueryLanguage.parse(searchText)
@@ -2089,7 +2115,8 @@ struct DesignMockRootView: View {
                     )
                 }
                 searchText = text
-            }
+            },
+            isDashboardActive: selectedLayoutMode == .stats
         )
         // Finder-parity minimum (~150pt). All sidebar row kinds —
         // `sidebarRow` (icon + title + optional subtitle) and the
@@ -2488,6 +2515,17 @@ private struct DesignMockSidebar: View {
     /// tripping through name lookups in the shell.
     let onToggleSource: (String) -> Void
     let onToggleModel: (_ sourceName: String, _ modelName: String) -> Void
+    /// Phase 8 — `true` while the workspace is in `.stats` mode.
+    /// Source / model rows render a faint accent tint behind the
+    /// checkbox row body to surface the affordance "these
+    /// checkboxes filter the current Dashboard scope" without
+    /// adding a label or disrupting the existing hover / selection
+    /// chrome. Navigation rows (Wikis / Bookmarks / archive.db /
+    /// All Threads / Dashboard) deliberately do NOT highlight —
+    /// clicking those still navigates out of `.stats`, which is
+    /// the OPPOSITE behaviour from filter rows. Painting them with
+    /// the same tint would conflate two semantics.
+    let isDashboardActive: Bool
     /// Which sources are currently expanded. We seed from `sources` on
     /// first appear *and* whenever the source list changes shape (e.g. a
     /// real-data fetch finally lands), so newly-visible multi-model
@@ -2736,6 +2774,15 @@ private struct DesignMockSidebar: View {
             default: return false
             }
         }()
+        // Phase 8 — render a faint accent tint behind source / model
+        // rows while the workspace is in `.stats` mode. Surfaces the
+        // affordance "these checkboxes filter the current Dashboard
+        // scope" without adding labels or interfering with the
+        // existing hover / selection chrome. Same `isPassiveRow`
+        // gating as Phase 5.2's text-area passive logic — both
+        // behaviours apply to the same row kinds, so a single
+        // predicate keeps them in lockstep.
+        let dashboardFilterTint: Bool = isDashboardActive && isPassiveRow
         HoverableRow(isSelected: selection == item.id) { isHovering in
             let fill = selectionFill(for: item.id, isHovering: isHovering)
             Button {
@@ -2788,10 +2835,25 @@ private struct DesignMockSidebar: View {
                 }
                 .padding(.horizontal, 4)
                 .padding(.vertical, 4)
-                .background(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(fill)
-                )
+                .background {
+                    // Two-layer background: the primary fill carries
+                    // hover / selection feedback, the optional
+                    // Dashboard-filter tint sits beneath it so it
+                    // shows through whenever the row isn't
+                    // hovered / selected and gracefully recedes when
+                    // it is. Keeping the tint as its own shape (not
+                    // baked into `selectionFill`) avoids needing to
+                    // reconcile two different alpha curves
+                    // depending on hover / selection state.
+                    ZStack {
+                        if dashboardFilterTint {
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                .fill(Color.accentColor.opacity(0.10))
+                        }
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(fill)
+                    }
+                }
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)

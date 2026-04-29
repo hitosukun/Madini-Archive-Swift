@@ -256,6 +256,14 @@ def insertion_sort(a):
 - ロック中の遷移ブロックは **binding setter で吸収** する(`.onChange` の巻き戻しではない)。Phase 5.1 で発生した「state 連鎖を `.onChange` で打ち消すと SwiftUI のバッチング内で再帰してクラッシュ」を構造的に避ける
 - 視覚フィードバック(メニューのグレーアウト、トースト等)は出さない — Mac の慣習に準拠して「できない操作はそもそも反応しない」
 
+**Phase 8 — Dashboard モード中のサイドバー filter 操作**:
+
+- **チェックボックス操作**(All Threads 配下のソース行 / モデル行)は `.stats` 維持で集計に反映される。チェックボックスを切り替えると `searchText` の DSL(`-source:` / `-model:`)が更新され、`composedQuery` 経由で `statsViewModel.filter` に伝搬し、5 種チャートが narrowed で再描画される。**画面遷移は起きない**(`.stats` を離れない)
+- **検索バーの DSL 直接入力**も同様に `.stats` 維持で集計に反映される(チェックボックス経路と同じ DSL 書き換えチャネルを通るため)
+- **ナビゲーション項目クリック**(Wikis / Bookmarks / archive.db / All Threads / Dashboard 自身)は通常通り遷移し、その時点で `.stats` モードを離れる(これらは「画面遷移するための入口」)
+- 視覚フィードバック:`.stats` モード中、All Threads 配下のソース行・モデル行のチェックボックス領域に **薄いアクセントカラーの背景**(`Color.accentColor.opacity(0.10)`)を敷く。「これらは Dashboard の集計を narrow するためのチェックボックス」というアフォーダンスを言語によらず示す。ナビゲーション項目には敷かない(意味が逆の操作なので)
+- 実装上の重要点:`onToggleSource` / `onToggleModel` 内の「サイドバー選択を `.allThreads` にリセット」副作用は、`.stats` モード時には **発火しない**ように `selectedLayoutMode != .stats` でガードする。これにより `.onChange(of: selectedSidebarItemID)` の `.default` bump 経路が反応しない構造になる(state 書き換えそのものを発生させないので Phase 5.1 の「同一 frame 3 つ State 書き換え」教訓も自動的に満たす)
+
 実装する集計 (Phase 2 で 5 種すべて実装済):
 
 1. **日付別ヒートマップ** — `primary_time` を `'localtime'` で日付化。プロンプト数 (role='user') を集計、過去 365 日上限。中央ペインは過去 90 日のコンパクト表示、右ペインで全 365 日
