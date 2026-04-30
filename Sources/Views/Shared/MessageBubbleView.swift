@@ -161,6 +161,16 @@ struct MessageBubbleView: View, Equatable {
         static let heading2FontSize: CGFloat = 19
         static let heading3FontSize: CGFloat = 17
         static let minorHeadingFontSize: CGFloat = 15
+
+        /// Baseline extra gap between wrapped lines in body text. See
+        /// `MessageBubbleView.scaledBodyLineSpacing` for the rationale
+        /// and how this scales with the body-text zoom multiplier.
+        /// 5pt at the default 15pt body size pushes the effective
+        /// line height from ~1.2× to ~1.5× — the comfort zone for
+        /// long-form reading per typography research (Bringhurst,
+        /// Lupton) and the value most modern reading-mode UIs land
+        /// on.
+        static let bodyLineSpacing: CGFloat = 5
     }
 
     let message: Message
@@ -230,6 +240,23 @@ struct MessageBubbleView: View, Equatable {
     /// blocks are body content rendered alongside the prose.
     private var scaledMathFontSize: CGFloat {
         Layout.mathFontSize * bodyTextSizeMultiplier
+    }
+
+    /// Extra space between wrapped lines in body text. SwiftUI's
+    /// default line height is approximately 1.2× the font size; the
+    /// 5pt baseline here pushes that to roughly 1.5× at 15pt body
+    /// text — the line height most reading-mode designs (Notion,
+    /// Medium, browser reader views) settle on for long-form prose.
+    /// Mixed Japanese / English content benefits in particular: kanji
+    /// without breathing room visually pile up, and the wider
+    /// vertical rhythm makes scanning much easier.
+    ///
+    /// Scales with the body-text zoom so the proportion stays
+    /// constant — at 200 % zoom we get 10pt of additional line
+    /// spacing on top of the doubled font size, preserving the same
+    /// 1.5× line height ratio.
+    private var scaledBodyLineSpacing: CGFloat {
+        Layout.bodyLineSpacing * bodyTextSizeMultiplier
     }
 
     var body: some View {
@@ -329,6 +356,7 @@ struct MessageBubbleView: View, Equatable {
 
             Text(highlightedVerbatim(message.content, blockAnchorID: message.id))
                 .font(.system(size: scaledBodyFontSize))
+                .lineSpacing(scaledBodyLineSpacing)
                 .textSelection(.enabled)
                 .multilineTextAlignment(.leading)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -443,6 +471,7 @@ struct MessageBubbleView: View, Equatable {
 
             Text(highlightedVerbatim(message.content, blockAnchorID: message.id))
                 .font(.system(size: scaledBodyFontSize))
+                .lineSpacing(scaledBodyLineSpacing)
                 .textSelection(.enabled)
                 .multilineTextAlignment(.leading)
                 .padding(12)
@@ -488,6 +517,7 @@ struct MessageBubbleView: View, Equatable {
                 if displayMode == .plain {
                     Text(highlightedVerbatim(message.content, blockAnchorID: message.id))
                         .font(.system(size: scaledBodyFontSize))
+                        .lineSpacing(scaledBodyLineSpacing)
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 } else {
@@ -635,6 +665,7 @@ struct MessageBubbleView: View, Equatable {
 
         rendered
             .font(.system(size: scaledBodyFontSize))
+            .lineSpacing(scaledBodyLineSpacing)
             .textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)
             .fixedSize(horizontal: false, vertical: true)
@@ -684,6 +715,7 @@ struct MessageBubbleView: View, Equatable {
                 blockAnchorID: blockAnchorID
             )
                 .font(.system(size: scaledBodyFontSize))
+                .lineSpacing(scaledBodyLineSpacing)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .fixedSize(horizontal: false, vertical: true)
@@ -707,6 +739,7 @@ struct MessageBubbleView: View, Equatable {
                 blockAnchorID: blockAnchorID
             )
                 .font(.system(size: scaledBodyFontSize).italic())
+                .lineSpacing(scaledBodyLineSpacing)
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
