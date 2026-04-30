@@ -20,6 +20,11 @@ struct MadiniArchiveApp: App {
     @StateObject private var services = AppServices()
     @State private var identityPreferences = IdentityPreferencesStore()
     @State private var archiveEvents = ArchiveEvents()
+    /// Browser-style body-text zoom shared across every reader scene.
+    /// Held by the App so a single instance survives scene restores
+    /// and is wired into both the environment (for views) and
+    /// `AppCommands` (for the View-menu shortcuts).
+    @StateObject private var bodyTextSize = BodyTextSizePreference()
     #if os(macOS)
     @NSApplicationDelegateAdaptor(MadiniAppDelegate.self) private var appDelegate
     #endif
@@ -30,6 +35,8 @@ struct MadiniArchiveApp: App {
                 .environmentObject(services)
                 .environment(identityPreferences)
                 .environment(archiveEvents)
+                .environmentObject(bodyTextSize)
+                .environment(\.bodyTextSizeMultiplier, bodyTextSize.multiplier)
                 #if os(macOS)
                 // Start auto-intake once the main scene appears. `.task`
                 // anchors the lifecycle to the root view so the poll loop
@@ -43,7 +50,7 @@ struct MadiniArchiveApp: App {
         #if os(macOS)
         .defaultSize(width: 1200, height: 800)
         .commands {
-            AppCommands()
+            AppCommands(bodyTextSize: bodyTextSize)
         }
         #endif
 
@@ -239,6 +246,12 @@ struct AppCommands: Commands {
     /// so ⌘↑/⌘↓ retarget the prompt rows instead of the cards.
     @FocusedValue(\.promptNavigation) private var promptNav
 
+    /// Browser-style body-text zoom, owned by the App and threaded
+    /// through here so the View menu can drive it. `@ObservedObject`
+    /// rather than `@StateObject` because the App holds the source
+    /// of truth — this is just an observation point.
+    @ObservedObject var bodyTextSize: BodyTextSizePreference
+
     var body: some Commands {
         // View menu — layout switchers. `after: .sidebar` slots them
         // directly beneath the default "Show Sidebar" item SwiftUI
@@ -269,6 +282,31 @@ struct AppCommands: Commands {
             }
             .keyboardShortcut("4", modifiers: .command)
             .disabled(shell == nil)
+
+            // Browser-style body-text zoom. Sits in the View menu
+            // beneath the layout switchers because both control "how
+            // the reader looks" — keeping them in the same group
+            // mirrors Mail.app, which co-locates layout and font-size
+            // controls under View. Kept enabled at the limits (rather
+            // than disabled) so ⌘= at 200 % / ⌘- at 70 % silently no-
+            // op instead of triggering the system error beep that an
+            // unbound shortcut would.
+            Divider()
+
+            Button("Increase Body Text Size") {
+                bodyTextSize.stepUp()
+            }
+            .keyboardShortcut("=", modifiers: .command)
+
+            Button("Decrease Body Text Size") {
+                bodyTextSize.stepDown()
+            }
+            .keyboardShortcut("-", modifiers: .command)
+
+            Button("Reset Body Text Size") {
+                bodyTextSize.reset()
+            }
+            .keyboardShortcut("0", modifiers: .command)
         }
 
         // Library menu — thread-level navigation + reload. Lives at
