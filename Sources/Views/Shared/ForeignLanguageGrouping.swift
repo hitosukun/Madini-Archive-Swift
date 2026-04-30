@@ -213,6 +213,34 @@ enum ForeignLanguageGrouping {
             guard let text = textContent(of: block), text.count >= 20 else {
                 return nil
             }
+            // Temporary fix for Bug A v2 (math/formula paragraph
+            // misdetection as Spanish/Polish/etc.). Display equations
+            // such as "eml(x, y) = eˣ – ln(y)" frequently arrive as a
+            // standalone paragraph of mostly Latin glyphs, parens,
+            // and operators. NLLanguageRecognizer reads the
+            // letter-and-punctuation pattern as a confident European
+            // language and the grouper folds the formula away. The
+            // listItem exclusion (commit faef0a5) caught the numbered-
+            // list flavor of this bug; this guard catches the
+            // paragraph flavor by requiring the text to be majority-
+            // letters before language detection runs.
+            //
+            // The 0.55 threshold was tuned against observed false
+            // positives ("eml(x, y) = eˣ – ln(y)" ≈ 45 % letters,
+            // "d(x, y) = d(y, x)（対称性）" ≈ 38 %) without dropping
+            // genuine prose ("The user wants me to act as Madini"
+            // ≈ 86 %, "あたしはマディニだよ〜！" ≈ 94 %).
+            //
+            // TODO: Remove this guard when Phase 6 cleanup of
+            // ForeignLanguageGrouping completes. See
+            // docs/plans/thinking-preservation-2026-04-30.md for the
+            // structural solution (thinking blocks preserved by the
+            // Python importer + MessageRenderProfile.collapsesThinking
+            // dispatch in the Swift reader).
+            let letterCount = text.reduce(into: 0) { $0 += $1.isLetter ? 1 : 0 }
+            if Double(letterCount) / Double(text.count) < 0.55 {
+                return nil
+            }
             let key = text as NSString
             if let cached = cache.object(forKey: key) {
                 return cached as String == "" ? nil : NLLanguage(rawValue: cached as String)
