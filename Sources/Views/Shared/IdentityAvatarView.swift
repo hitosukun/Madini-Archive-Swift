@@ -164,9 +164,35 @@ private struct DefaultIdentityAvatarView: View {
 
     private func loadBundledImage() -> Image? {
         guard let imageName = bundledAvatarImageName,
-              let resourceURL = Bundle.module.url(forResource: imageName, withExtension: "png") else {
+              let resourceURL = BundledResources.url(forResource: imageName, withExtension: "png") else {
             return nil
         }
         return AvatarImageCache.image(forBundleResource: resourceURL)
+    }
+}
+
+/// Resource lookup that works under both build systems the project
+/// supports:
+///
+///   * **SPM** (`swift build`, `swift test`, and anything that
+///     compiles `Package.swift`). Resources declared in the manifest
+///     live in an auto-generated `Bundle.module`.
+///   * **Xcode app target** (`xcodebuild` on the generated
+///     `.xcodeproj`, driven by `project.yml`). Resources are copied
+///     into `Bundle.main` — the regular app bundle — and
+///     `Bundle.module` doesn't exist at all.
+///
+/// The generated SPM accessor only exists in the SPM build, so any
+/// direct `Bundle.module` reference breaks the Xcode build. We gate it
+/// behind the `SPM_BUILD` compile flag (set in `Package.swift` via
+/// `swiftSettings: [.define("SPM_BUILD")]`) and fall through to
+/// `Bundle.main` for Xcode builds.
+private enum BundledResources {
+    static func url(forResource name: String, withExtension ext: String) -> URL? {
+        #if SPM_BUILD
+        return Bundle.module.url(forResource: name, withExtension: ext)
+        #else
+        return Bundle.main.url(forResource: name, withExtension: ext)
+        #endif
     }
 }

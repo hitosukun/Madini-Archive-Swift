@@ -26,7 +26,24 @@ let package = Package(
             path: "Sources",
             resources: [
                 .process("Resources"),
+            ],
+            // `SPM_BUILD` gates direct `Bundle.module` references in
+            // the source tree. It's defined only in the SPM build so
+            // that the Xcode app target (which has no `Bundle.module`
+            // accessor because resources are copied into the main
+            // bundle) compiles cleanly. See `BundledResources` for
+            // the matching lookup shim.
+            swiftSettings: [
+                .define("SPM_BUILD")
             ]
+        ),
+        .testTarget(
+            name: "MadiniArchiveTests",
+            dependencies: [
+                "MadiniArchive",
+                .product(name: "GRDB", package: "GRDB.swift"),
+            ],
+            path: "Tests/MadiniArchiveTests"
         ),
     ]
 )

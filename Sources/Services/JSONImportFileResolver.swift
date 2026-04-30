@@ -5,6 +5,20 @@ struct JSONImportSelection: Sendable {
     let rejectedInputCount: Int
 }
 
+/// Given a list of user-dropped URLs (files or folders), work out which JSON
+/// files the importer should actually read. Provider-shape detection lives in
+/// `RawExportProviderDetector`; this resolver is the "what to hand off to the
+/// importer" layer on top of it.
+///
+/// Priority when a directory is dropped:
+///   1. ChatGPT conversation chunks (`conversations-*.json`)
+///   2. Claude `conversations.json` at the root
+///   3. Gemini activity files (anywhere beneath the directory)
+///   4. Fall back to top-level `.json` children
+///
+/// A single `.json` file is returned as-is, except that a dropped
+/// `export_manifest.json` redirects to the ChatGPT conversation chunks that
+/// sit alongside it.
 enum JSONImportFileResolver {
     static func resolve(_ urls: [URL]) -> JSONImportSelection {
         var resolved: [URL] = []
@@ -34,15 +48,14 @@ enum JSONImportFileResolver {
 
     private static func importableJSONFiles(from url: URL) -> [URL] {
         if isDirectory(url) {
-            let conversationChunks = chatGPTConversationChunks(in: url)
-            if !conversationChunks.isEmpty {
-                return conversationChunks
+            let chatgptChunks = RawExportProviderDetector.chatGPTConversationChunks(in: url)
+            if !chatgptChunks.isEmpty {
+                return chatgptChunks
             }
-            let claudeConversations = url.appendingPathComponent("conversations.json")
-            if FileManager.default.fileExists(atPath: claudeConversations.path) {
-                return [claudeConversations]
+            if let claude = RawExportProviderDetector.claudeConversationsFile(in: url) {
+                return [claude]
             }
-            let geminiActivities = geminiActivityFiles(in: url)
+            let geminiActivities = RawExportProviderDetector.geminiActivityFiles(in: url)
             if !geminiActivities.isEmpty {
                 return geminiActivities
             }
@@ -56,9 +69,11 @@ enum JSONImportFileResolver {
         // A full ChatGPT export includes several helper JSON files. If the
         // user drops the manifest, import the actual conversation chunks.
         if url.lastPathComponent == "export_manifest.json" {
-            let conversationChunks = chatGPTConversationChunks(in: url.deletingLastPathComponent())
-            if !conversationChunks.isEmpty {
-                return conversationChunks
+            let chunks = RawExportProviderDetector.chatGPTConversationChunks(
+                in: url.deletingLastPathComponent()
+            )
+            if !chunks.isEmpty {
+                return chunks
             }
         }
 
@@ -70,58 +85,13 @@ enum JSONImportFileResolver {
     }
 
     private static func directJSONChildren(in directory: URL) -> [URL] {
-        directoryChildren(in: directory)
-            .filter { $0.pathExtension.lowercased() == "json" }
-            .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
-    }
-
-    private static func chatGPTConversationChunks(in directory: URL) -> [URL] {
-        directoryChildren(in: directory)
-            .filter { url in
-                let name = url.lastPathComponent
-                return name.hasPrefix("conversations-") && name.hasSuffix(".json")
-            }
-            .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
-    }
-
-    private static func geminiActivityFiles(in directory: URL) -> [URL] {
-        guard let enumerator = FileManager.default.enumerator(
-            at: directory,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-        ) else {
-            return []
-        }
-
-        return enumerator
-            .compactMap { $0 as? URL }
-            .filter(isGeminiActivityFile)
-            .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
-    }
-
-    private static func isGeminiActivityFile(_ url: URL) -> Bool {
-        guard url.pathExtension.lowercased() == "json",
-              let handle = try? FileHandle(forReadingFrom: url) else {
-            return false
-        }
-        defer { try? handle.close() }
-
-        let prefix = handle.readData(ofLength: 65_536)
-        guard let text = String(data: prefix, encoding: .utf8) else {
-            return false
-        }
-
-        return text.contains("\"header\"")
-            && text.contains("Gemini")
-            && text.contains("\"time\"")
-            && text.contains("\"title\"")
-    }
-
-    private static func directoryChildren(in directory: URL) -> [URL] {
         (try? FileManager.default.contentsOfDirectory(
             at: directory,
             includingPropertiesForKeys: [.isDirectoryKey],
             options: [.skipsHiddenFiles]
-        )) ?? []
+        ))?
+            .filter { $0.pathExtension.lowercased() == "json" }
+            .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+        ?? []
     }
 }

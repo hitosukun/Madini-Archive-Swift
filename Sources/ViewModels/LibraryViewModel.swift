@@ -908,6 +908,29 @@ final class LibraryViewModel {
         }
     }
 
+    /// Record a query the user ran in the DesignMock shell (or any
+    /// surface that doesn't funnel its filter through `LibraryViewModel.filter`)
+    /// as a recent-filter row in the shared DB, then refresh
+    /// `unifiedFilters` so the saved-filter surfaces (sidebar rows +
+    /// toolbar search suggestions) pick it up. Silently no-ops when
+    /// the filter carries nothing meaningful — mirrors `saveRecentFilter`'s
+    /// own guard so an empty toolbar doesn't flood the list with
+    /// identical "Filtered View" rows.
+    func recordRecentSearch(_ filter: ArchiveSearchFilter) {
+        guard filter.hasMeaningfulFilters else { return }
+        Task {
+            do {
+                _ = try await viewService.saveRecentFilter(
+                    filters: filter,
+                    targetType: .virtualThread
+                )
+                await refreshSavedEntries()
+            } catch {
+                errorText = error.localizedDescription
+            }
+        }
+    }
+
     /// Delete any saved_filters row — replaces the old `deleteSavedView` path
     /// for the unified list so pinned AND recent rows can be removed.
     func deleteFilterEntry(_ entry: SavedFilterEntry) {
@@ -1014,7 +1037,8 @@ final class LibraryViewModel {
             query: SearchQuery(
                 filter: filter,
                 offset: offset,
-                limit: pageSize
+                limit: pageSize,
+                sortKey: sortKey
             )
         )
 
@@ -1037,7 +1061,8 @@ final class LibraryViewModel {
             query: SearchQuery(
                 filter: filter,
                 offset: 0,
-                limit: 1
+                limit: 1,
+                sortKey: sortKey
             )
         )
     }

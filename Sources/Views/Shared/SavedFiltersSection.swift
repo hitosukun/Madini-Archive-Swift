@@ -37,7 +37,11 @@ struct SavedFiltersSection: View {
     var hasEntries: Bool { !entries.isEmpty }
 }
 
-private struct SavedFilterRow: View {
+/// Single history-filter row. Exposed (non-private) so callers that
+/// want to interleave filter rows with non-filter history items in a
+/// single chronological list can render each row individually, instead
+/// of handing a whole batch to `SavedFiltersSection` as one group.
+struct SavedFilterRow: View {
     let entry: SavedFilterEntry
     let onSelect: () -> Void
     let onTogglePin: () -> Void
@@ -63,7 +67,6 @@ private struct SavedFilterRow: View {
                     // clock (narrow) and star (wider).
                     .frame(width: 14, alignment: .center)
                     .contentShape(Rectangle())
-                    .animation(.easeOut(duration: 0.12), value: isHovering)
             }
             .buttonStyle(.plain)
             .help(entry.pinned ? "Unpin" : "Pin to top")
@@ -79,11 +82,12 @@ private struct SavedFilterRow: View {
         }
         .font(.body)
         .padding(.horizontal, 6)
-        // Taller hover zone — previously 4pt vertical made hovering
-        // finicky because the row's hit-target shrank to only the
-        // visual content, and the gap between rows left dead bands.
-        // 7pt roughly doubles the vertical catch-area per row.
-        .padding(.vertical, 7)
+        // 4pt vertical — previously 7pt, which read as too airy once
+        // the sidebar started interleaving multiple row kinds (the
+        // user asked to "行間を詰めて"). Left at 4pt even after the
+        // History section was removed because the tighter rhythm still
+        // reads better at typical sidebar widths.
+        .padding(.vertical, 4)
         // Apply contentShape BEFORE `.onHover` so the whole padded
         // rectangle counts as hoverable, not just the visible glyph /
         // text. Without this the user has to land directly on a child
@@ -93,7 +97,26 @@ private struct SavedFilterRow: View {
             RoundedRectangle(cornerRadius: 5, style: .continuous)
                 .fill(isHovering ? Color.secondary.opacity(0.08) : Color.clear)
         )
-        .onHover { isHovering = $0 }
+        // Explicitly disable the implicit animation SwiftUI would
+        // otherwise run on the background fill and icon swap when
+        // `isHovering` flips. During a scroll with the cursor parked
+        // over the sidebar, rows slide under the pointer rapidly —
+        // each transition would otherwise kick off a fresh fade
+        // animation, and the cascade of overlapping animations across
+        // every visible row is the scroll-jitter the user was feeling.
+        // Hover feedback is now an instant toggle, which reads fine
+        // visually and lets the scroll run smooth.
+        .animation(nil, value: isHovering)
+        .onHover { hovering in
+            // Wrap the state write in a zero-animation transaction so
+            // any ambient `withAnimation` at the parent level can't
+            // retroactively animate the hover transition either.
+            var tx = Transaction()
+            tx.disablesAnimations = true
+            withTransaction(tx) {
+                isHovering = hovering
+            }
+        }
         .contextMenu {
             Button(entry.pinned ? "Unpin" : "Pin", action: onTogglePin)
             Button("Delete", role: .destructive, action: onDelete)
