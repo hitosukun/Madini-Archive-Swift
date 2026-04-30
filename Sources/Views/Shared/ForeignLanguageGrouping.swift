@@ -170,8 +170,26 @@ enum ForeignLanguageGrouping {
             return s
         case .heading(_, let s):
             return s
-        case .listItem(_, _, let s, _):
-            return s
+        case .listItem:
+            // Temporary fix for Bug A (math/list-item misdetection as
+            // Spanish/Polish). Numbered list items frequently contain
+            // short Latin-glyph payloads such as math notation
+            // ("d(x, y) = d(y, x)") that NLLanguageRecognizer assigns to
+            // a confident European language and the grouper then folds
+            // away. Excluding listItem from language detection avoids
+            // the false positive without touching the confidence
+            // threshold or other rules. The trade-off — a genuinely
+            // foreign-language list item no longer gets folded — is
+            // acceptable: prose runs are paragraphs, and structurally
+            // foreign list items are rare.
+            //
+            // TODO: Remove this exclusion when Phase 6 cleanup of
+            // ForeignLanguageGrouping completes. See
+            // docs/plans/thinking-preservation-2026-04-30.md for the
+            // structural solution (thinking blocks preserved by the
+            // Python importer + MessageRenderProfile.collapsesThinking
+            // dispatch in the Swift reader).
+            return nil
         case .table(let headers, let rows, _):
             return (headers + rows.flatMap { $0 }).joined(separator: " ")
         case .code, .math, .horizontalRule:
