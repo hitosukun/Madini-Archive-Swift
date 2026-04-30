@@ -310,6 +310,30 @@ private struct LoadedConversationDetailView: View {
     /// then falls back to system locale.
     @State private var conversationPrimaryLanguage: NLLanguage?
 
+    /// Browser-style body-text zoom (`Cmd+=` / `Cmd+-` / `Cmd+0`).
+    /// Read here so the reading column's max width can scale with the
+    /// font size — we want roughly the same characters per line at
+    /// every zoom level, not a constant pixel cap that turns into a
+    /// 30-character cramped column at 200 %.
+    @Environment(\.bodyTextSizeMultiplier) private var bodyTextSizeMultiplier
+
+    /// Base width of the reading column at 100 % body-text zoom. Sized
+    /// for ~60-65 Japanese characters / ~75-90 English characters per
+    /// line at the default 15pt body font — the upper end of the
+    /// 45-75 char readability range typography research (Bringhurst,
+    /// Lupton) puts the comfort band at. The actual cap scales with
+    /// `bodyTextSizeMultiplier` via `readingColumnMaxWidth(for:)`.
+    static let readingColumnBaseMaxWidth: CGFloat = 720
+
+    /// Reading column cap for a given body-text multiplier. Linear
+    /// scale: at 200 % zoom the column doubles to 1440pt, which
+    /// preserves the per-line character count at the larger font.
+    /// Static so the call site outside `body` (the `.frame(maxWidth:)`
+    /// modifier on the LazyVStack) stays uncluttered.
+    static func readingColumnMaxWidth(for multiplier: CGFloat) -> CGFloat {
+        readingColumnBaseMaxWidth * multiplier
+    }
+
     /// Cached copy of the most-recent `PromptTopYPreferenceKey`
     /// dictionary. `handlePromptOffsetChange` ignores it while a
     /// programmatic scroll is in flight, but `performProgrammaticScroll`
@@ -331,6 +355,9 @@ private struct LoadedConversationDetailView: View {
     @State private var readerViewportHeight: CGFloat = 0
 
     var body: some View {
+        let columnMaxWidth = Self.readingColumnMaxWidth(
+            for: bodyTextSizeMultiplier
+        )
         let detailBody = Group {
             if shouldUseDocumentViewer {
                 DocumentConversationView(detail: detail)
@@ -472,6 +499,34 @@ private struct LoadedConversationDetailView: View {
                                 }
                             }
                         }
+                        // Cap the reading column at a comfortable
+                        // width and center it inside the reader pane.
+                        // Without this the assistant article-style
+                        // bubbles run edge-to-edge on a wide window
+                        // (1400pt+ on a 16" or external monitor),
+                        // which pushes line lengths well past the
+                        // 60-75-character readability sweet spot and
+                        // forces the eye to track too far between
+                        // lines. Capping at ~720pt at 100 % zoom
+                        // keeps body lines around 50-65 Japanese
+                        // characters / 70-90 English characters —
+                        // matches Mail.app, Notion, and the typical
+                        // reading mode of modern browsers.
+                        //
+                        // The cap scales with the body-text zoom
+                        // (`bodyTextSizeMultiplier`) so the comfortable
+                        // line length tracks the user's chosen font
+                        // size: at 200 % the column doubles in width
+                        // to keep roughly the same characters per line.
+                        // The outer `.frame(maxWidth: .infinity,
+                        // alignment: .center)` is what actually
+                        // centers the column — without it the inner
+                        // frame would leading-align inside the
+                        // ScrollView. On panes narrower than the cap
+                        // the inner frame yields and the column fills
+                        // the available width naturally (no centering
+                        // gutter needed).
+                        .modifier(ReaderColumnFrame(maxWidth: columnMaxWidth))
                         // Slightly wider horizontal gutters than the
                         // default 16pt so the reader text has a bit
                         // more breathing room against the pane edges;
@@ -1775,4 +1830,23 @@ func prepareConversationShareURLs(
     async let plainText = PlainTextExporter.writeTempShareFile(for: detail)
     return await (markdown, plainText)
     #endif
+}
+
+/// Caps a view at a readable column width and centers it inside its
+/// parent. Extracted as a `ViewModifier` rather than chained inline on
+/// the LazyVStack because the surrounding `var body` chain in
+/// `ConversationDetailView` is already at the edge of what the Swift
+/// type checker can resolve in reasonable time — adding two more
+/// `.frame(...)` calls inline tipped the build over into a "compiler
+/// is unable to type-check this expression in reasonable time" error.
+/// Wrapping the constraint in a single `.modifier(...)` call keeps the
+/// inferred type of the LazyVStack stable and the build under budget.
+private struct ReaderColumnFrame: ViewModifier {
+    let maxWidth: CGFloat
+
+    func body(content: Content) -> some View {
+        content
+            .frame(maxWidth: maxWidth, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .center)
+    }
 }
