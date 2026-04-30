@@ -62,9 +62,42 @@ enum ForeignLanguageGrouping {
         var result: [MessageRenderItem] = []
         var pending: (language: NLLanguage, blocks: [ContentBlock])?
 
+        // Temporary fix: only fold a foreign-language run when it is
+        // long enough to actually be worth hiding. Single short
+        // foreign sentences are better displayed inline because:
+        // (a) when the language detection is wrong (the recurring
+        //     failure mode of this pre-Phase-6 design), the user
+        //     still sees the content rather than having a sentence
+        //     hidden behind a "Japanese / English / ..." header;
+        // (b) when the detection is right but the run is brief, a
+        //     fold affordance is overkill — the user can just read
+        //     the sentence in place.
+        // The threshold is the total character count across all
+        // blocks queued in the pending run (paragraphs, headings,
+        // list items, etc., as exposed by `textContent(of:)`).
+        // 200 characters is roughly two-to-three Japanese lines or
+        // three-to-four English lines — below that, fold churn
+        // outweighs the readability win.
+        //
+        // TODO: Remove this gate when Phase 6 cleanup of
+        // ForeignLanguageGrouping completes. See
+        // docs/plans/thinking-preservation-2026-04-30.md for the
+        // structural solution that supersedes the entire
+        // language-based grouping.
+        let foldThreshold = 200
+
         func flush() {
             guard let p = pending else { return }
-            result.append(.foreignLanguageGroup(language: p.language, blocks: p.blocks))
+            let totalChars = p.blocks.reduce(into: 0) { acc, block in
+                acc += textContent(of: block)?.count ?? 0
+            }
+            if totalChars >= foldThreshold {
+                result.append(.foreignLanguageGroup(language: p.language, blocks: p.blocks))
+            } else {
+                for b in p.blocks {
+                    result.append(.block(b))
+                }
+            }
             pending = nil
         }
 
