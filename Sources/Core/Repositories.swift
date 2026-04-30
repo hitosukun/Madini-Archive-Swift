@@ -148,6 +148,34 @@ struct Message: Identifiable, Hashable, Sendable {
     let id: String
     let role: MessageRole
     let content: String
+    /// Structured-block representation of the message (Phase 3 read-
+    /// only forward-compat). Populated when the row's
+    /// `messages.content_json` column has been written by the Python
+    /// core (Phase 2 / 2b) and the JSON decodes cleanly. `nil` for
+    /// legacy rows, for messages whose content is plain text without
+    /// structure (Claude bare-text, ChatGPT non-reasoning), and for
+    /// rows whose JSON failed to decode (defensive — corrupted blob,
+    /// future schema). Phase 4 will switch the reader to dispatch on
+    /// this when present and fall back to the flat `content` path
+    /// when nil. See `Sources/Core/MessageBlock.swift` and
+    /// `docs/plans/thinking-preservation-2026-04-30.md`.
+    let contentBlocks: [MessageBlock]?
+
+    /// Memberwise init with a default for `contentBlocks` so the four
+    /// existing call sites (PreviewData fixtures, mock repositories)
+    /// keep compiling without modification — they predate Phase 3 and
+    /// only know the flat content path.
+    init(
+        id: String,
+        role: MessageRole,
+        content: String,
+        contentBlocks: [MessageBlock]? = nil
+    ) {
+        self.id = id
+        self.role = role
+        self.content = content
+        self.contentBlocks = contentBlocks
+    }
 
     var isUser: Bool { role == .user }
 }
