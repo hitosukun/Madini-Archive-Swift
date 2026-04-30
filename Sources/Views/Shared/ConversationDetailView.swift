@@ -526,17 +526,18 @@ private struct LoadedConversationDetailView: View {
                         // "foreign" and folds it.
                         //
                         // Strategy: try user-only detection first with
-                        // a lowered character threshold (user prompts
-                        // are typically short — sometimes a single
-                        // sentence — but the language signal is strong
-                        // when the script itself is non-Latin: even
-                        // 30 characters of pure Japanese is plenty for
-                        // NLLanguageRecognizer to be confident).
-                        // Fall back to the all-messages sample (with
-                        // the default threshold) only when user-only
-                        // detection fails — that way short user-side
-                        // exchanges like a one-line prompt + a
-                        // confirmation reply still get the user-bias
+                        // an aggressively-lowered character threshold
+                        // (user prompts are sometimes a single short
+                        // sentence — "これを読んで、続きを話そう。" is
+                        // only ~14 chars — but the language signal is
+                        // already strong at that length when the
+                        // script is non-Latin. NLLanguageRecognizer
+                        // separately enforces a 0.6 confidence floor,
+                        // which catches the ambiguous short-Latin
+                        // cases. Fall back to the all-messages sample
+                        // (with the default threshold) only when user-
+                        // only detection fails — that way short user-
+                        // side exchanges still get the user-bias
                         // benefit instead of regressing to the all-
                         // messages skew.
                         //
@@ -552,7 +553,7 @@ private struct LoadedConversationDetailView: View {
                         let detected: NLLanguage? = await Task.detached(priority: .utility) { () -> NLLanguage? in
                             if let userPrimary = ForeignLanguageGrouping.primaryLanguage(
                                 ofMessageTexts: userTexts,
-                                minCharacters: 30
+                                minCharacters: 10
                             ) {
                                 return userPrimary
                             }
