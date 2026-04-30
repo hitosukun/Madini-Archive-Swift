@@ -523,14 +523,22 @@ private struct LoadedConversationDetailView: View {
                         // skews English even when the user is clearly
                         // operating in Japanese, so the grouper then
                         // treats the assistant's Japanese answer as
-                        // "foreign" and folds it. User-side text is a
-                        // cleaner signal of the conversation language
-                        // because the user almost always types in
-                        // their own language, with no preamble noise.
-                        // Fall back to all messages when the user-only
-                        // sample is empty or too short for confident
-                        // detection (e.g. very first turn with a one-
-                        // word prompt).
+                        // "foreign" and folds it.
+                        //
+                        // Strategy: try user-only detection first with
+                        // a lowered character threshold (user prompts
+                        // are typically short — sometimes a single
+                        // sentence — but the language signal is strong
+                        // when the script itself is non-Latin: even
+                        // 30 characters of pure Japanese is plenty for
+                        // NLLanguageRecognizer to be confident).
+                        // Fall back to the all-messages sample (with
+                        // the default threshold) only when user-only
+                        // detection fails — that way short user-side
+                        // exchanges like a one-line prompt + a
+                        // confirmation reply still get the user-bias
+                        // benefit instead of regressing to the all-
+                        // messages skew.
                         //
                         // TODO: Remove this user-bias when Phase 4 of
                         // the thinking-preservation plan ships and
@@ -541,16 +549,15 @@ private struct LoadedConversationDetailView: View {
                             .filter(\.isUser)
                             .map(\.content)
                         let allTexts = detail.messages.map(\.content)
-                        let userSampleChars = userTexts.reduce(into: 0) { $0 += $1.count }
-                        let texts: [String]
-                        if userSampleChars >= 200 {
-                            texts = userTexts
-                        } else {
-                            texts = allTexts
-                        }
-                        let detected = await Task.detached(priority: .utility) {
-                            ForeignLanguageGrouping.primaryLanguage(
-                                ofMessageTexts: texts
+                        let detected: NLLanguage? = await Task.detached(priority: .utility) { () -> NLLanguage? in
+                            if let userPrimary = ForeignLanguageGrouping.primaryLanguage(
+                                ofMessageTexts: userTexts,
+                                minCharacters: 30
+                            ) {
+                                return userPrimary
+                            }
+                            return ForeignLanguageGrouping.primaryLanguage(
+                                ofMessageTexts: allTexts
                             )
                         }.value
                         await MainActor.run {
