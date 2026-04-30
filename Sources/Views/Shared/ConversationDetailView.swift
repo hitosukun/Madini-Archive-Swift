@@ -511,7 +511,43 @@ private struct LoadedConversationDetailView: View {
                         // system locale; the `@State` write below
                         // replaces that with the detected value once
                         // the work finishes.
-                        let texts = detail.messages.map(\.content)
+                        //
+                        // Temporary fix for Bug B (Japanese response
+                        // text folded as "Japanese" inside Claude
+                        // threads). Sampling all messages mixes the
+                        // user's prompts with the assistant's reply,
+                        // and on Claude threads the assistant emits
+                        // long English "thinking out loud" preambles
+                        // that get concatenated into messages.content
+                        // by the Python importer. The combined sample
+                        // skews English even when the user is clearly
+                        // operating in Japanese, so the grouper then
+                        // treats the assistant's Japanese answer as
+                        // "foreign" and folds it. User-side text is a
+                        // cleaner signal of the conversation language
+                        // because the user almost always types in
+                        // their own language, with no preamble noise.
+                        // Fall back to all messages when the user-only
+                        // sample is empty or too short for confident
+                        // detection (e.g. very first turn with a one-
+                        // word prompt).
+                        //
+                        // TODO: Remove this user-bias when Phase 4 of
+                        // the thinking-preservation plan ships and
+                        // structural thinking blocks replace the
+                        // language-based grouping. See
+                        // docs/plans/thinking-preservation-2026-04-30.md.
+                        let userTexts = detail.messages
+                            .filter(\.isUser)
+                            .map(\.content)
+                        let allTexts = detail.messages.map(\.content)
+                        let userSampleChars = userTexts.reduce(into: 0) { $0 += $1.count }
+                        let texts: [String]
+                        if userSampleChars >= 200 {
+                            texts = userTexts
+                        } else {
+                            texts = allTexts
+                        }
                         let detected = await Task.detached(priority: .utility) {
                             ForeignLanguageGrouping.primaryLanguage(
                                 ofMessageTexts: texts
