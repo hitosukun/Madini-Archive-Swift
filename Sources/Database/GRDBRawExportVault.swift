@@ -5,6 +5,21 @@ import GRDB
 import UniformTypeIdentifiers
 
 final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
+    /// Filesystem layout for blob & manifest storage. Split out so tests can
+    /// redirect the vault to a temporary directory without touching
+    /// `~/Library/Application Support/Madini Archive`.
+    struct Storage: Sendable {
+        let blobsDir: URL
+        let snapshotsDir: URL
+
+        static var `default`: Storage {
+            Storage(
+                blobsDir: AppPaths.rawExportBlobsDir,
+                snapshotsDir: AppPaths.rawExportSnapshotsDir
+            )
+        }
+    }
+
     private struct CandidateFile {
         let url: URL
         let relativePath: String
@@ -58,10 +73,16 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
     }
 
     private let dbQueue: DatabaseQueue
+    private let storage: Storage
     private let fileManager: FileManager
 
-    init(dbQueue: DatabaseQueue, fileManager: FileManager = .default) {
+    init(
+        dbQueue: DatabaseQueue,
+        storage: Storage = .default,
+        fileManager: FileManager = .default
+    ) {
         self.dbQueue = dbQueue
+        self.storage = storage
         self.fileManager = fileManager
     }
 
@@ -74,8 +95,8 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
             return nil
         }
 
-        try fileManager.createDirectory(at: AppPaths.rawExportBlobsDir, withIntermediateDirectories: true)
-        try fileManager.createDirectory(at: AppPaths.rawExportSnapshotsDir, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: storage.blobsDir, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: storage.snapshotsDir, withIntermediateDirectories: true)
 
         let importedAt = GRDBProjectDateCodec.string(from: Date())
         var storedFiles: [StoredFile] = []
@@ -86,10 +107,12 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
         var reusedBlobCount = 0
         var originalBytes: Int64 = 0
         var storedBytes: Int64 = 0
+        var contentPairs: [(String, String)] = []
 
         for candidate in candidates {
             let original = try Data(contentsOf: candidate.url)
             let hash = Self.sha256Hex(original)
+            contentPairs.append((candidate.relativePath, hash))
             let originalSize = Int64(original.count)
             originalBytes += originalSize
             if let searchable = searchableText(from: original, candidate: candidate) {
@@ -145,6 +168,26 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
             )
         }
 
+        let contentHash = Self.computeContentHash(provider: provider.rawValue, files: contentPairs)
+
+        // Dedupe: if a prior snapshot carries the same stable content hash,
+        // skip the manifest + INSERT and return the existing snapshot. This
+        // is what makes re-dropping the same export folder a no-op at the
+        // Vault level instead of the watcher level.
+        if let existing = try await fetchExistingSnapshot(contentHash: contentHash) {
+            return RawExportVaultResult(
+                provider: existing.provider,
+                snapshotID: existing.id,
+                totalFiles: existing.fileCount,
+                newBlobs: 0,
+                reusedBlobs: 0,
+                originalBytes: 0,
+                storedBytes: 0,
+                manifestURL: URL(fileURLWithPath: existing.manifestPath),
+                wasDuplicate: true
+            )
+        }
+
         let manifest = SnapshotManifest(
             provider: provider.rawValue,
             sourceRoot: root?.path,
@@ -158,7 +201,7 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let manifestData = try encoder.encode(manifest)
         let manifestHash = Self.sha256Hex(manifestData)
-        let manifestURL = AppPaths.rawExportSnapshotsDir
+        let manifestURL = storage.snapshotsDir
             .appendingPathComponent(provider.rawValue, isDirectory: true)
             .appendingPathComponent("\(safeTimestamp(importedAt))-\(String(manifestHash.prefix(12)))", isDirectory: true)
             .appendingPathComponent("manifest.json")
@@ -170,9 +213,10 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
                 sql: """
                     INSERT INTO raw_export_snapshots (
                         provider, source_root, imported_at, manifest_hash, file_count,
-                        new_blob_count, reused_blob_count, original_bytes, stored_bytes, manifest_path
+                        new_blob_count, reused_blob_count, original_bytes, stored_bytes, manifest_path,
+                        content_hash
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                 arguments: [
                     provider.rawValue,
@@ -184,7 +228,8 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
                     reusedBlobCount,
                     originalBytes,
                     storedBytes,
-                    manifestURL.path
+                    manifestURL.path,
+                    contentHash
                 ]
             )
             let snapshotID = db.lastInsertedRowID
@@ -282,8 +327,40 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
             reusedBlobs: reusedBlobCount,
             originalBytes: originalBytes,
             storedBytes: storedBytes,
-            manifestURL: manifestURL
+            manifestURL: manifestURL,
+            wasDuplicate: false
         )
+    }
+
+    private struct ExistingSnapshot {
+        let id: Int64
+        let provider: RawExportProvider
+        let fileCount: Int
+        let manifestPath: String
+    }
+
+    private func fetchExistingSnapshot(contentHash: String) async throws -> ExistingSnapshot? {
+        try await GRDBAsync.read(from: dbQueue) { db in
+            guard let row = try Row.fetchOne(
+                db,
+                sql: """
+                    SELECT id, provider, file_count, manifest_path
+                    FROM raw_export_snapshots
+                    WHERE content_hash = ?
+                    ORDER BY id ASC
+                    LIMIT 1
+                    """,
+                arguments: [contentHash]
+            ) else {
+                return nil
+            }
+            return ExistingSnapshot(
+                id: row["id"],
+                provider: RawExportProvider(rawValue: row["provider"] ?? "") ?? .unknown,
+                fileCount: row["file_count"],
+                manifestPath: row["manifest_path"] ?? ""
+            )
+        }
     }
 
     func listSnapshots(offset: Int, limit: Int) async throws -> [RawExportSnapshotSummary] {
@@ -378,6 +455,386 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
         }
     }
 
+    // MARK: - Restore API
+
+    func getSnapshot(id: Int64) async throws -> RawExportSnapshotSummary? {
+        try await GRDBAsync.read(from: dbQueue) { db in
+            guard let row = try Row.fetchOne(
+                db,
+                sql: """
+                    SELECT
+                        id, provider, source_root, imported_at, manifest_hash, file_count,
+                        new_blob_count, reused_blob_count, original_bytes, stored_bytes, manifest_path
+                    FROM raw_export_snapshots
+                    WHERE id = ?
+                    """,
+                arguments: [id]
+            ) else {
+                return nil
+            }
+            return RawExportSnapshotSummary(
+                id: row["id"],
+                provider: RawExportProvider(rawValue: row["provider"] ?? "") ?? .unknown,
+                sourceRoot: row["source_root"],
+                importedAt: row["imported_at"],
+                manifestHash: row["manifest_hash"],
+                fileCount: row["file_count"],
+                newBlobCount: row["new_blob_count"],
+                reusedBlobCount: row["reused_blob_count"],
+                originalBytes: row["original_bytes"],
+                storedBytes: row["stored_bytes"],
+                manifestPath: row["manifest_path"]
+            )
+        }
+    }
+
+    func listFiles(
+        snapshotID: Int64,
+        offset: Int,
+        limit: Int
+    ) async throws -> [RawExportFileEntry] {
+        let boundedLimit = max(0, min(limit, 5_000))
+        let boundedOffset = max(0, offset)
+
+        return try await GRDBAsync.read(from: dbQueue) { db in
+            // ingest never creates empty snapshots, so an unknown ID is a
+            // contract break rather than "no files" — throw a typed error so
+            // callers (and UI) can tell apart "snapshot gone" from "empty page".
+            guard try Self.snapshotExists(snapshotID: snapshotID, in: db) else {
+                throw RawExportVaultError.snapshotNotFound(snapshotID: snapshotID)
+            }
+            guard boundedLimit > 0 else {
+                return []
+            }
+            let rows = try Row.fetchAll(
+                db,
+                sql: """
+                    SELECT
+                        f.snapshot_id    AS snapshot_id,
+                        f.relative_path  AS relative_path,
+                        f.blob_hash      AS blob_hash,
+                        f.size_bytes     AS size_bytes,
+                        b.stored_size_bytes AS stored_size_bytes,
+                        f.mime_type      AS mime_type,
+                        f.role           AS role,
+                        f.compression    AS compression,
+                        f.stored_path    AS stored_path
+                    FROM raw_export_files AS f
+                    LEFT JOIN raw_export_blobs AS b ON b.hash = f.blob_hash
+                    WHERE f.snapshot_id = ?
+                    ORDER BY f.relative_path ASC
+                    LIMIT ? OFFSET ?
+                    """,
+                arguments: [snapshotID, boundedLimit, boundedOffset]
+            )
+            return rows.map(Self.fileEntry(from:))
+        }
+    }
+
+    func loadBlob(hash: String) async throws -> Data {
+        let record = try await fetchBlobRecord(hash: hash)
+
+        // Vault must be portable: the data directory can move between machines
+        // or user homes, so resolve the blob through the current `storage`
+        // first and fall back to the DB-recorded absolute path only when the
+        // canonical layout isn't present (older snapshots, debug copies).
+        let canonicalURL = blobURL(hash: hash, compression: record.compression)
+        let legacyURL = URL(fileURLWithPath: record.storedPath)
+        let candidates: [URL]
+        if canonicalURL.standardizedFileURL == legacyURL.standardizedFileURL {
+            candidates = [canonicalURL]
+        } else {
+            candidates = [canonicalURL, legacyURL]
+        }
+
+        var resolvedURL: URL?
+        for candidate in candidates where fileManager.fileExists(atPath: candidate.path) {
+            resolvedURL = candidate
+            break
+        }
+        guard let storedURL = resolvedURL else {
+            throw RawExportVaultError.blobFileMissing(hash: hash, path: canonicalURL.path)
+        }
+
+        // Everything below — disk read, LZFSE decompress, SHA-256 — is CPU /
+        // I/O heavy. For an 84 MB JSON the hash alone takes ~200 ms, and
+        // SwiftUI freezes if that runs on the main actor. Non-isolated async
+        // funcs are supposed to off-main automatically, but the guarantee
+        // isn't reliable in practice (it hinges on Swift version + optimizer
+        // decisions). Push the work onto a detached task to make off-main
+        // execution explicit.
+        let expectedSize = Int(clamping: record.sizeBytes)
+        let compression = record.compression
+        return try await Task.detached(priority: .userInitiated) {
+            let storedData: Data
+            do {
+                storedData = try Data(contentsOf: storedURL, options: .mappedIfSafe)
+            } catch {
+                throw RawExportVaultError.blobFileMissing(hash: hash, path: storedURL.path)
+            }
+
+            let bytes: Data
+            switch compression {
+            case "none":
+                bytes = storedData
+            case "lzfse":
+                guard let decompressed = Self.lzfseDecompressed(
+                    storedData,
+                    expectedSize: expectedSize
+                ) else {
+                    throw RawExportVaultError.decompressionFailed(hash: hash)
+                }
+                bytes = decompressed
+            default:
+                throw RawExportVaultError.unsupportedCompression(compression)
+            }
+
+            let actual = Self.sha256Hex(bytes)
+            guard actual == hash else {
+                throw RawExportVaultError.hashMismatch(expected: hash, actual: actual)
+            }
+            return bytes
+        }.value
+    }
+
+    func loadFile(
+        snapshotID: Int64,
+        relativePath: String
+    ) async throws -> RawExportFilePayload {
+        let entry = try await fetchFileEntry(snapshotID: snapshotID, relativePath: relativePath)
+        let data = try await loadBlob(hash: entry.blobHash)
+        return RawExportFilePayload(entry: entry, data: data)
+    }
+
+    // MARK: - Delete API
+
+    /// One blob whose last reference is the snapshot being deleted, so it
+    /// becomes orphan and is eligible for filesystem GC.
+    private struct OrphanBlob {
+        let hash: String
+        let storedPath: String
+        let storedBytes: Int64
+    }
+
+    @discardableResult
+    func deleteSnapshot(id: Int64) async throws -> RawExportVaultDeleteResult {
+        // Step 1 (read-only): Verify the snapshot exists, capture which blobs
+        // are referenced ONLY by this snapshot (those become orphan after
+        // deletion), and grab the manifest path so we can clean its directory
+        // up afterward. Done in a separate read tx so the write tx below can
+        // use the GC list without re-querying.
+        let prefetch: (orphans: [OrphanBlob], manifestPath: String?, fileCount: Int) =
+            try await GRDBAsync.read(from: dbQueue) { db in
+                guard try Self.snapshotExists(snapshotID: id, in: db) else {
+                    throw RawExportVaultError.snapshotNotFound(snapshotID: id)
+                }
+                // Blobs referenced by this snapshot AND by no other snapshot.
+                // The double-NOT-IN keeps this index-friendly: the inner query
+                // hits idx_raw_export_files_blob, the outer scans only files
+                // belonging to the target snapshot.
+                let orphanRows = try Row.fetchAll(
+                    db,
+                    sql: """
+                        SELECT b.hash, b.stored_path, b.stored_size_bytes
+                        FROM raw_export_blobs b
+                        WHERE b.hash IN (
+                            SELECT DISTINCT blob_hash FROM raw_export_files WHERE snapshot_id = ?
+                        )
+                        AND b.hash NOT IN (
+                            SELECT DISTINCT blob_hash FROM raw_export_files WHERE snapshot_id != ?
+                        )
+                        """,
+                    arguments: [id, id]
+                )
+                let orphans: [OrphanBlob] = orphanRows.map { row in
+                    OrphanBlob(
+                        hash: row["hash"],
+                        storedPath: row["stored_path"] ?? "",
+                        storedBytes: row["stored_size_bytes"] ?? 0
+                    )
+                }
+                let fileCount = try Int.fetchOne(
+                    db,
+                    sql: "SELECT COUNT(*) FROM raw_export_files WHERE snapshot_id = ?",
+                    arguments: [id]
+                ) ?? 0
+                let manifestPath = try String.fetchOne(
+                    db,
+                    sql: "SELECT manifest_path FROM raw_export_snapshots WHERE id = ?",
+                    arguments: [id]
+                )
+                return (orphans, manifestPath, fileCount)
+            }
+
+        // Step 2 (write tx): Delete metadata rows. Children are deleted
+        // explicitly rather than relying on `ON DELETE CASCADE` because we
+        // can't assume `PRAGMA foreign_keys = ON` is set on this connection
+        // (GRDB doesn't enforce it by default), and `raw_export_search_idx`
+        // is a virtual FTS5 table that has no FK in the first place.
+        // `conversation_raw_refs` belongs to the normalize layer (not
+        // installed by this file's `installSchema`); it may not exist in
+        // every database, hence the `try?`.
+        try await GRDBAsync.write(to: dbQueue) { db in
+            try db.execute(
+                sql: "DELETE FROM raw_export_search_idx WHERE snapshot_id = ?",
+                arguments: [id]
+            )
+            try db.execute(
+                sql: "DELETE FROM raw_export_files WHERE snapshot_id = ?",
+                arguments: [id]
+            )
+            try db.execute(
+                sql: "DELETE FROM raw_export_asset_links WHERE snapshot_id = ?",
+                arguments: [id]
+            )
+            try? db.execute(
+                sql: "DELETE FROM conversation_raw_refs WHERE snapshot_id = ?",
+                arguments: [id]
+            )
+            try db.execute(
+                sql: "DELETE FROM raw_export_snapshots WHERE id = ?",
+                arguments: [id]
+            )
+            for orphan in prefetch.orphans {
+                try db.execute(
+                    sql: "DELETE FROM raw_export_blobs WHERE hash = ?",
+                    arguments: [orphan.hash]
+                )
+            }
+        }
+
+        // Step 3 (filesystem): Remove orphan blob files and the snapshot's
+        // manifest directory. Best-effort — a missing or already-deleted file
+        // shouldn't fail the whole operation. We sum bytes only for files we
+        // actually removed, so the reported `bytesFreed` matches what the
+        // user will see in `du`.
+        var bytesFreed: Int64 = 0
+        var blobsRemoved = 0
+        for orphan in prefetch.orphans {
+            guard !orphan.storedPath.isEmpty else { continue }
+            let url = URL(fileURLWithPath: orphan.storedPath)
+            if fileManager.fileExists(atPath: url.path) {
+                do {
+                    try fileManager.removeItem(at: url)
+                    bytesFreed += orphan.storedBytes
+                    blobsRemoved += 1
+                } catch {
+                    // Swallow — the row is already gone, so leaving the file
+                    // behind is at most a small disk leak that a future
+                    // sweep can catch. Surfacing this would block deletion
+                    // for a transient FS hiccup, which the user can't act on.
+                }
+            }
+        }
+        if let manifestPath = prefetch.manifestPath, !manifestPath.isEmpty {
+            let manifestDir = URL(fileURLWithPath: manifestPath).deletingLastPathComponent()
+            try? fileManager.removeItem(at: manifestDir)
+        }
+
+        return RawExportVaultDeleteResult(
+            snapshotID: id,
+            filesRemoved: prefetch.fileCount,
+            blobsGarbageCollected: blobsRemoved,
+            bytesFreed: bytesFreed
+        )
+    }
+
+    // MARK: - Restore helpers
+
+    private struct BlobRecord {
+        let hash: String
+        let sizeBytes: Int64
+        let storedSizeBytes: Int64
+        let compression: String
+        let storedPath: String
+    }
+
+    private func fetchBlobRecord(hash: String) async throws -> BlobRecord {
+        try await GRDBAsync.read(from: dbQueue) { db in
+            guard let row = try Row.fetchOne(
+                db,
+                sql: """
+                    SELECT hash, size_bytes, stored_size_bytes, compression, stored_path
+                    FROM raw_export_blobs
+                    WHERE hash = ?
+                    """,
+                arguments: [hash]
+            ) else {
+                throw RawExportVaultError.blobNotFound(hash: hash)
+            }
+            return BlobRecord(
+                hash: row["hash"],
+                sizeBytes: row["size_bytes"],
+                storedSizeBytes: row["stored_size_bytes"],
+                compression: row["compression"],
+                storedPath: row["stored_path"]
+            )
+        }
+    }
+
+    private func fetchFileEntry(
+        snapshotID: Int64,
+        relativePath: String
+    ) async throws -> RawExportFileEntry {
+        try await GRDBAsync.read(from: dbQueue) { db in
+            guard let row = try Row.fetchOne(
+                db,
+                sql: """
+                    SELECT
+                        f.snapshot_id    AS snapshot_id,
+                        f.relative_path  AS relative_path,
+                        f.blob_hash      AS blob_hash,
+                        f.size_bytes     AS size_bytes,
+                        b.stored_size_bytes AS stored_size_bytes,
+                        f.mime_type      AS mime_type,
+                        f.role           AS role,
+                        f.compression    AS compression,
+                        f.stored_path    AS stored_path
+                    FROM raw_export_files AS f
+                    LEFT JOIN raw_export_blobs AS b ON b.hash = f.blob_hash
+                    WHERE f.snapshot_id = ? AND f.relative_path = ?
+                    """,
+                arguments: [snapshotID, relativePath]
+            ) else {
+                // Distinguish "snapshot gone" from "snapshot exists but file
+                // missing" so the UI can word errors correctly.
+                if try Self.snapshotExists(snapshotID: snapshotID, in: db) {
+                    throw RawExportVaultError.fileNotFound(
+                        snapshotID: snapshotID,
+                        relativePath: relativePath
+                    )
+                } else {
+                    throw RawExportVaultError.snapshotNotFound(snapshotID: snapshotID)
+                }
+            }
+            return Self.fileEntry(from: row)
+        }
+    }
+
+    private static func snapshotExists(snapshotID: Int64, in db: Database) throws -> Bool {
+        try Bool.fetchOne(
+            db,
+            sql: "SELECT EXISTS(SELECT 1 FROM raw_export_snapshots WHERE id = ?)",
+            arguments: [snapshotID]
+        ) ?? false
+    }
+
+    private static func fileEntry(from row: Row) -> RawExportFileEntry {
+        let sizeBytes: Int64 = row["size_bytes"]
+        let storedSizeBytes: Int64 = row["stored_size_bytes"] ?? sizeBytes
+        return RawExportFileEntry(
+            snapshotID: row["snapshot_id"],
+            relativePath: row["relative_path"],
+            blobHash: row["blob_hash"],
+            sizeBytes: sizeBytes,
+            storedSizeBytes: storedSizeBytes,
+            mimeType: row["mime_type"],
+            role: row["role"],
+            compression: row["compression"],
+            storedPath: row["stored_path"]
+        )
+    }
+
     private func collectFiles(from urls: [URL], root: URL?) -> [CandidateFile] {
         var result: [CandidateFile] = []
         var seen = Set<String>()
@@ -428,45 +885,7 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
     }
 
     private func detectProvider(urls: [URL], root: URL?) -> RawExportProvider {
-        if let root {
-            if !chatGPTConversationChunks(in: root).isEmpty
-                || fileManager.fileExists(atPath: root.appendingPathComponent("export_manifest.json").path) {
-                return .chatGPT
-            }
-            if fileManager.fileExists(atPath: root.appendingPathComponent("conversations.json").path)
-                && fileManager.fileExists(atPath: root.appendingPathComponent("projects.json").path) {
-                return .claude
-            }
-            if !geminiActivityFiles(in: root).isEmpty {
-                return .gemini
-            }
-        }
-
-        for url in urls where url.pathExtension.lowercased() == "json" {
-            if let provider = providerFromJSONHeader(url) {
-                return provider
-            }
-        }
-        return .unknown
-    }
-
-    private func providerFromJSONHeader(_ url: URL) -> RawExportProvider? {
-        guard let data = try? Data(contentsOf: url),
-              let object = try? JSONSerialization.jsonObject(with: data),
-              let list = object as? [[String: Any]],
-              let first = list.first else {
-            return nil
-        }
-        if first["mapping"] != nil {
-            return .chatGPT
-        }
-        if first["chat_messages"] != nil {
-            return .claude
-        }
-        if first["time"] != nil, first["title"] != nil {
-            return .gemini
-        }
-        return nil
+        RawExportProviderDetector.detect(urls: urls, root: root, fileManager: fileManager)
     }
 
     private func prepareBlobData(
@@ -584,6 +1003,49 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
             || lower.hasSuffix(".xml")
     }
 
+    private static func lzfseDecompressed(_ data: Data, expectedSize: Int) -> Data? {
+        // Start with a buffer sized for the expected payload; retry with a
+        // doubled buffer if the runtime can't fit the output (some pathological
+        // LZFSE streams expand temporarily during decode). Cap retries so a
+        // corrupt blob can't trigger unbounded allocation.
+        let minimumCapacity = max(4_096, expectedSize + 1_024)
+        var capacity = minimumCapacity
+        for _ in 0..<4 {
+            if let result = decodeLZFSE(data, capacity: capacity), result.count == expectedSize {
+                return result
+            }
+            capacity *= 2
+        }
+        return nil
+    }
+
+    private static func decodeLZFSE(_ data: Data, capacity: Int) -> Data? {
+        data.withUnsafeBytes { sourceBuffer -> Data? in
+            guard let sourcePointer = sourceBuffer.bindMemory(to: UInt8.self).baseAddress else {
+                return nil
+            }
+            var output = Data(count: capacity)
+            let written = output.withUnsafeMutableBytes { destinationBuffer -> Int in
+                guard let destinationPointer = destinationBuffer.bindMemory(to: UInt8.self).baseAddress else {
+                    return 0
+                }
+                return compression_decode_buffer(
+                    destinationPointer,
+                    capacity,
+                    sourcePointer,
+                    data.count,
+                    nil,
+                    COMPRESSION_LZFSE
+                )
+            }
+            guard written > 0 else {
+                return nil
+            }
+            output.removeSubrange(written..<output.count)
+            return output
+        }
+    }
+
     private func lzfseCompressed(_ data: Data) -> Data? {
         let destinationCapacity = max(1_024, data.count + 1_024)
         return data.withUnsafeBytes { sourceBuffer in
@@ -615,7 +1077,7 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
     }
 
     private func blobURL(hash: String, compression: String) -> URL {
-        AppPaths.rawExportBlobsDir
+        storage.blobsDir
             .appendingPathComponent(String(hash.prefix(2)), isDirectory: true)
             .appendingPathComponent("\(hash).\(compression == "lzfse" ? "lzfse" : "blob")")
     }
@@ -633,7 +1095,11 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
         if ["projects.json", "users.json", "user.json", "user_settings.json", "memories.json"].contains(name) {
             return "metadata"
         }
-        if let mimeType = mimeType(forExtension: URL(fileURLWithPath: relativePath).pathExtension),
+        let pathExtension = URL(fileURLWithPath: relativePath).pathExtension.lowercased()
+        if Self.assetFileExtensions.contains(pathExtension) {
+            return "asset"
+        }
+        if let mimeType = mimeType(forExtension: pathExtension),
            mimeType.hasPrefix("image/") || mimeType == "application/pdf" {
             return "asset"
         }
@@ -645,10 +1111,12 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
     }
 
     private func mimeType(forExtension pathExtension: String) -> String? {
-        guard !pathExtension.isEmpty else {
+        let normalizedExtension = pathExtension.lowercased()
+        guard !normalizedExtension.isEmpty else {
             return nil
         }
-        return UTType(filenameExtension: pathExtension)?.preferredMIMEType
+        return UTType(filenameExtension: normalizedExtension)?.preferredMIMEType
+            ?? Self.fallbackMimeTypes[normalizedExtension]
     }
 
     private func relativePath(for file: URL, root: URL?) -> String {
@@ -690,35 +1158,6 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
         url.lastPathComponent.hasPrefix(".")
     }
 
-    private func chatGPTConversationChunks(in directory: URL) -> [URL] {
-        directoryChildren(in: directory).filter { url in
-            let name = url.lastPathComponent
-            return name.hasPrefix("conversations-") && name.hasSuffix(".json")
-        }
-    }
-
-    private func geminiActivityFiles(in directory: URL) -> [URL] {
-        recursiveFiles(in: directory).filter { url in
-            guard url.pathExtension.lowercased() == "json",
-                  let data = try? Data(contentsOf: url, options: .mappedIfSafe),
-                  let text = String(data: data.prefix(65_536), encoding: .utf8) else {
-                return false
-            }
-            return text.contains("\"header\"")
-                && text.contains("Gemini")
-                && text.contains("\"time\"")
-                && text.contains("\"title\"")
-        }
-    }
-
-    private func directoryChildren(in directory: URL) -> [URL] {
-        (try? fileManager.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-        )) ?? []
-    }
-
     private func safeTimestamp(_ value: String) -> String {
         value.replacingOccurrences(of: ":", with: "-")
             .replacingOccurrences(of: " ", with: "T")
@@ -743,6 +1182,258 @@ final class GRDBRawExportVault: RawExportVault, @unchecked Sendable {
 
     private static func sha256Hex(_ data: Data) -> String {
         SHA256.hash(data: data)
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+
+    private static let assetFileExtensions: Set<String> = [
+        "gif",
+        "heic",
+        "jpeg",
+        "jpg",
+        "mov",
+        "mp4",
+        "pdf",
+        "png",
+        "webm",
+        "webp"
+    ]
+
+    private static let fallbackMimeTypes: [String: String] = [
+        "gif": "image/gif",
+        "heic": "image/heic",
+        "jpeg": "image/jpeg",
+        "jpg": "image/jpeg",
+        "mov": "video/quicktime",
+        "mp4": "video/mp4",
+        "pdf": "application/pdf",
+        "png": "image/png",
+        "webm": "video/webm",
+        "webp": "image/webp"
+    ]
+
+    // MARK: - Schema
+
+    /// Install the 5 Vault tables (+ indexes) onto the given database.
+    /// Idempotent — all statements use `IF NOT EXISTS` so it can be replayed
+    /// after partial setup. `AppServices.bootstrapViewLayerSchema` calls this
+    /// during app startup; tests call it directly against a scratch queue.
+    static func installSchema(in db: Database) throws {
+        try db.execute(sql: """
+            CREATE TABLE IF NOT EXISTS raw_export_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider TEXT NOT NULL,
+                source_root TEXT,
+                imported_at TEXT NOT NULL,
+                manifest_hash TEXT NOT NULL,
+                file_count INTEGER NOT NULL,
+                new_blob_count INTEGER NOT NULL,
+                reused_blob_count INTEGER NOT NULL,
+                original_bytes INTEGER NOT NULL,
+                stored_bytes INTEGER NOT NULL,
+                manifest_path TEXT NOT NULL,
+                content_hash TEXT NOT NULL DEFAULT ''
+            )
+            """)
+        try db.execute(sql: """
+            CREATE INDEX IF NOT EXISTS idx_raw_export_snapshots_provider_time
+            ON raw_export_snapshots(provider, imported_at DESC, id DESC)
+            """)
+        // `content_hash` was added after the initial schema shipped. For
+        // databases created before this column existed, add it with a safe
+        // default ('') so the backfill pass below can populate it.
+        if try !Self.tableColumns(db: db, table: "raw_export_snapshots").contains("content_hash") {
+            try db.execute(sql: """
+                ALTER TABLE raw_export_snapshots
+                ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''
+                """)
+        }
+        // Partial unique index guards against duplicate ingests. Rows with an
+        // empty `content_hash` (pre-backfill or legacy) are excluded so the
+        // column can be added without breaking migration.
+        try db.execute(sql: """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_raw_export_snapshots_content_hash
+            ON raw_export_snapshots(content_hash)
+            WHERE content_hash <> ''
+            """)
+        try db.execute(sql: """
+            CREATE TABLE IF NOT EXISTS raw_export_blobs (
+                hash TEXT PRIMARY KEY,
+                size_bytes INTEGER NOT NULL,
+                stored_size_bytes INTEGER NOT NULL,
+                mime_type TEXT,
+                compression TEXT NOT NULL,
+                stored_path TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """)
+        try db.execute(sql: """
+            CREATE TABLE IF NOT EXISTS raw_export_files (
+                snapshot_id INTEGER NOT NULL,
+                relative_path TEXT NOT NULL,
+                blob_hash TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                mime_type TEXT,
+                role TEXT NOT NULL,
+                compression TEXT NOT NULL,
+                stored_path TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (snapshot_id, relative_path),
+                FOREIGN KEY(snapshot_id) REFERENCES raw_export_snapshots(id) ON DELETE CASCADE,
+                FOREIGN KEY(blob_hash) REFERENCES raw_export_blobs(hash)
+            )
+            """)
+        try db.execute(sql: """
+            CREATE INDEX IF NOT EXISTS idx_raw_export_files_blob
+            ON raw_export_files(blob_hash)
+            """)
+        try db.execute(sql: """
+            CREATE VIRTUAL TABLE IF NOT EXISTS raw_export_search_idx
+            USING fts5(
+                snapshot_id UNINDEXED,
+                blob_hash UNINDEXED,
+                provider UNINDEXED,
+                relative_path,
+                content,
+                tokenize="unicode61"
+            )
+            """)
+        try db.execute(sql: """
+            CREATE TABLE IF NOT EXISTS raw_export_asset_links (
+                snapshot_id INTEGER NOT NULL,
+                source_relative_path TEXT NOT NULL,
+                asset_relative_path TEXT NOT NULL,
+                blob_hash TEXT,
+                kind TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (snapshot_id, source_relative_path, asset_relative_path),
+                FOREIGN KEY(snapshot_id) REFERENCES raw_export_snapshots(id) ON DELETE CASCADE
+            )
+            """)
+        try db.execute(sql: """
+            CREATE INDEX IF NOT EXISTS idx_raw_export_asset_links_asset
+            ON raw_export_asset_links(snapshot_id, asset_relative_path)
+            """)
+
+        try Self.backfillContentHashes(in: db)
+    }
+
+    /// Populate `content_hash` for any legacy snapshots that predate the
+    /// column. Reads each snapshot's file list (provider + sorted
+    /// relative_path/blob_hash tuples), computes the stable digest, and
+    /// writes it back. Runs only on rows where `content_hash` is still empty
+    /// — once filled, the row is skipped on subsequent boots.
+    ///
+    /// When two legacy snapshots collapse to the same hash, the older one
+    /// (lowest `id`) is kept and the newer duplicates are **deleted
+    /// outright** along with their `raw_export_files` / `raw_export_search_idx`
+    /// / `raw_export_asset_links` / `conversation_raw_refs` rows. Earlier
+    /// versions of this method left duplicates with an empty `content_hash`
+    /// for "a future GC pass to prune"; that pass is now this code.
+    ///
+    /// No blob GC is needed here — by definition a duplicate snapshot
+    /// references the same `blob_hash` set as the kept one, so every blob
+    /// still has a referrer after the duplicate row goes away. (Plan A's
+    /// `deleteSnapshot` is the right tool when the snapshot has unique
+    /// blobs; this fast path is safe specifically because content_hash
+    /// equality guarantees blob-set equality.)
+    private static func backfillContentHashes(in db: Database) throws {
+        let pendingRows = try Row.fetchAll(
+            db,
+            sql: """
+                SELECT id, provider
+                FROM raw_export_snapshots
+                WHERE content_hash = ''
+                ORDER BY id ASC
+                """
+        )
+        guard !pendingRows.isEmpty else {
+            return
+        }
+
+        var seenHashes = Set<String>()
+        // Prime with already-backfilled rows so the first legacy snapshot
+        // collides with them, not the other way around.
+        if let existing = try? String.fetchAll(
+            db,
+            sql: "SELECT content_hash FROM raw_export_snapshots WHERE content_hash <> ''"
+        ) {
+            seenHashes.formUnion(existing)
+        }
+
+        for row in pendingRows {
+            let snapshotID: Int64 = row["id"]
+            let provider: String = row["provider"] ?? "unknown"
+            let fileRows = try Row.fetchAll(
+                db,
+                sql: """
+                    SELECT relative_path, blob_hash
+                    FROM raw_export_files
+                    WHERE snapshot_id = ?
+                    ORDER BY relative_path ASC
+                    """,
+                arguments: [snapshotID]
+            )
+            let pairs: [(String, String)] = fileRows.map { ($0["relative_path"], $0["blob_hash"]) }
+            let contentHash = Self.computeContentHash(provider: provider, files: pairs)
+            if seenHashes.contains(contentHash) {
+                // Duplicate of a kept snapshot (either pre-backfilled with
+                // a non-empty content_hash, or an earlier iteration of this
+                // loop). Drop the metadata rows; blobs are still safe
+                // because the kept snapshot references the same hashes.
+                try db.execute(
+                    sql: "DELETE FROM raw_export_search_idx WHERE snapshot_id = ?",
+                    arguments: [snapshotID]
+                )
+                try db.execute(
+                    sql: "DELETE FROM raw_export_files WHERE snapshot_id = ?",
+                    arguments: [snapshotID]
+                )
+                try db.execute(
+                    sql: "DELETE FROM raw_export_asset_links WHERE snapshot_id = ?",
+                    arguments: [snapshotID]
+                )
+                // `conversation_raw_refs` lives in the normalize layer; on
+                // databases that don't carry that table, this is a no-op.
+                try? db.execute(
+                    sql: "DELETE FROM conversation_raw_refs WHERE snapshot_id = ?",
+                    arguments: [snapshotID]
+                )
+                try db.execute(
+                    sql: "DELETE FROM raw_export_snapshots WHERE id = ?",
+                    arguments: [snapshotID]
+                )
+                continue
+            }
+            seenHashes.insert(contentHash)
+            try db.execute(
+                sql: "UPDATE raw_export_snapshots SET content_hash = ? WHERE id = ?",
+                arguments: [contentHash, snapshotID]
+            )
+        }
+    }
+
+    private static func tableColumns(db: Database, table: String) throws -> Set<String> {
+        let rows = try Row.fetchAll(db, sql: "PRAGMA table_info(\(table))")
+        return Set(rows.compactMap { $0["name"] as String? })
+    }
+
+    /// Stable digest of a snapshot's content: provider + sorted list of
+    /// (relativePath, blobHash). Intentionally excludes timestamps and the
+    /// import path so re-dropping the same export folder collapses to the
+    /// same hash.
+    static func computeContentHash(provider: String, files: [(String, String)]) -> String {
+        let sorted = files.sorted { $0.0 < $1.0 }
+        var hasher = SHA256()
+        hasher.update(data: Data("v1\n".utf8))
+        hasher.update(data: Data("\(provider)\n".utf8))
+        for (path, hash) in sorted {
+            hasher.update(data: Data(path.utf8))
+            hasher.update(data: Data("\t".utf8))
+            hasher.update(data: Data(hash.utf8))
+            hasher.update(data: Data("\n".utf8))
+        }
+        return hasher.finalize()
             .map { String(format: "%02x", $0) }
             .joined()
     }

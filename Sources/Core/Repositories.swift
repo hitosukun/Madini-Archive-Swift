@@ -312,6 +312,38 @@ struct ArchiveSearchFilter: Codable, Hashable, Sendable {
         get { models.count == 1 ? models.first : nil }
         set { models = Set(newValue.map { [$0] } ?? []) }
     }
+
+    /// True when this filter carries at least one dimension the current
+    /// DesignMock shell (keyword + single source + single model +
+    /// bookmarksOnly) has no UI path to produce. Used to evict legacy
+    /// saved_filters rows from the recent-filter surfaces — such rows
+    /// would otherwise linger forever because their `filter_hash` can
+    /// never match any new query the user can actually issue, so
+    /// `saveRecentFilter`'s dedup path never touches them.
+    ///
+    /// Applied to BOTH `kind = 'recent'` AND `kind = 'saved_view'` rows:
+    /// an earlier iteration spared saved_view "in case the user pinned
+    /// one intentionally," but the whole point of the tag-removal
+    /// refactor is that these dimensions can no longer be filtered
+    /// against, so a pinned row whose filter is unreachable is just
+    /// noise (user report: "にしつこく残ってる").
+    /// `bookmarkTags` is checked as "any entry" — the tag-picker UI
+    /// was removed and the `tag:` DSL token no longer round-trips
+    /// into recording, so any row with a tag is legacy.
+    ///
+    /// Keep in sync with `archiveFilter(from:)` in `DesignMockRootView`
+    /// — that function defines, in one place, which dimensions the
+    /// shell round-trips into a saved_filters row.
+    var isUnproducibleByCurrentShell: Bool {
+        if !sourceFiles.isEmpty { return true }
+        if !roles.isEmpty { return true }
+        if normalized(dateFrom) != nil { return true }
+        if normalized(dateTo) != nil { return true }
+        if sources.count > 1 { return true }
+        if models.count > 1 { return true }
+        if !bookmarkTags.isEmpty { return true }
+        return false
+    }
 }
 
 struct ConversationListQuery: Hashable, Sendable {
@@ -343,15 +375,25 @@ struct SearchQuery: Hashable, Sendable {
     let filter: ArchiveSearchFilter
     let offset: Int
     let limit: Int
+    /// Optional explicit ordering. `nil` keeps the repository's default
+    /// relevance-first ordering (FTS bm25 rank, then primary_time DESC);
+    /// a non-nil value asks the repository to dominate-sort by that key
+    /// and use relevance only as a tie-breaker. Set from the toolbar
+    /// `sort:` DSL so typed directives like `sort:updated-asc` actually
+    /// reach the SQL layer instead of being silently dropped on the
+    /// FTS path.
+    let sortKey: ConversationSortKey?
 
     init(
         filter: ArchiveSearchFilter,
         offset: Int,
-        limit: Int
+        limit: Int,
+        sortKey: ConversationSortKey? = nil
     ) {
         self.filter = filter
         self.offset = offset
         self.limit = limit
+        self.sortKey = sortKey
     }
 
     var normalizedText: String {
@@ -472,6 +514,72 @@ struct SourceModelFacet: Sendable, Hashable {
     let count: Int
 }
 
+// MARK: - Stats / Dashboard DTOs
+//
+// All five Dashboard charts are bounded aggregates over the active
+// `ArchiveSearchFilter`. The DTOs are intentionally Plain Old Swift —
+// no GRDB types reach the view layer, matching the AGENTS.md
+// repository pattern.
+//
+// Date representation follows the existing repo convention: short ISO
+// 8601 strings (`"YYYY-MM-DD"` for daily buckets, `"YYYY-MM"` for
+// monthly). The Stats path computes both via SQLite's `date()` /
+// `strftime()` over the `primary_time` COALESCE expression with the
+// `'localtime'` modifier — the "blue tile" timezone bug the SPEC
+// calls out is structurally prevented by always passing through
+// `'localtime'` at the SQL boundary, never converting in Swift.
+
+/// One bucket in the source-distribution chart (Stats view).
+/// `label` is the canonical source name (`"chatgpt"`, `"claude"`,
+/// `"gemini"`); markdown rows are filtered out at the WHERE level
+/// because Dashboard treats markdown imports as non-conversational
+/// content.
+struct SourceCount: Sendable, Hashable {
+    let label: String
+    let count: Int
+}
+
+/// One bucket in the model-distribution chart (Stats view).
+/// `label` is the model name; conversations whose `model` column is
+/// NULL or whitespace collapse into the single label `"Unknown"` so
+/// the chart never grows an unbounded "blank" slice.
+struct ModelCount: Sendable, Hashable {
+    let label: String
+    let count: Int
+}
+
+/// One column in the monthly-totals bar chart (Stats view).
+/// `yearMonth` is `"YYYY-MM"`. Both metrics travel together on the
+/// same DTO so the view's series-toggle Picker can flip between
+/// "conversations / month" and "prompts / month" without re-querying.
+struct MonthlyCount: Sendable, Hashable {
+    let yearMonth: String
+    let conversationCount: Int
+    let promptCount: Int
+}
+
+/// One cell in the daily heatmap (GitHub-contributions style).
+/// `date` is `"YYYY-MM-DD"` in localtime. `promptCount` is `COUNT()`
+/// over `messages.role = 'user'` joined to the active conversation
+/// scope — the per-message timestamp gap (Phase 0 finding: messages
+/// has no timestamp column) means every prompt within a conversation
+/// is bucketed by the conversation's `primary_time`.
+struct DailyCount: Sendable, Hashable {
+    let date: String
+    let promptCount: Int
+}
+
+/// One cell in the hour × weekday heatmap (Stats view).
+/// `weekday` is `0…6` (Sunday = 0, matches `strftime('%w')`),
+/// `hour` is `0…23` in localtime. `count` follows the same
+/// "all prompts within a conversation share the conversation's
+/// primary_time" rule as `DailyCount`.
+struct HourWeekdayCount: Sendable, Hashable {
+    let weekday: Int
+    let hour: Int
+    let count: Int
+}
+
 enum ProjectOrigin: String, Codable, Hashable, Sendable {
     case canonicalImport = "canonical_import"
     case userCreated = "user_created"
@@ -542,6 +650,28 @@ struct RawExportVaultResult: Hashable, Sendable {
     let originalBytes: Int64
     let storedBytes: Int64
     let manifestURL: URL
+    /// `true` when the ingest was a no-op because an existing snapshot with
+    /// the same stable content hash was found. The returned `snapshotID`
+    /// points to that prior snapshot, and byte / blob counts are zero.
+    let wasDuplicate: Bool
+}
+
+/// Summary of a `deleteSnapshot` call. Reports the metadata rows that went
+/// away plus the actually-orphaned blobs that were garbage-collected from
+/// disk. `bytesFreed` is the on-disk (compressed) size of the GC'd blobs —
+/// useful for "freed N MB" UI feedback.
+struct RawExportVaultDeleteResult: Hashable, Sendable {
+    let snapshotID: Int64
+    /// Number of `raw_export_files` rows removed.
+    let filesRemoved: Int
+    /// Number of blobs whose last reference was this snapshot, and which
+    /// were deleted from both the blobs table and the on-disk store.
+    let blobsGarbageCollected: Int
+    /// On-disk bytes reclaimed by the blob GC. Excludes metadata rows
+    /// (which are tiny) and the SQLite page-level overhead — i.e., this
+    /// is the number `du blobs/` will go down by, not the number
+    /// `du archive.db` will.
+    let bytesFreed: Int64
 }
 
 struct RawExportSnapshotSummary: Identifiable, Hashable, Sendable {
@@ -567,6 +697,68 @@ struct RawExportSearchResult: Identifiable, Hashable, Sendable {
 
     var id: String {
         "\(snapshotID):\(relativePath):\(blobHash)"
+    }
+}
+
+/// One file-level record inside a snapshot. This is the metadata view — the
+/// actual bytes live behind `loadBlob(hash:)` / `loadFile(...)`.
+struct RawExportFileEntry: Identifiable, Hashable, Sendable {
+    let snapshotID: Int64
+    let relativePath: String
+    let blobHash: String
+    /// Byte length of the original (uncompressed) file.
+    let sizeBytes: Int64
+    /// Byte length on disk. Differs from `sizeBytes` when `compression` is
+    /// anything other than `"none"`.
+    let storedSizeBytes: Int64
+    let mimeType: String?
+    /// `"conversation" | "metadata" | "manifest" | "asset" | "other"`.
+    let role: String
+    /// `"none" | "lzfse"`. Additional codecs can be added later without
+    /// breaking callers — `RawExportVaultError.unsupportedCompression` will
+    /// fire if an unknown value is encountered during restore.
+    let compression: String
+    /// Absolute path to the blob on disk. Present so tests and tooling can
+    /// assert filesystem layout; normal callers should prefer `loadBlob`.
+    let storedPath: String
+
+    var id: String { "\(snapshotID):\(relativePath)" }
+}
+
+/// A file's metadata plus its decompressed bytes. The bytes are hash-verified
+/// against `entry.blobHash` before being returned, so a successful return
+/// implies integrity.
+struct RawExportFilePayload: Sendable {
+    let entry: RawExportFileEntry
+    let data: Data
+}
+
+/// Errors surfaced by the restore / read side of the Vault. `ingest` still
+/// throws generic errors (I/O, GRDB) — this enum is specifically for the
+/// read path where we can describe the failure precisely.
+enum RawExportVaultError: Error, Sendable, Equatable {
+    case snapshotNotFound(snapshotID: Int64)
+    case fileNotFound(snapshotID: Int64, relativePath: String)
+    case blobNotFound(hash: String)
+    case blobFileMissing(hash: String, path: String)
+    case decompressionFailed(hash: String)
+    case hashMismatch(expected: String, actual: String)
+    case unsupportedCompression(String)
+}
+
+struct RawAssetHit: Identifiable, Hashable, Sendable {
+    let snapshotID: Int64
+    let sourceRelativePath: String
+    let assetRelativePath: String
+    let blobHash: String
+    let kind: String
+    let sizeBytes: Int64
+    let storedSizeBytes: Int64
+    let mimeType: String?
+    let compression: String
+
+    var id: String {
+        "\(snapshotID):\(sourceRelativePath):\(assetRelativePath)"
     }
 }
 
@@ -631,7 +823,12 @@ protocol ProjectSuggestionRepository: Sendable {
 }
 
 protocol RawExportVault: Sendable {
+    // MARK: Ingest
+
     func ingest(_ urls: [URL]) async throws -> RawExportVaultResult?
+
+    // MARK: Browse
+
     func listSnapshots(offset: Int, limit: Int) async throws -> [RawExportSnapshotSummary]
     func search(
         query: String,
@@ -639,6 +836,109 @@ protocol RawExportVault: Sendable {
         offset: Int,
         limit: Int
     ) async throws -> [RawExportSearchResult]
+
+    // MARK: Restore
+
+    /// Fetch a single snapshot summary by its database ID.
+    /// Returns `nil` when the snapshot does not exist.
+    func getSnapshot(id: Int64) async throws -> RawExportSnapshotSummary?
+
+    /// Page through the files that belong to a snapshot. Ordered by
+    /// `relative_path ASC` so results are stable across calls.
+    /// Throws `RawExportVaultError.snapshotNotFound` when the snapshot is
+    /// unknown — ingest never creates empty snapshots, so an unknown ID is
+    /// treated as a contract break rather than "empty page".
+    func listFiles(
+        snapshotID: Int64,
+        offset: Int,
+        limit: Int
+    ) async throws -> [RawExportFileEntry]
+
+    /// Read a blob by its SHA-256 hash. Transparently decompresses LZFSE.
+    /// The returned bytes are verified against `hash` before return.
+    /// Throws `RawExportVaultError.blobNotFound` / `.blobFileMissing` /
+    /// `.decompressionFailed` / `.hashMismatch` on integrity failures.
+    func loadBlob(hash: String) async throws -> Data
+
+    /// Read a specific file from a snapshot: looks up the file row, fetches
+    /// the blob, verifies integrity, and returns both metadata and bytes.
+    /// Throws `RawExportVaultError.snapshotNotFound` when the snapshot is
+    /// unknown, or `.fileNotFound` when the snapshot exists but does not
+    /// contain the given relative path.
+    func loadFile(
+        snapshotID: Int64,
+        relativePath: String
+    ) async throws -> RawExportFilePayload
+
+    // MARK: Delete
+
+    /// Remove a snapshot, its file/asset/search-index rows, and any blobs
+    /// that the snapshot was the *only* referrer of. Blobs still
+    /// referenced by other snapshots are left alone — that's the point of
+    /// content-addressed storage. The on-disk blob files are removed too,
+    /// not just the rows.
+    ///
+    /// Throws `RawExportVaultError.snapshotNotFound` if the id is unknown.
+    /// The DB mutation runs in a single transaction; filesystem cleanup
+    /// runs after the transaction commits, on a best-effort basis (a
+    /// failed `removeItem` on one orphan blob doesn't fail the whole
+    /// call). Returns counts so the caller can tell the user how much
+    /// space was reclaimed.
+    @discardableResult
+    func deleteSnapshot(id: Int64) async throws -> RawExportVaultDeleteResult
+}
+
+protocol RawAssetResolver: Sendable {
+    /// Resolve one asset reference inside a snapshot. `reference` can be an
+    /// exact relative path or the basename seen in an export JSON field.
+    /// Returns `nil` when the snapshot exists but no asset matches.
+    func resolveAsset(
+        snapshotID: Int64,
+        reference: String
+    ) async throws -> RawAssetHit?
+
+    /// Page through the assets referenced by one textual export file.
+    /// Throws `RawExportVaultError.snapshotNotFound` when the snapshot is
+    /// unknown.
+    func assetsReferencedBy(
+        snapshotID: Int64,
+        sourceRelativePath: String,
+        offset: Int,
+        limit: Int
+    ) async throws -> [RawAssetHit]
+}
+
+/// Aggregations over the active `ArchiveSearchFilter` for the
+/// Dashboard / Stats middle-pane mode. Every call returns a bounded
+/// list (top-N for category breakdowns, fixed shape for time-axis
+/// charts) so the view layer can render without virtualization.
+///
+/// All implementations must be pure aggregations — they never write
+/// to the DB, never persist intermediates. Per AGENTS.md, Stats is a
+/// derived view.
+protocol StatsRepository: Sendable {
+    /// Conversation count per source. Markdown is excluded at the
+    /// WHERE level (consistent with the conversation list and search
+    /// paths). Sorted by count desc, label asc as a tie-breaker.
+    func sourceBreakdown(filter: ArchiveSearchFilter) async throws -> [SourceCount]
+    /// Conversation + prompt count per `YYYY-MM`. Bounded to the
+    /// most recent 24 months in the result set so the view's bar
+    /// chart renders predictably; older buckets are still queried
+    /// but only the trailing 24 are returned.
+    func monthlyBreakdown(filter: ArchiveSearchFilter) async throws -> [MonthlyCount]
+    /// Prompt count per `YYYY-MM-DD` localtime. Bounded to the most
+    /// recent 365 days. Used for the GitHub-contributions style
+    /// daily heatmap.
+    func dailyHeatmap(filter: ArchiveSearchFilter) async throws -> [DailyCount]
+    /// Prompt count per (weekday, hour) localtime. Returns up to
+    /// 7 × 24 = 168 cells; missing cells are zero by convention
+    /// (the view fills them in).
+    func hourWeekdayHeatmap(filter: ArchiveSearchFilter) async throws -> [HourWeekdayCount]
+    /// Conversation count per model name, with NULL / blank model
+    /// folded into the `"Unknown"` bucket. Top 10 only — model names
+    /// have a long tail (every quarter ships new variants) and the
+    /// chart can't render 60+ rows usefully.
+    func modelBreakdown(filter: ArchiveSearchFilter) async throws -> [ModelCount]
 }
 
 protocol BookmarkRepository: Sendable {
@@ -702,6 +1002,15 @@ protocol ViewService: Sendable {
     /// Toggle the pinned flag on a saved_filters row regardless of `kind`.
     @discardableResult
     func togglePinnedFilter(id: Int, targetType: ViewTargetType) async throws -> Bool
+    /// Rename a saved_filters row's user-visible label. Used by the
+    /// "name-on-pin" flow — the same row can carry a user-given title
+    /// (e.g. "Q1 rollouts") instead of the auto-generated recent label
+    /// ("source: chatgpt / 2026-04-10").
+    /// Promotes the row to `kind = 'saved_view'` as a side effect so it
+    /// stops competing with pure autogenerated recents for the recent
+    /// cap. Returns `true` if a row was updated.
+    @discardableResult
+    func renameFilter(id: Int, targetType: ViewTargetType, newName: String) async throws -> Bool
     /// Delete any saved_filters row by id/target (pinned or recent).
     @discardableResult
     func deleteFilter(id: Int, targetType: ViewTargetType) async throws -> Bool

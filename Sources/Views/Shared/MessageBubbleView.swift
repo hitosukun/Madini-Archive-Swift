@@ -4,7 +4,98 @@ import AppKit
 #else
 import UIKit
 #endif
+import NaturalLanguage
 import SwiftMath
+
+/// Describes an in-thread search that bubbles should paint keyword-level
+/// highlights for. Threaded through the view tree via
+/// `EnvironmentValues.searchHighlight` so every `MessageBubbleView` can
+/// react independently — no need to plumb a Set of IDs through the
+/// `ConversationDetailView` init.
+///
+/// Semantics:
+/// - `query` empty / whitespace → no highlight (cheap no-op path).
+/// - `activeAnchorID` matches the current block's anchor +
+///   `activeOccurrenceInBlock == N` → the Nth (0-indexed) occurrence
+///   inside that specific rendered block is the single "you are here"
+///   hit and gets the hot color; every other occurrence (in this
+///   block, in other blocks of this message, or across the thread)
+///   stays in the dim "also hit" color.
+/// - `activeAnchorID` matches the current block with
+///   `activeOccurrenceInBlock == nil` → every occurrence in this block
+///   gets the hot color (block-level cursor). Retained so non-per-
+///   occurrence callers keep working.
+///
+/// The anchor id is threaded EXPLICITLY down `MessageBubbleView`'s
+/// render chain (`renderItem` → `renderBlock` → per-block helpers →
+/// `applyingSearchHighlight`) as a `blockAnchorID` parameter. For user
+/// messages it's the message id; for rendered assistant replies it's
+/// the per-render-item block anchor id produced by
+/// `searchBlockAnchorID(messageID:blockIndex:)`. Earlier iterations
+/// tried to deliver this via `@Environment`, but `@Environment` on a
+/// view reads from the PARENT scope — writing
+/// `.environment(\.currentSearchBlockAnchor, …)` inside the view's own
+/// body never flowed back to `self`'s env read, so the hot cursor was
+/// silently painted with `nil` and never showed up. This granularity
+/// is what keeps the "hot" highlight on the *one* match the find bar's
+/// N/M cursor points at in a long assistant reply with many matches.
+struct SearchHighlightSpec: Equatable {
+    var query: String
+    /// Anchor id (user message id OR assistant block anchor id) that
+    /// contains the active match. `nil` → no block is hot.
+    var activeAnchorID: String?
+    /// Which occurrence inside the active block is the current jump
+    /// target. 0-indexed against a case-insensitive left-to-right scan
+    /// of that block's rendered text (the same scan
+    /// `applyingSearchHighlight` uses). `nil` falls back to block-level
+    /// highlight so older call sites keep working.
+    var activeOccurrenceInBlock: Int?
+
+    var normalizedQuery: String {
+        query.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var isEmpty: Bool { normalizedQuery.isEmpty }
+}
+
+private struct SearchHighlightKey: EnvironmentKey {
+    static let defaultValue: SearchHighlightSpec? = nil
+}
+
+extension EnvironmentValues {
+    var searchHighlight: SearchHighlightSpec? {
+        get { self[SearchHighlightKey.self] }
+        set { self[SearchHighlightKey.self] = newValue }
+    }
+}
+
+/// Phase 4 env-delivered hook so user-authored message bubbles can
+/// expose a pin toggle without `MessageBubbleView` needing to know
+/// which conversation owns them or which repository/store backs the
+/// bookmark state. The host (`ConversationDetailView`'s caller, or
+/// the DesignMock shell) captures the conversation id inside the
+/// closures and seeds `isPinned` from an observable set so the
+/// bubble re-renders the moment the pin flips.
+struct PromptBookmarkBridge {
+    /// `true` when the given message id is currently pinned. Cheap —
+    /// implementations back this with a `Set<String>` lookup.
+    var isPinned: (_ promptID: String) -> Bool
+    /// Toggle the pin for the given message id. `snippet` is a short
+    /// excerpt the sidebar list uses to render the row without
+    /// re-fetching the message body.
+    var toggle: (_ promptID: String, _ snippet: String) -> Void
+}
+
+private struct PromptBookmarkBridgeKey: EnvironmentKey {
+    static let defaultValue: PromptBookmarkBridge? = nil
+}
+
+extension EnvironmentValues {
+    var promptBookmarkBridge: PromptBookmarkBridge? {
+        get { self[PromptBookmarkBridgeKey.self] }
+        set { self[PromptBookmarkBridgeKey.self] = newValue }
+    }
+}
 
 struct MessageBubbleView: View, Equatable {
     enum DisplayMode {
@@ -27,6 +118,7 @@ struct MessageBubbleView: View, Equatable {
         lhs.message == rhs.message
             && lhs.displayMode == rhs.displayMode
             && lhs.identityContext == rhs.identityContext
+            && lhs.conversationPrimaryLanguage == rhs.conversationPrimaryLanguage
     }
 
     private enum Layout {
@@ -74,12 +166,46 @@ struct MessageBubbleView: View, Equatable {
     let message: Message
     let displayMode: DisplayMode
     let identityContext: MessageIdentityContext?
+    /// Conversation-level primary language detected up-front by
+    /// `ConversationDetailView` (or `nil` if undetermined). Threaded
+    /// through to the foreign-language grouper so its "is this run
+    /// foreign?" check compares against the thread's actual native
+    /// language, not the system locale — Japanese-primary threads
+    /// rendered on an English-locale Mac were getting their
+    /// Japanese answers folded into a "translate" disclosure.
+    let conversationPrimaryLanguage: NLLanguage?
     @Environment(IdentityPreferencesStore.self) private var identityPreferences
+    /// Optional find-in-page spec. SwiftUI tracks this as an environment
+    /// dependency of `body`, so even though `.equatable()` short-circuits
+    /// on structural input equality (`message`, `displayMode`,
+    /// `identityContext`), environment writes still trigger a re-render —
+    /// which is exactly what we want when the user types into the find
+    /// bar.
+    @Environment(\.searchHighlight) private var searchHighlight
+    /// Optional Phase 4 pin bridge. When present, user-message bubbles
+    /// render a small bookmark toggle next to their byline; when nil
+    /// (legacy callers / previews that don't wire a bridge), the
+    /// affordance is omitted entirely.
+    @Environment(\.promptBookmarkBridge) private var promptBookmarkBridge
+    /// Per-conversation asset handles + per-message attachment index
+    /// published by `ConversationDetailView` after the raw transcript
+    /// load finishes. When present, any images attached to this
+    /// message (user-uploaded photos on ChatGPT, Claude image blocks)
+    /// render above the text via `RawTranscriptImageView`. When
+    /// `nil` — mock data, Gemini conversations, conversations whose
+    /// raw JSON isn't vaulted, or the brief window before extraction
+    /// resolves — bubbles render text-only, same as before.
+    @Environment(\.messageAssetContext) private var messageAssetContext
     #if os(macOS)
     @Environment(\.openSettings) private var openSettings
     #endif
 
     var body: some View {
+        bodyContent
+    }
+
+    @ViewBuilder
+    private var bodyContent: some View {
         // Two layouts:
         //
         // - **User** → classic speech-bubble form. Avatar lives in its own
@@ -95,25 +221,124 @@ struct MessageBubbleView: View, Equatable {
         //   in). A compact inline byline at the top carries the avatar +
         //   name; content flows out to the full pane width below it.
         if message.isUser {
-            // Leading Spacer + trailing-capped bubble = iMessage-style
-            // right-hugging layout. Short prompts sit compactly next to
-            // the avatar; long prompts wrap at `Layout.userBubbleMaxWidth`
-            // rather than stretching the full pane width, so the bubble
-            // always looks like it's anchored to the avatar instead of
-            // floating as a full-bleed banner.
-            HStack(alignment: .top, spacing: 10) {
-                Spacer(minLength: 0)
-
-                userMessageColumn
-                    .frame(maxWidth: Layout.userBubbleMaxWidth, alignment: .trailing)
-
-                avatarButton(size: Layout.avatarSize)
-                    .frame(width: Layout.avatarColumnWidth, alignment: .topTrailing)
+            // Two user-side layouts, chosen per-pane-width via
+            // `ViewThatFits`:
+            //
+            // - **Wide** (pane ≥ ~600pt): iMessage-style right-hug.
+            //   Leading Spacer, bubble capped at
+            //   `Layout.userBubbleMaxWidth`, dedicated avatar column
+            //   on the right. Short prompts sit compactly next to
+            //   the avatar; long prompts wrap at the cap rather than
+            //   stretching edge-to-edge, so the bubble reads as
+            //   anchored to the avatar instead of a full-bleed
+            //   banner.
+            //
+            // - **Narrow** (pane < ~600pt): avatar moves INLINE with
+            //   the byline above the bubble, and the bubble fills
+            //   the pane's full width. At narrow widths the trailing
+            //   avatar column costs 52pt of horizontal budget the
+            //   prompt text can't spare — the inline byline style
+            //   (same pattern the assistant side uses) gives the
+            //   bubble ~50pt more breathing room, which is enough to
+            //   keep a typical prompt line from wrapping awkwardly.
+            //
+            // The wide candidate carries an explicit `minWidth` so
+            // `ViewThatFits` has an honest rejection criterion —
+            // otherwise the HStack's ideal size (tiny Spacer + short
+            // bubble + fixed avatar) fits everywhere and the narrow
+            // fallback is unreachable.
+            ViewThatFits(in: .horizontal) {
+                wideUserLayout
+                    .frame(minWidth: 600)
+                narrowUserLayout
             }
         } else {
             assistantMessageColumn
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
+    }
+
+    /// Wide layout for user messages — classic trailing-avatar speech
+    /// bubble. See `body` for the size-class rationale.
+    private var wideUserLayout: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Spacer(minLength: 0)
+
+            userMessageColumn
+                .frame(maxWidth: Layout.userBubbleMaxWidth, alignment: .trailing)
+
+            avatarButton(size: Layout.avatarSize)
+                .frame(width: Layout.avatarColumnWidth, alignment: .topTrailing)
+        }
+    }
+
+    /// Narrow layout for user messages — inline byline + full-width
+    /// bubble. Avatar sits in the byline row (same treatment as the
+    /// assistant side) rather than stealing a dedicated trailing
+    /// column, reclaiming ~50pt of horizontal budget for the prompt
+    /// text itself.
+    private var narrowUserLayout: some View {
+        VStack(alignment: .trailing, spacing: 4) {
+            HStack(alignment: .center, spacing: 8) {
+                Spacer(minLength: 0)
+
+                if let bridge = promptBookmarkBridge {
+                    pinToggle(bridge: bridge)
+                }
+                Text(identityPresentation.displayName)
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                    .foregroundStyle(identityPresentation.accentColor)
+
+                avatarButton(size: Layout.avatarSize)
+            }
+
+            attachmentImagesView(alignment: .trailing)
+
+            Text(highlightedVerbatim(message.content, blockAnchorID: message.id))
+                .font(.system(size: Layout.bodyFontSize))
+                .textSelection(.enabled)
+                .multilineTextAlignment(.leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(12)
+                .background(bubbleBackground)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+        }
+    }
+
+    /// Pin toggle rendered inside the user-message byline when a
+    /// `PromptBookmarkBridge` is available in the environment. Clicking
+    /// flips the bookmark for this specific message; the shell observes
+    /// the resulting set and updates the sidebar Bookmarks disclosure.
+    /// Kept snug (14pt glyph) so it reads as a secondary affordance
+    /// rather than a competing primary action to the avatar.
+    @ViewBuilder
+    private func pinToggle(bridge: PromptBookmarkBridge) -> some View {
+        let pinned = bridge.isPinned(message.id)
+        Button {
+            bridge.toggle(message.id, pinSnippet)
+        } label: {
+            Image(systemName: pinned ? "bookmark.fill" : "bookmark")
+                .font(.caption)
+                .foregroundStyle(pinned ? Color.yellow : Color.secondary)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(pinned ? "Unpin this prompt" : "Pin this prompt")
+    }
+
+    /// Short excerpt stored in the bookmark payload so the sidebar row
+    /// can render without re-loading the full message. Collapse
+    /// whitespace runs first — otherwise `prefix(140)` on a prompt that
+    /// starts with "\n\n" would emit a row that looks blank.
+    private var pinSnippet: String {
+        let collapsed = message.content
+            .replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\t", with: " ")
+        let trimmed = collapsed.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.count <= 140 { return trimmed }
+        return String(trimmed.prefix(140)) + "…"
     }
 
     /// The avatar is a gateway into the Settings window where the user
@@ -150,10 +375,19 @@ struct MessageBubbleView: View, Equatable {
     /// both sides.
     private var userMessageColumn: some View {
         VStack(alignment: .trailing, spacing: 4) {
-            Text(identityPresentation.displayName)
-                .font(.caption)
-                .fontWeight(.semibold)
-                .foregroundStyle(identityPresentation.accentColor)
+            // Byline row: pin toggle (when the env bridge is wired) to
+            // the left of the name. The pin sits outside the bubble so
+            // it stays visually at the "header" level — the prompt
+            // bubble itself is the payload, the header is the metadata.
+            HStack(spacing: 6) {
+                if let bridge = promptBookmarkBridge {
+                    pinToggle(bridge: bridge)
+                }
+                Text(identityPresentation.displayName)
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                    .foregroundStyle(identityPresentation.accentColor)
+            }
 
             // User prompts render verbatim regardless of display mode.
             // The raw input often contains markdown-significant prefixes
@@ -168,7 +402,14 @@ struct MessageBubbleView: View, Equatable {
             // width (capped by the parent's max-width frame), not to
             // stretch to fill. That's what lets a short prompt produce
             // a short bubble.
-            Text(verbatim: message.content)
+            // Attachments (images the user uploaded alongside this
+            // prompt) render above the text bubble, right-aligned so
+            // they visually belong to the user's column. Skipped when
+            // the environment has no resolved asset context — the
+            // normal text-only reader path.
+            attachmentImagesView(alignment: .trailing)
+
+            Text(highlightedVerbatim(message.content, blockAnchorID: message.id))
                 .font(.system(size: Layout.bodyFontSize))
                 .textSelection(.enabled)
                 .multilineTextAlignment(.leading)
@@ -201,19 +442,65 @@ struct MessageBubbleView: View, Equatable {
             }
 
             VStack(alignment: .leading, spacing: 10) {
+                // Attachments — same rationale as the user-side
+                // column. Assistants can return image blocks too (for
+                // example, Claude's vision responses), so this isn't
+                // user-exclusive.
+                attachmentImagesView(alignment: .leading)
+
                 // Assistant replies render fully — their markdown is
                 // meaningful output (headings, lists, code blocks). The
                 // `.plain` display mode switches to verbatim text, same
                 // as user prompts, so power-users can inspect raw
                 // content without losing formatting chars.
                 if displayMode == .plain {
-                    Text(verbatim: message.content)
+                    Text(highlightedVerbatim(message.content, blockAnchorID: message.id))
                         .font(.system(size: Layout.bodyFontSize))
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 } else {
-                    ForEach(Array(renderItems.enumerated()), id: \.offset) { _, item in
-                        renderItem(item)
+                    ForEach(Array(renderItems.enumerated()), id: \.offset) { offset, item in
+                        let anchorID = Self.searchBlockAnchorID(
+                            messageID: message.id,
+                            blockIndex: offset
+                        )
+                        // Pass the anchor EXPLICITLY to `renderItem` so
+                        // `applyingSearchHighlight` — called deep inside
+                        // the render chain — compares against the right
+                        // per-block id. An earlier env-based delivery
+                        // (`.environment(\.currentSearchBlockAnchor,…)`)
+                        // didn't work because @Environment on
+                        // MessageBubbleView reads its PARENT scope, not
+                        // any `.environment(...)` written inside its
+                        // own body — the env write was silently nil at
+                        // the call site and the orange cursor never
+                        // painted.
+                        renderItem(item, blockAnchorID: anchorID)
+                            // Register a scroll target per block so the
+                            // find-bar's Next/Prev can land on the
+                            // specific match inside a long reply,
+                            // rather than always snapping back to the
+                            // message top.
+                            .id(anchorID)
+                            // Publish this block's top-Y so the
+                            // convergence loop in
+                            // `performProgrammaticScroll` can tell when
+                            // a block-level jump has actually landed,
+                            // instead of always eating its full
+                            // 480ms timeout because the target id
+                            // never shows up in the offset cache.
+                            .background(
+                                GeometryReader { proxyGeo in
+                                    Color.clear.preference(
+                                        key: PromptTopYPreferenceKey.self,
+                                        value: [
+                                            anchorID: proxyGeo.frame(
+                                                in: .named(ReaderScrollCoordinateSpace.name)
+                                            ).minY
+                                        ]
+                                    )
+                                }
+                            )
                     }
                 }
             }
@@ -229,30 +516,46 @@ struct MessageBubbleView: View, Equatable {
     // MARK: - Block rendering
 
     @ViewBuilder
-    private func renderItem(_ item: MessageRenderItem) -> some View {
+    private func renderItem(
+        _ item: MessageRenderItem,
+        blockAnchorID: String
+    ) -> some View {
         switch item {
         case .block(let block):
-            renderBlock(block)
+            renderBlock(block, blockAnchorID: blockAnchorID)
         case .foreignLanguageGroup(let language, let blocks):
             ForeignLanguageBlockView(language: language, blocks: blocks) { displayBlocks in
+                // All sub-blocks inside a foreign-language group share
+                // the outer group's anchor, so matches inside any
+                // paragraph of the group hot-color as a single unit
+                // when the find bar's cursor points at this group.
                 ForEach(Array(displayBlocks.enumerated()), id: \.offset) { _, block in
-                    renderBlock(block)
+                    renderBlock(block, blockAnchorID: blockAnchorID)
                 }
             }
         }
     }
 
     @ViewBuilder
-    private func renderBlock(_ block: ContentBlock) -> some View {
+    private func renderBlock(
+        _ block: ContentBlock,
+        blockAnchorID: String
+    ) -> some View {
         switch block {
         case .paragraph(let text):
-            paragraphView(text)
+            paragraphView(text, blockAnchorID: blockAnchorID)
         case .heading(let level, let text):
-            headingView(level: level, text: text)
+            headingView(level: level, text: text, blockAnchorID: blockAnchorID)
         case .listItem(let ordered, let depth, let text, let marker):
-            listItemView(ordered: ordered, depth: depth, text: text, marker: marker)
+            listItemView(
+                ordered: ordered,
+                depth: depth,
+                text: text,
+                marker: marker,
+                blockAnchorID: blockAnchorID
+            )
         case .blockquote(let text):
-            blockquoteView(text)
+            blockquoteView(text, blockAnchorID: blockAnchorID)
         case .code(let language, let code):
             CodeBlockView(language: language, code: code, fontSize: Layout.codeFontSize)
         case .math(let source):
@@ -263,21 +566,39 @@ struct MessageBubbleView: View, Equatable {
                 rows: rows,
                 alignments: alignments,
                 fontSize: Layout.bodyFontSize,
-                renderInline: { renderInlineRich($0, fontSize: Layout.bodyFontSize) }
+                renderInline: { text in
+                    // Capture this block's anchor so the table's inline
+                    // cells flow through the same hot/dim decision as
+                    // top-level paragraphs in this block.
+                    renderInlineRich(
+                        text,
+                        fontSize: Layout.bodyFontSize,
+                        blockAnchorID: blockAnchorID
+                    )
+                }
             )
         case .horizontalRule:
             Divider()
                 .padding(.vertical, 4)
+        case .image(let url, let alt):
+            imageBlockView(url: url, alt: alt)
         }
     }
 
     @ViewBuilder
-    private func paragraphView(_ text: String) -> some View {
+    private func paragraphView(
+        _ text: String,
+        blockAnchorID: String
+    ) -> some View {
         let rendered: Text = {
             if canRenderMarkdown(text) {
-                return renderInlineRich(text, fontSize: Layout.bodyFontSize)
+                return renderInlineRich(
+                    text,
+                    fontSize: Layout.bodyFontSize,
+                    blockAnchorID: blockAnchorID
+                )
             }
-            return Text(verbatim: text)
+            return Text(highlightedVerbatim(text, blockAnchorID: blockAnchorID))
         }()
 
         rendered
@@ -288,7 +609,11 @@ struct MessageBubbleView: View, Equatable {
     }
 
     @ViewBuilder
-    private func headingView(level: Int, text: String) -> some View {
+    private func headingView(
+        level: Int,
+        text: String,
+        blockAnchorID: String
+    ) -> some View {
         let size: CGFloat = {
             switch level {
             case 1: return Layout.heading1FontSize
@@ -298,7 +623,7 @@ struct MessageBubbleView: View, Equatable {
             }
         }()
 
-        renderInlineRich(text, fontSize: size)
+        renderInlineRich(text, fontSize: size, blockAnchorID: blockAnchorID)
             .font(.system(size: size, weight: .semibold))
             .textSelection(.enabled)
             .padding(.top, level <= 2 ? 6 : 2)
@@ -308,14 +633,24 @@ struct MessageBubbleView: View, Equatable {
     }
 
     @ViewBuilder
-    private func listItemView(ordered: Bool, depth: Int, text: String, marker: String) -> some View {
+    private func listItemView(
+        ordered: Bool,
+        depth: Int,
+        text: String,
+        marker: String,
+        blockAnchorID: String
+    ) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 6) {
             Text(marker)
                 .font(.system(size: Layout.bodyFontSize).monospacedDigit())
                 .foregroundStyle(.secondary)
                 .frame(minWidth: ordered ? 22 : 14, alignment: .trailing)
 
-            renderInlineRich(text, fontSize: Layout.bodyFontSize)
+            renderInlineRich(
+                text,
+                fontSize: Layout.bodyFontSize,
+                blockAnchorID: blockAnchorID
+            )
                 .font(.system(size: Layout.bodyFontSize))
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -325,13 +660,20 @@ struct MessageBubbleView: View, Equatable {
     }
 
     @ViewBuilder
-    private func blockquoteView(_ text: String) -> some View {
+    private func blockquoteView(
+        _ text: String,
+        blockAnchorID: String
+    ) -> some View {
         HStack(alignment: .top, spacing: 8) {
             RoundedRectangle(cornerRadius: 1.5, style: .continuous)
                 .fill(Color.accentColor.opacity(0.6))
                 .frame(width: 3)
 
-            renderInlineRich(text, fontSize: Layout.bodyFontSize)
+            renderInlineRich(
+                text,
+                fontSize: Layout.bodyFontSize,
+                blockAnchorID: blockAnchorID
+            )
                 .font(.system(size: Layout.bodyFontSize).italic())
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)
@@ -339,6 +681,219 @@ struct MessageBubbleView: View, Equatable {
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(.vertical, 2)
+    }
+
+    /// Render a markdown image block. Behaviour depends on the URL
+    /// scheme — transcripts end up carrying a mix of:
+    ///
+    ///   * **`http(s)://…`** — mostly external image hosts pasted by
+    ///     the user or retrieved by the assistant. These are the only
+    ///     URLs we can actually fetch from the reader, so we hand
+    ///     them to `AsyncImage`. While the image is in flight we
+    ///     reserve a small placeholder band so the message doesn't
+    ///     jump around during load.
+    ///   * **`sandbox:/mnt/data/…`** (ChatGPT-generated images) — the
+    ///     URL is meaningful only inside the ChatGPT sandbox. The
+    ///     primary reader can't resolve it from the DB row alone; the
+    ///     canonical rendering path for these lives in the raw
+    ///     transcript view, which has access to the export vault and
+    ///     asset resolver. We degrade gracefully: show a labelled
+    ///     placeholder with the alt text so the reader still sees
+    ///     "there was an image here" instead of a raw `![…](…)`
+    ///     fragment.
+    ///   * **Everything else** (bare filenames, `data:` URIs, etc.) —
+    ///     treat as unresolvable for now and render the same labelled
+    ///     placeholder.
+    ///
+    /// The alt caption, when present, renders in secondary foreground
+    /// under the image so the description is preserved regardless of
+    /// whether the image itself loaded.
+    @ViewBuilder
+    private func imageBlockView(url: String, alt: String) -> some View {
+        let parsed = URL(string: url)
+        let scheme = parsed?.scheme?.lowercased()
+        let isFetchable = scheme == "http" || scheme == "https"
+
+        VStack(alignment: .leading, spacing: 6) {
+            if isFetchable, let parsed {
+                AsyncImage(url: parsed) { phase in
+                    switch phase {
+                    case .empty:
+                        imageLoadingBand()
+                    case .success(let image):
+                        image
+                            .resizable()
+                            .scaledToFit()
+                            .frame(maxWidth: .infinity, maxHeight: 480, alignment: .leading)
+                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    case .failure:
+                        imageUnresolvedView(alt: alt, target: url, reason: .loadFailed)
+                    @unknown default:
+                        imageUnresolvedView(alt: alt, target: url, reason: .unknown)
+                    }
+                }
+            } else {
+                imageUnresolvedView(alt: alt, target: url, reason: .unfetchableScheme(scheme))
+            }
+
+            if !alt.isEmpty {
+                Text(alt)
+                    .font(.system(size: Layout.bodyFontSize - 2))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 4)
+    }
+
+    /// In-flight band shown while `AsyncImage` fetches a remote image.
+    /// Fixed height so the surrounding layout doesn't jump once the
+    /// real image lands; width is left flexible so the band spans the
+    /// reader column.
+    @ViewBuilder
+    private func imageLoadingBand() -> some View {
+        HStack(spacing: 8) {
+            ProgressView()
+                .controlSize(.small)
+            Text("画像を読み込み中…")
+                .font(.system(size: Layout.bodyFontSize - 2))
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, minHeight: 80, alignment: .leading)
+        .padding(.horizontal, 12)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.secondary.opacity(0.08))
+        )
+    }
+
+    /// Fallback presentation for image references the primary reader
+    /// can't fetch (sandbox paths, bare filenames, load failures).
+    /// Keeps the "an image was here" cue visible without spamming the
+    /// reader with raw `![…](…)` markdown. The URL text is selectable
+    /// so power users can copy it into the raw transcript view, which
+    /// DOES know how to resolve sandbox assets via
+    /// `RawTranscriptImageView`.
+    private enum ImageUnresolvedReason {
+        case unfetchableScheme(String?)
+        case loadFailed
+        case unknown
+    }
+
+    @ViewBuilder
+    private func imageUnresolvedView(
+        alt: String,
+        target: String,
+        reason: ImageUnresolvedReason
+    ) -> some View {
+        let caption: String = {
+            switch reason {
+            case .unfetchableScheme(let scheme):
+                if let scheme, scheme == "sandbox" {
+                    return "サンドボックス内の画像（生の書き出しビューでのみ表示）"
+                }
+                if let scheme {
+                    return "\(scheme): スキームの画像は表示できません"
+                }
+                return "画像の場所を解決できません"
+            case .loadFailed:
+                return "画像を読み込めませんでした"
+            case .unknown:
+                return "画像を表示できません"
+            }
+        }()
+
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "photo")
+                .font(.system(size: 18))
+                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(caption)
+                    .font(.system(size: Layout.bodyFontSize - 1))
+                    .foregroundStyle(.secondary)
+                Text(target)
+                    .font(.system(size: Layout.bodyFontSize - 3, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                    .textSelection(.enabled)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.secondary.opacity(0.08))
+        )
+    }
+
+    /// Render any images the raw transcript extractor attached to
+    /// this message. Returns `EmptyView` — not even a `Spacer` — when
+    /// the environment has no context or this message has no
+    /// attachments, so bubbles without pictures stay visually
+    /// identical to the pre-attachment layout.
+    ///
+    /// `alignment` controls which edge the image stack hugs inside
+    /// its parent VStack: `.trailing` on the user side (so photos
+    /// mirror the text bubble's right-hugging layout), `.leading` on
+    /// the assistant side (so they align with the inline byline and
+    /// the message body).
+    @ViewBuilder
+    private func attachmentImagesView(alignment: HorizontalAlignment) -> some View {
+        if let context = messageAssetContext,
+           let refs = context.attachmentsByMessageID[message.id],
+           !refs.isEmpty {
+            let baseOffset = context.startOffsetByMessageID[message.id] ?? 0
+            // Horizontal strip: each `RawTranscriptImageView` sizes its
+            // width from the decoded bitmap's aspect ratio (height is
+            // pinned at `reservedHeight`), so the row naturally matches
+            // the pane width when a handful of images fit and overflows
+            // into horizontal scroll when they don't. Replaces the
+            // prior `VStack`, which stacked portraits into a tall column
+            // that forced the reader to scroll past the attachments
+            // before the assistant's reply appeared underneath.
+            //
+            // `GeometryReader` hands the available width into the inner
+            // HStack so the row can be right-hugged on the user side
+            // when the images fit without scrolling. Without the
+            // `minWidth`, an HStack of narrow attachments inside
+            // `ScrollView(.horizontal)` collapses to its intrinsic
+            // width and always sits at the leading edge — which on the
+            // user side breaks the "user messages hug the right" shape
+            // of the bubble column.
+            GeometryReader { proxy in
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(alignment: .top, spacing: 8) {
+                        ForEach(Array(refs.enumerated()), id: \.offset) { localIndex, ref in
+                            RawTranscriptImageView(
+                                reference: ref,
+                                snapshotID: context.snapshotID,
+                                vault: context.vault,
+                                resolver: context.resolver,
+                                globalIndex: baseOffset + localIndex,
+                                orderedReferences: context.orderedReferences
+                            )
+                        }
+                    }
+                    .frame(
+                        minWidth: proxy.size.width,
+                        alignment: alignment == .trailing ? .trailing : .leading
+                    )
+                }
+            }
+            // `GeometryReader` is flex-height, so the outer layout
+            // needs a concrete band. `RawTranscriptImageView` reserves
+            // `reservedHeight` (320pt) for each cell, and the row
+            // itself has no surrounding chrome, so pinning the same
+            // height here keeps the bubble layout stable during load.
+            .frame(height: RawTranscriptImageView.reservedHeight)
+            // Small bottom gap so the image row visually separates
+            // from the text bubble / prose body below it.
+            .padding(.bottom, 2)
+        }
     }
 
     // MARK: - Identity / theme
@@ -387,13 +942,35 @@ struct MessageBubbleView: View, Equatable {
     /// grouping pass is itself non-trivial (NL detection per block) and
     /// `body` is re-evaluated on parent updates.
     private var renderItems: [MessageRenderItem] {
-        let key = message.id as NSString
+        // Cache key folds in `collapseFlag` and the conversation's
+        // detected primary language: the same blocks rendered under
+        // a different "what counts as foreign?" baseline produce
+        // different grouping output, so a Japanese thread on an
+        // English-locale Mac mustn't return cached items computed
+        // before the primary-language signal arrived.
+        let profile = renderProfile
+        let collapse = profile.collapsesForeignLanguageRuns
+        let nativeLang = conversationPrimaryLanguage?.rawValue ?? ""
+        let key = "\(message.id)#\(collapse ? 1 : 0)#\(nativeLang)" as NSString
         if let cached = Self.renderItemsCache.object(forKey: key) {
             return cached.items
         }
-        let items = ForeignLanguageGrouping.group(contentBlocks)
+        let items = ForeignLanguageGrouping.items(
+            from: contentBlocks,
+            collapseForeignRuns: collapse,
+            nativeLanguage: conversationPrimaryLanguage
+        )
         Self.renderItemsCache.setObject(RenderItemsBox(items), forKey: key)
         return items
+    }
+
+    /// Per-bubble rendering policy, resolved from the conversation's
+    /// source. See `MessageRenderProfile` for the dispatch table.
+    private var renderProfile: MessageRenderProfile {
+        MessageRenderProfile.resolve(
+            source: identityContext?.source,
+            model: identityContext?.model
+        )
     }
 
     private static let renderItemsCache: NSCache<NSString, RenderItemsBox> = {
@@ -411,6 +988,104 @@ struct MessageBubbleView: View, Equatable {
         message.content.count <= Layout.maxRenderedMessageLength
     }
 
+    // MARK: - In-thread search anchor helpers
+
+    /// Scroll-anchor id for an individual assistant block. Pairs with
+    /// the per-renderItem `.id(...)` in `assistantMessageColumn` so the
+    /// find-bar's Next/Prev can scroll to the block containing the
+    /// active match, not just to the message top.
+    ///
+    /// Prefix matches `SearchBlockAnchor.idPrefix` so the reader's
+    /// outline-cursor logic can cleanly filter these ids back out
+    /// (they're NOT prompt boundaries).
+    static func searchBlockAnchorID(messageID: String, blockIndex: Int) -> String {
+        "\(SearchBlockAnchor.idPrefix)\(messageID)#\(blockIndex)"
+    }
+
+    /// Build the (text, anchorID) list the in-thread search scanner
+    /// needs — one entry per addressable render block inside the
+    /// message, in the same order the view lays them out.
+    ///
+    /// - User messages: a single entry whose anchor id is the outer
+    ///   message id, since the whole prompt renders as one Text.
+    /// - Assistant messages: one entry per `MessageRenderItem` produced
+    ///   by `ForeignLanguageGrouping.group(...)`, so the scanner's
+    ///   per-block occurrence counting stays aligned with
+    ///   `applyingSearchHighlight`'s per-block scan.
+    ///
+    /// Caller is `DesignMockReaderPaneContent.recomputeMatches`. Lives
+    /// here so the block-enumeration logic is owned by exactly the
+    /// view that renders the blocks — the two can't drift out of
+    /// sync as the markdown parser / grouper evolves.
+    static func searchableBlocks(
+        for message: Message,
+        profile: MessageRenderProfile = .passthrough,
+        nativeLanguage: NLLanguage? = nil
+    ) -> [(text: String, anchorID: String)] {
+        if message.isUser {
+            return [(message.content, message.id)]
+        }
+        let parsed = ContentBlock.parse(message.content)
+        // MUST mirror the grouping decision `renderItems` makes, or
+        // the per-block occurrence indices produced here will not line
+        // up with `applyingSearchHighlight`'s render-time scan. Take
+        // the same path by routing through the profile-gated helper —
+        // including the conversation-level native language so the two
+        // views agree on which runs are foreign.
+        let items = ForeignLanguageGrouping.items(
+            from: parsed,
+            collapseForeignRuns: profile.collapsesForeignLanguageRuns,
+            nativeLanguage: nativeLanguage
+        )
+        return items.enumerated().map { offset, item in
+            let anchorID = searchBlockAnchorID(
+                messageID: message.id,
+                blockIndex: offset
+            )
+            return (searchText(for: item), anchorID)
+        }
+    }
+
+    /// Visible-text payload for a single render item. Matches the text
+    /// the layout-side `applyingSearchHighlight` scans, so occurrence
+    /// indices produced here line up with the ones the renderer sees
+    /// when it picks which range to hot-color.
+    private static func searchText(for item: MessageRenderItem) -> String {
+        switch item {
+        case .block(let block):
+            return searchText(for: block)
+        case .foreignLanguageGroup(_, let blocks):
+            return blocks.map(searchText(for:)).joined(separator: "\n")
+        }
+    }
+
+    private static func searchText(for block: ContentBlock) -> String {
+        switch block {
+        case .paragraph(let text):
+            return text
+        case .heading(_, let text):
+            return text
+        case .listItem(_, _, let text, _):
+            return text
+        case .blockquote(let text):
+            return text
+        case .code(_, let code):
+            return code
+        case .math(let source):
+            return source
+        case .table(let headers, let rows, _):
+            var parts: [String] = headers
+            for row in rows {
+                parts.append(contentsOf: row)
+            }
+            return parts.joined(separator: " ")
+        case .horizontalRule:
+            return ""
+        case .image(_, let alt):
+            return alt
+        }
+    }
+
     /// Inline-only markdown: bold, italic, inline code, links. We handle
     /// block structures (headings, lists, etc.) ourselves above, so we
     /// specifically do NOT want `.full` here — that would double-format
@@ -422,8 +1097,91 @@ struct MessageBubbleView: View, Equatable {
     /// paragraphs), so we memoize by the exact source string. Cache lives at
     /// process scope because the same paragraph often repeats across messages
     /// (greetings, signatures, template replies).
-    private func renderInlineMarkdown(_ text: String) -> AttributedString {
-        InlineMarkdownCache.shared.render(text)
+    private func renderInlineMarkdown(
+        _ text: String,
+        blockAnchorID: String
+    ) -> AttributedString {
+        // The cache stores the markdown-parsed `AttributedString` keyed
+        // on source text only — deliberately NOT on the search spec, so
+        // the cache stays valid across typing. Highlight runs are applied
+        // on the way out as a cheap post-pass; they mutate only the
+        // `.backgroundColor` attribute of character ranges that match,
+        // which is O(n) in the paragraph length.
+        applyingSearchHighlight(
+            to: InlineMarkdownCache.shared.render(text),
+            blockAnchorID: blockAnchorID
+        )
+    }
+
+    /// Wrap a raw `String` in an `AttributedString`, applying any active
+    /// search highlight. Used for the three verbatim-text paths (user
+    /// prompt, assistant plain mode, oversized-paragraph fallback) that
+    /// bypass the markdown pipeline entirely.
+    private func highlightedVerbatim(
+        _ text: String,
+        blockAnchorID: String
+    ) -> AttributedString {
+        applyingSearchHighlight(
+            to: AttributedString(text),
+            blockAnchorID: blockAnchorID
+        )
+    }
+
+    /// Paint `.backgroundColor` runs onto every case-insensitive substring
+    /// match of the active search query. No-ops when the env spec is nil,
+    /// empty, or when this bubble's message content doesn't contain the
+    /// query (the containment check is a cheap filter to skip the
+    /// per-range scan for the majority of bubbles that aren't hits).
+    ///
+    /// `blockAnchorID` identifies the rendered block this attributed
+    /// string belongs to. It's compared against
+    /// `SearchHighlightSpec.activeAnchorID` to decide whether THIS block
+    /// should draw its Nth match in the hot color (orange) or leave all
+    /// matches in the dim color (yellow). Threading this in as an
+    /// explicit parameter — rather than via `@Environment` on
+    /// MessageBubbleView — is load-bearing: SwiftUI's `@Environment`
+    /// properties on a view are read from the view's PARENT scope, so a
+    /// `.environment(...)` modifier applied INSIDE MessageBubbleView's
+    /// body never flows back up to `self`'s env read. A per-block env
+    /// write was silently nil-valued at this call site, which is why
+    /// the orange cursor was never visible.
+    private func applyingSearchHighlight(
+        to attr: AttributedString,
+        blockAnchorID: String
+    ) -> AttributedString {
+        guard let spec = searchHighlight, !spec.isEmpty else { return attr }
+        let needle = spec.normalizedQuery
+        // Fast path: this bubble isn't a match, don't scan its runs.
+        guard message.content.range(of: needle, options: .caseInsensitive) != nil else {
+            return attr
+        }
+        var result = attr
+        let isActiveBlock = spec.activeAnchorID != nil
+            && spec.activeAnchorID == blockAnchorID
+        let activeOccurrence = spec.activeOccurrenceInBlock
+        let hot = Color.orange.opacity(0.55)
+        let dim = Color.yellow.opacity(0.45)
+
+        var searchStart = result.startIndex
+        var occurrenceIndex = 0
+        while searchStart < result.endIndex,
+              let range = result[searchStart..<result.endIndex]
+                .range(of: needle, options: .caseInsensitive) {
+            let isHot: Bool
+            if isActiveBlock {
+                if let target = activeOccurrence {
+                    isHot = occurrenceIndex == target
+                } else {
+                    isHot = true
+                }
+            } else {
+                isHot = false
+            }
+            result[range].backgroundColor = isHot ? hot : dim
+            searchStart = range.upperBound
+            occurrenceIndex += 1
+        }
+        return result
     }
 
     /// Like `renderInlineMarkdown`, but first carves out any inline math
@@ -447,12 +1205,16 @@ struct MessageBubbleView: View, Equatable {
     /// concatenated `Text` with a `baselineOffset(-descent)` so the
     /// math's internal baseline lines up with the surrounding prose
     /// baseline instead of its bounding box sitting on top.
-    private func renderInlineRich(_ text: String, fontSize: CGFloat) -> Text {
+    private func renderInlineRich(
+        _ text: String,
+        fontSize: CGFloat,
+        blockAnchorID: String
+    ) -> Text {
         // Fast path: nothing that could possibly be inline math. Skip
         // the splitter entirely and go straight to the existing
         // markdown path (which itself has a fast path for pure prose).
         if !text.contains("$") && !text.contains("\\(") {
-            return Text(renderInlineMarkdown(text))
+            return Text(renderInlineMarkdown(text, blockAnchorID: blockAnchorID))
         }
 
         let runs = InlineMathSplitter.split(text)
@@ -461,14 +1223,14 @@ struct MessageBubbleView: View, Equatable {
         // to the plain-markdown path so we don't pay for Text
         // concatenation when there's nothing to typeset.
         if runs.count == 1, case .text(let only) = runs[0] {
-            return Text(renderInlineMarkdown(only))
+            return Text(renderInlineMarkdown(only, blockAnchorID: blockAnchorID))
         }
 
         var result = Text("")
         for run in runs {
             switch run {
             case .text(let segment):
-                result = result + Text(renderInlineMarkdown(segment))
+                result = result + Text(renderInlineMarkdown(segment, blockAnchorID: blockAnchorID))
             case .math(let latex):
                 if let rendered = InlineMathImageCache.shared.rendered(for: latex, fontSize: fontSize) {
                     #if os(macOS)
@@ -811,6 +1573,18 @@ enum ContentBlock {
     /// `:---:` = center, `---:` = trailing).
     case table(headers: [String], rows: [[String]], alignments: [TableAlignment])
     case horizontalRule
+    /// Standalone image reference parsed from markdown image syntax
+    /// (`![alt](url)` on its own line). The reader renders this inline
+    /// as a picture rather than surfacing the raw `![…](…)` source,
+    /// which is how assistants like ChatGPT / Claude deliver generated
+    /// or attached images back in their replies. `url` is the source
+    /// target as written in the message (may be an `http(s)` URL, a
+    /// `sandbox:` path for ChatGPT transcripts, or a bare filename);
+    /// the renderer decides per-scheme how (or whether) to resolve it.
+    /// `alt` is the bracketed caption — displayed as a subtitle below
+    /// the image so the textual description is preserved for
+    /// accessibility and for cases where the image can't load.
+    case image(url: String, alt: String)
 
     // MARK: - Parser
 
@@ -957,6 +1731,25 @@ enum ContentBlock {
                     flushBlockquote()
                     flushPendingTable()
                     blocks.append(.horizontalRule)
+                    return
+                }
+
+                // Standalone image: `![alt](url)` on its own line.
+                // Extracted before list / heading detection so that an
+                // image isn't swallowed by the paragraph stream (where
+                // `canRenderMarkdown` would just surface `![alt](url)`
+                // as literal text — SwiftUI's attributed-markdown
+                // parser doesn't inflate image references on its own).
+                // Inline image syntax inside a prose paragraph is
+                // intentionally left untouched: assistants almost
+                // always emit image links on their own line, and
+                // extracting mid-sentence would fragment the
+                // surrounding paragraph into awkward pieces.
+                if let image = Self.parseStandaloneImage(trimmed) {
+                    flushParagraph()
+                    flushBlockquote()
+                    flushPendingTable()
+                    blocks.append(.image(url: image.url, alt: image.alt))
                     return
                 }
 
@@ -1173,6 +1966,94 @@ enum ContentBlock {
             let stripped = trimmed.filter { !$0.isWhitespace }
             guard let first = stripped.first, "-*_".contains(first) else { return false }
             return stripped.allSatisfy { $0 == first } && stripped.count >= 3
+        }
+
+        /// Recognize a standalone markdown image line: `![alt](url)`.
+        ///
+        /// Returns the bracketed alt text and the parenthesized target
+        /// if the entire trimmed line is exactly one image reference
+        /// with nothing trailing after the closing `)`. Anything else
+        /// (image followed by more prose, optional title strings
+        /// inside the parens, bracket-nesting past what a normal alt
+        /// string uses, etc.) falls through to paragraph text.
+        ///
+        /// The matcher is hand-rolled rather than `NSRegularExpression`
+        /// because:
+        ///   * the parser is on the message-body render hot path, and
+        ///     a string scan avoids the per-call regex compile cost;
+        ///   * alt strings can legitimately contain unbalanced
+        ///     brackets from pasted captions, so we only accept a
+        ///     simple (non-nested) `[…]` and let the regex-unfriendly
+        ///     edge cases remain paragraph text.
+        ///
+        /// An optional quoted title after the URL (`![alt](url "t")`)
+        /// is stripped — the reader surfaces `alt` as the caption and
+        /// doesn't expose link titles separately.
+        private static func parseStandaloneImage(_ trimmed: String) -> (url: String, alt: String)? {
+            // Fast reject: must start with `![` and end with `)`.
+            guard trimmed.hasPrefix("![") else { return nil }
+            guard trimmed.hasSuffix(")") else { return nil }
+
+            let chars = Array(trimmed)
+            var i = 2 // past `![`
+            var altChars: [Character] = []
+            while i < chars.count, chars[i] != "]" {
+                // No nested brackets inside alt — keep this simple so
+                // pathological inputs fall back to paragraph text
+                // rather than over-matching.
+                if chars[i] == "[" { return nil }
+                altChars.append(chars[i])
+                i += 1
+            }
+            guard i < chars.count, chars[i] == "]" else { return nil }
+            i += 1
+            guard i < chars.count, chars[i] == "(" else { return nil }
+            i += 1
+
+            // URL body: everything up to the final `)`. We allow
+            // parentheses inside the URL only via balancing, which
+            // matches CommonMark's image-URL rule for bare URLs. A
+            // trailing `"title"` is tolerated and stripped.
+            var urlChars: [Character] = []
+            var parenDepth = 1
+            while i < chars.count {
+                let c = chars[i]
+                if c == "(" {
+                    parenDepth += 1
+                    urlChars.append(c)
+                } else if c == ")" {
+                    parenDepth -= 1
+                    if parenDepth == 0 {
+                        i += 1
+                        break
+                    }
+                    urlChars.append(c)
+                } else {
+                    urlChars.append(c)
+                }
+                i += 1
+            }
+            // The whole line must end at the matching `)` — no trailing
+            // prose. `i == chars.count` ensures that.
+            guard i == chars.count, parenDepth == 0 else { return nil }
+
+            var body = String(urlChars).trimmingCharacters(in: .whitespaces)
+            // Strip optional title: `url "title"` or `url 'title'`.
+            if let lastSpace = body.lastIndex(of: " ") {
+                let tail = body[body.index(after: lastSpace)...]
+                    .trimmingCharacters(in: .whitespaces)
+                if (tail.hasPrefix("\"") && tail.hasSuffix("\"") && tail.count >= 2)
+                    || (tail.hasPrefix("'") && tail.hasSuffix("'") && tail.count >= 2) {
+                    body = String(body[..<lastSpace]).trimmingCharacters(in: .whitespaces)
+                }
+            }
+            // Angle-bracket wrapping: `<http://…>` is legal CommonMark.
+            if body.hasPrefix("<") && body.hasSuffix(">") && body.count >= 2 {
+                body = String(body.dropFirst().dropLast())
+            }
+
+            guard !body.isEmpty else { return nil }
+            return (url: body, alt: String(altChars))
         }
 
         private static func parseHeading(_ trimmed: String) -> (level: Int, text: String)? {

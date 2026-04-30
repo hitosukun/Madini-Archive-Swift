@@ -5,7 +5,7 @@ Madini is a local archive browser for long-term accumulation of LLM logs.
 It is not primarily an editor, an auto-summary tool, or a judgment engine.
 Its main purpose is to support rereading, exploration, comparison, and reconstruction over time.
 
-This is the SwiftUI (macOS / iOS) implementation. It shares the same SQLite schema and data directory as the Python version and must remain compatible with it.
+This is the SwiftUI implementation, and **it is the canonical version**. macOS is the primary platform; iOS and other platforms are derived from this codebase. An earlier Python prototype exists but is unpublished and no longer drives schema decisions — the Swift SQLite schema evolves on its own terms, with one-way compatibility ("we can ingest a legacy Python DB via migration") rather than two-way lock-step.
 
 ## Core Principles
 - Preserve originals by default, with explicit exceptions for storage-heavy binaries.
@@ -29,7 +29,7 @@ This is the SwiftUI (macOS / iOS) implementation. It shares the same SQLite sche
 - Avoid internal-only storage designs that are hard to inspect, migrate, or export.
 - New persistent structures should have a plausible export path before they are adopted.
 - Users must be able to keep and move their data without being locked into Madini.
-- The SQLite schema must remain compatible with the Python version. Do not rename tables or columns without a migration path that both versions can consume.
+- The SQLite schema is owned by the Swift codebase. Breaking changes are allowed when they serve the Mac-first design, as long as `DatabaseMigrator` migrations upgrade existing Swift databases and (where relevant) can ingest a legacy Python-era database as a one-way import. Two-way lock-step with the Python prototype is no longer required.
 
 ## Scale Resistance
 - Assume logs will continue to grow for years.
@@ -70,9 +70,12 @@ This is the SwiftUI (macOS / iOS) implementation. It shares the same SQLite sche
 | `ConversationRepository` | Paginated listing, detail fetch, filter options | `GRDBConversationRepository` |
 | `SearchRepository` | Keyword search (FTS5-first) | `GRDBSearchRepository` |
 | `BookmarkRepository` | Bookmark CRUD, tag membership | `GRDBBookmarkRepository` |
+| `StatsRepository` | Bounded aggregations for the Dashboard / `.stats` mode (source / model / monthly / daily / hour×weekday). Pure derived view — no caching, no persisted intermediates. | `GRDBStatsRepository` |
 | `RawSourceRepository` | Raw source and provenance access | `GRDBRawSourceRepository` |
 | `ViewService` | Virtual Thread build, Saved View CRUD, Recent Filter | `GRDBViewService` |
 | `ImportService` | File parse + DB registration + raw source preservation | `GRDBImportService` |
+
+WHERE-clause assembly is centralized in `Database/SearchFilterSQL.swift` so the conversation-list, search, and Stats paths translate `ArchiveSearchFilter` through one helper. Add new repositories with the same call pattern (`SearchFilterSQL.makeWhereClause(filter:options:)`) to keep filter semantics consistent across the codebase.
 
 ### Adding a New Repository
 1. Define the protocol in `Core/Repositories.swift` with all necessary DTOs.
@@ -80,12 +83,13 @@ This is the SwiftUI (macOS / iOS) implementation. It shares the same SQLite sche
 3. Add a property to `AppServices` and wire it in `init`.
 4. Access from views via `services.<repository>`.
 
-## SQLite Schema Compatibility
-- Table names and column names must match the Python version exactly.
-- Use `ifNotExists: true` on all `CREATE TABLE` and `CREATE INDEX` statements.
-- New columns must be added via `DatabaseMigrator` registered migrations, never by modifying existing migration blocks.
-- The FTS5 virtual table `search_idx` uses `tokenize="unicode61"`. Do not change the tokenizer.
+## SQLite Schema Evolution
+- The Swift codebase owns the schema. Table and column names may be changed or added as the design demands, but every change must ship with a `DatabaseMigrator` registered migration that upgrades in place.
+- Use `ifNotExists: true` on all `CREATE TABLE` and `CREATE INDEX` statements so bootstrap stays idempotent.
+- Never modify an already-released migration block. Add a new migration instead — migrator ordering is how we preserve upgrade paths for existing users.
+- The FTS5 virtual table `search_idx` tokenizer is a deliberate design choice, not a compatibility freeze. Changing it (or the column set) requires: (1) a new migration that rebuilds the index from `conversations` + `messages`, (2) UI progress feedback for large libraries (10x–100x today's scale), and (3) an updated spec note describing why the change was made.
 - `primary_time` is a derived expression: `COALESCE(NULLIF(TRIM(source_created_at),''), NULLIF(TRIM(imported_at),''), NULLIF(TRIM(date_str),''))`. This precedence order must be consistent across all query paths.
+- Legacy Python-era databases may be ingested via a one-way import migration, but the live schema is no longer constrained by what the Python prototype writes.
 
 ## Import Rules
 - Import logic lives in `ImportService` and parser files under `Import/`, not in UI code.
@@ -126,7 +130,7 @@ This is the SwiftUI (macOS / iOS) implementation. It shares the same SQLite sche
 - Prefer archive-browsing features over editing-oriented features.
 - Add new data access through repository protocols, not ad hoc SQL in views.
 - Use pagination (`offset` + `limit`) for all list queries.
-- Keep the SQLite schema compatible with the Python version.
+- Evolve the SQLite schema through `DatabaseMigrator` migrations, with a legacy-import path when older databases exist.
 
 ## Don't
 - Do not treat normalized text as a full substitute for raw source.
@@ -139,7 +143,7 @@ This is the SwiftUI (macOS / iOS) implementation. It shares the same SQLite sche
 - Do not write SQL in view files or view model files.
 - Do not fetch all rows without `LIMIT`. Every list query must be paginated.
 - Do not add SwiftData or Core Data. GRDB is the single database layer.
-- Do not rename SQLite tables or columns without a dual-version migration path.
+- Do not rename or drop SQLite tables / columns without a `DatabaseMigrator` migration.
 - Do not put import parsing logic in UI code.
 
 ## Not Yet

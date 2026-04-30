@@ -34,6 +34,20 @@ struct MacOSRootView: View {
     /// walk. Deliberately volatile (no persistence) — focus-mode is
     /// not a preference.
     @State private var viewMode: MiddlePaneMode = .default
+    /// Right-pane reader mode. `.canonical` shows the Python-imported
+    /// transcript (the existing reader). `.source` reads the original JSON
+    /// out of the Raw Export Vault and renders rich content — inline images,
+    /// code blocks, tool calls — that the canonical text-only projection
+    /// drops. Toggle lives at the top of the right pane so swapping modes
+    /// doesn't disturb the rest of the window.
+    @State private var readerMode: ReaderPaneMode = .canonical
+
+    enum ReaderPaneMode: String, CaseIterable, Identifiable {
+        case canonical = "Canonical"
+        case source = "Source"
+
+        var id: String { rawValue }
+    }
     // `selectedPromptID` used to live here as `@State`, but writing to it
     // from the reader's scroll-position observer forced `MacOSRootView` to
     // re-render every scroll tick, which cascaded into content-margin
@@ -250,74 +264,25 @@ struct MacOSRootView: View {
                 }
             }
 
-            // Resolve dropped files into importer-ready JSON payloads. A full
-            // ChatGPT export folder includes helper JSON files and assets; the
-            // importable payload is the sorted `conversations-*.json` set.
-            let selection = JSONImportFileResolver.resolve(urls)
-            let jsonURLs = selection.jsonURLs
-            let rejectedCount = selection.rejectedInputCount
-
-            guard !jsonURLs.isEmpty else {
-                if rejectedCount > 0 {
-                    showToast(.failure(
-                        message: "Only JSON exports can be imported.",
-                        detail: nil
-                    ))
-                }
+            guard !urls.isEmpty else {
+                showToast(.failure(
+                    message: "Only file drops can be imported.",
+                    detail: nil
+                ))
                 return
             }
 
-            showToast(.progress(message: "Vaulting and importing \(jsonURLs.count) file\(jsonURLs.count == 1 ? "" : "s")…"))
+            showToast(.progress(message: "Vaulting and importing export…"))
 
             do {
-                let vaultResult: RawExportVaultResult?
-                do {
-                    let rawExportVault = services.rawExportVault
-                    vaultResult = try await Task.detached(priority: .utility) {
-                        try await rawExportVault.ingest(urls)
-                    }.value
-                } catch {
-                    vaultResult = nil
-                    print("Raw export vault ingest failed: \(error)")
-                }
-
-                // Actual shell-out runs on a detached background task so
-                // the importer's blocking IO doesn't pin the main actor.
-                let result = try await Task.detached(priority: .userInitiated) {
-                    try await JSONImporter.importFiles(jsonURLs)
-                }.value
-
-                if result.exitCode == 0 {
-                    do {
-                        try await JSONImportProjectReconciler.reconcileImportedFiles(jsonURLs, services: services)
-                    } catch {
-                        print("Project reconciliation failed after import: \(error)")
-                    }
-                    archiveEvents.didImportConversations()
-                    let importSummary = rejectedCount > 0
-                        ? "Imported \(jsonURLs.count) file\(jsonURLs.count == 1 ? "" : "s"), skipped \(rejectedCount) unsupported item\(rejectedCount == 1 ? "" : "s")."
-                        : "Imported \(jsonURLs.count) file\(jsonURLs.count == 1 ? "" : "s")."
-                    let summary: String
-                    if let vaultResult {
-                        summary = "\(importSummary) Vault: \(vaultResult.newBlobs) new, \(vaultResult.reusedBlobs) reused."
-                    } else {
-                        summary = importSummary
-                    }
-                    showToast(.success(message: summary))
-                } else {
-                    // Non-zero exit: importer ran but the Python side
-                    // reported an error. Surface a short tail of stderr
-                    // so the user has a pointer to the cause (full
-                    // output is still in Console.app as stderr lines).
-                    let tail = result.stderr
-                        .split(separator: "\n")
-                        .suffix(2)
-                        .joined(separator: " ")
-                    showToast(.failure(
-                        message: "Import failed (exit \(result.exitCode)).",
-                        detail: tail.isEmpty ? nil : String(tail)
-                    ))
-                }
+                let result = try await ImportCoordinator.importDroppedURLs(urls, services: services)
+                archiveEvents.didImportConversations()
+                showToast(.success(message: importSuccessMessage(for: result)))
+            } catch let error as ImportCoordinatorError {
+                showToast(.failure(
+                    message: error.errorDescription ?? "Import failed.",
+                    detail: error.failureDetail
+                ))
             } catch {
                 showToast(.failure(
                     message: "Import couldn't start.",
@@ -325,6 +290,20 @@ struct MacOSRootView: View {
                 ))
             }
         }
+    }
+
+    private func importSuccessMessage(for result: ImportCoordinatorResult) -> String {
+        if result.wasDuplicateSnapshot {
+            return "Already ingested — reusing snapshot \(result.vaultResult.snapshotID)."
+        }
+        let importSummary = result.rejectedInputCount > 0
+            ? "Imported \(result.jsonFileCount) file\(result.jsonFileCount == 1 ? "" : "s"), skipped \(result.rejectedInputCount) unsupported item\(result.rejectedInputCount == 1 ? "" : "s")."
+            : "Imported \(result.jsonFileCount) file\(result.jsonFileCount == 1 ? "" : "s")."
+        let vaultSummary = "Vault: \(result.vaultResult.newBlobs) new, \(result.vaultResult.reusedBlobs) reused."
+        if result.reconciliationErrorDescription != nil {
+            return "\(importSummary) \(vaultSummary) Project hints need review."
+        }
+        return "\(importSummary) \(vaultSummary)"
     }
 
     /// Async wrapper around `NSItemProvider.loadItem(forTypeIdentifier:…)`
@@ -542,10 +521,7 @@ struct MacOSRootView: View {
                 // chips no longer render here — they live inside the
                 // sidebar's expanded search container.
                 UnifiedConversationListView(
-                    viewModel: libraryViewModel,
-                    onTapTag: { tag in
-                        libraryViewModel.toggleBookmarkTag(tag.name)
-                    }
+                    viewModel: libraryViewModel
                 )
             }
         }
@@ -562,10 +538,65 @@ struct MacOSRootView: View {
     }
 
     private var rightPane: some View {
-        ReaderWorkspaceView(
-            tabManager: tabManager,
-            repository: services.conversations
-        )
+        VStack(spacing: 0) {
+            if services.rawConversationLoader != nil {
+                readerModeBar
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                Divider()
+            }
+            Group {
+                switch readerMode {
+                case .canonical:
+                    ReaderWorkspaceView(
+                        tabManager: tabManager,
+                        repository: services.conversations
+                    )
+                case .source:
+                    sourceReaderPane
+                }
+            }
+        }
+    }
+
+    private var readerModeBar: some View {
+        HStack {
+            Picker("Reader", selection: $readerMode) {
+                ForEach(ReaderPaneMode.allCases) { mode in
+                    Text(mode.rawValue).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .fixedSize()
+            Spacer()
+            if readerMode == .source {
+                Text("Reading original provider JSON from the Raw Export Vault.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var sourceReaderPane: some View {
+        if let loader = services.rawConversationLoader,
+           let conversationID = tabManager.activeTab?.conversationID {
+            RawTranscriptReaderView(
+                conversationID: conversationID,
+                loader: loader,
+                vault: services.rawExportVault,
+                resolver: services.rawAssetResolver
+            )
+            .id(conversationID)
+        } else {
+            ContentUnavailableView(
+                "Open a conversation",
+                systemImage: "rectangle.on.rectangle",
+                description: Text("Select a conversation from the list to see its vaulted source JSON.")
+            )
+        }
     }
 
     private var librarySidebar: some View {
@@ -726,15 +757,10 @@ private struct UnifiedLibrarySidebar: View {
                 // filter is retired; the date range was relocated into the
                 // middle-pane header popover for proximity to the sort bar.
 
-                // Tags + Filters wrapped in `section(title:)` so they get
-                // the same collapse/expand behavior as Library and
-                // Sources. Each section's view intentionally no longer
-                // draws its own "TAGS" / "FILTERS" header — the wrapper
-                // owns the title now so the stack reads as one family of
-                // collapsibles down the sidebar.
-                section(title: "Tags") {
-                    SidebarTagsSection(libraryViewModel: viewModel)
-                }
+                // Tags section removed — replaced by the query-history
+                // surface below. Filters still use the shared
+                // `section(title:)` wrapper so collapse/expand behavior
+                // matches Library and Sources.
 
                 // "Saved View" name input removed. Pinning is now the way to
                 // promote a recent filter into a persistent view.
@@ -1062,7 +1088,6 @@ private struct RoleGrid: View {
 
 private struct UnifiedConversationListView: View {
     @Bindable var viewModel: LibraryViewModel
-    let onTapTag: (TagEntry) -> Void
 
     var body: some View {
         Group {
@@ -1100,19 +1125,7 @@ private struct UnifiedConversationListView: View {
                 // on the `.tag(conversation.id)` assigned per row.
                 ScrollViewReader { proxy in
                 List(viewModel.conversations, selection: $viewModel.selectedConversationIDs) { conversation in
-                    ConversationRowView(
-                        conversation: conversation,
-                        tags: viewModel.conversationTags[conversation.id] ?? [],
-                        onTapTag: onTapTag,
-                        onAttachTag: { tagName in
-                            Task {
-                                await viewModel.attachTag(
-                                    named: tagName,
-                                    toConversation: conversation.id
-                                )
-                            }
-                        }
-                    )
+                    ConversationRowView(conversation: conversation)
                     // NOTE: `.equatable()` was tried here for tag-drop perf,
                     // but it caused intermittent "card click doesn't open"
                     // — `List` with a `selection:` binding does not play

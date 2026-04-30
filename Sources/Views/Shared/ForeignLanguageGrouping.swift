@@ -31,8 +31,34 @@ enum MessageRenderItem {
 ///    Below that we treat the text as "not confidently foreign" and
 ///    leave it as a normal block.
 enum ForeignLanguageGrouping {
-    static func group(_ blocks: [ContentBlock]) -> [MessageRenderItem] {
-        let system = systemLanguage
+    /// Profile-gated entry point. When `collapseForeignRuns` is false,
+    /// returns each block wrapped as `.block(_)` without language
+    /// detection — the render pipeline stays uniform (still a
+    /// `[MessageRenderItem]`) but no grouping is applied. Callers that
+    /// know their source always wants grouping (or never wants it) can
+    /// skip this and call `group(_:)` / build trivially directly.
+    ///
+    /// `nativeLanguage` lets the caller override what counts as
+    /// "not foreign". Pass the conversation's detected primary
+    /// language so a Japanese-primary thread treats Japanese as
+    /// native even when the user's macOS locale is English. `nil`
+    /// falls back to the system locale.
+    static func items(
+        from blocks: [ContentBlock],
+        collapseForeignRuns: Bool,
+        nativeLanguage: NLLanguage? = nil
+    ) -> [MessageRenderItem] {
+        guard collapseForeignRuns else {
+            return blocks.map { .block($0) }
+        }
+        return group(blocks, nativeLanguage: nativeLanguage)
+    }
+
+    static func group(
+        _ blocks: [ContentBlock],
+        nativeLanguage: NLLanguage? = nil
+    ) -> [MessageRenderItem] {
+        let system = nativeLanguage ?? systemLanguage
         var result: [MessageRenderItem] = []
         var pending: (language: NLLanguage, blocks: [ContentBlock])?
 
@@ -61,6 +87,70 @@ enum ForeignLanguageGrouping {
         return result
     }
 
+    /// Detect the dominant language of a conversation by sampling
+    /// text from its messages. Returns `nil` for inputs too short
+    /// or too mixed to call confidently — caller falls back to
+    /// `systemLanguage` in that case. Used so a Japanese-primary
+    /// thread treats Japanese as native (no collapsed-block
+    /// affordance over plain Japanese) even when the user's macOS
+    /// locale is English. The reverse holds for English-primary
+    /// threads on a Japanese system.
+    ///
+    /// Concatenates message text up to `sampleLimit` characters
+    /// then runs one `NLLanguageRecognizer` pass — language
+    /// recognition is global over the whole window, not per-block,
+    /// so noise from short or mixed paragraphs averages out.
+    static func primaryLanguage(
+        ofMessageTexts texts: [String],
+        sampleLimit: Int = 5_000,
+        minCharacters: Int = 200,
+        minimumConfidence: Double = 0.6
+    ) -> NLLanguage? {
+        var combined = ""
+        for text in texts {
+            if combined.count >= sampleLimit { break }
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            // Phase 9 hotfix — compute remaining capacity AFTER
+            // accounting for the separator we're about to append, and
+            // bail out when capacity has run out. The previous version
+            // appended `"\n\n"` first and then computed
+            // `remaining = sampleLimit - combined.count`, which could
+            // land at -1 / -2 when an earlier iteration had filled
+            // `combined` to within 1-2 chars of `sampleLimit` (the
+            // outer `>= sampleLimit` break only catches the exact
+            // overshoot, not the off-by-2 caused by the separator).
+            // Negative `remaining` then crashed `trimmed.prefix(_:)`
+            // with "Can't take a prefix of negative length from a
+            // collection" (SIGTRAP, observed in the wild on a real
+            // conversation whose message lengths happened to land
+            // `combined.count` at `sampleLimit - 1` mid-iteration).
+            // Reordering the calculation and adding the early-break
+            // removes both the negative-length path AND the silent
+            // overshoot where `combined` could exceed `sampleLimit`
+            // by the separator length.
+            let separator = combined.isEmpty ? "" : "\n\n"
+            let remaining = sampleLimit - combined.count - separator.count
+            if remaining <= 0 { break }
+            combined.append(separator)
+            if trimmed.count <= remaining {
+                combined.append(trimmed)
+            } else {
+                combined.append(String(trimmed.prefix(remaining)))
+            }
+        }
+        let trimmedAll = combined.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmedAll.count >= minCharacters else { return nil }
+        let recognizer = NLLanguageRecognizer()
+        recognizer.processString(trimmedAll)
+        let hyps = recognizer.languageHypotheses(withMaximum: 1)
+        guard let (language, confidence) = hyps.first,
+              confidence >= minimumConfidence else {
+            return nil
+        }
+        return language
+    }
+
     /// System-preferred language as `NLLanguage`. Falls back to
     /// English when the locale doesn't expose a code (shouldn't
     /// happen on Apple OSes but we keep the default sensible).
@@ -85,6 +175,12 @@ enum ForeignLanguageGrouping {
         case .table(let headers, let rows, _):
             return (headers + rows.flatMap { $0 }).joined(separator: " ")
         case .code, .math, .horizontalRule:
+            return nil
+        case .image:
+            // Image blocks don't contribute prose to language detection.
+            // The alt text is a short caption, often just "image" or
+            // a filename, which would skew per-message language stats
+            // if we mixed it in with actual body text.
             return nil
         }
     }

@@ -10,15 +10,77 @@ final class AppServices: ObservableObject {
     let projectSuggestions: any ProjectSuggestionRepository
     let projectSuggester: any ProjectSuggester
     let rawExportVault: any RawExportVault
+    let rawAssetResolver: any RawAssetResolver
+    /// Optional: populated only when the app is running against a real
+    /// archive database. Mock mode leaves this `nil` — there's no vault to
+    /// load raw JSON from. The rich-content reader gates its "switch to
+    /// Source view" UI on this being non-nil.
+    let rawConversationLoader: (any RawConversationLoader)?
     let bookmarks: any BookmarkRepository
     let tags: any TagRepository
     let views: any ViewService
+    let stats: any StatsRepository
     let dataSource: DataSource
 
     enum DataSource {
         case database(path: String)
         case mock
     }
+
+    #if os(macOS)
+    /// Path the watcher polls. Always resolvable, even in mock mode, so the
+    /// UI can still render "this is where it would go" when intake is off.
+    /// Published so the Drop folder pane re-renders when the user picks a
+    /// different directory via `setIntakeDirectory(_:)`.
+    ///
+    /// Seeded from `IntakeLocationStore.load()` on launch — if the user had
+    /// previously overridden the location, we honor that before any lazy
+    /// intake wiring runs. Absent override ⇒ `IntakePaths.intakeDir`
+    /// (`~/Documents/Madini Archive Intake`).
+    @Published private(set) var intakeDirURL: URL = IntakeLocationStore.load() ?? IntakePaths.intakeDir
+
+    /// Lazy because `IntakeService` needs `self` to drive `ImportCoordinator`.
+    /// Constructed on first access, started explicitly via `startIntake()` —
+    /// we don't auto-start in `init` because the mock `DataSource` would wire
+    /// the intake folder to a `NoOpRawExportVault` that rejects every ingest.
+    private(set) lazy var intake: IntakeService = IntakeService(
+        services: self,
+        intakeDir: intakeDirURL
+    )
+
+    /// Kick off auto-intake. No-op when the app is running off mock data
+    /// (there's no Vault to ingest into, so polling would just spam the
+    /// activity log with "Vault ingest failed" for anything the user drops).
+    func startIntake() {
+        guard case .database = dataSource else { return }
+        intake.start()
+    }
+
+    func stopIntake() {
+        intake.stop()
+    }
+
+    /// Activity log surfaced by the auto-intake watcher. `nil` when the app
+    /// is running against mock data — the watcher is never started in that
+    /// mode, so there's no log to show.
+    var intakeActivityLog: IntakeActivityLog? {
+        guard case .database = dataSource else { return nil }
+        return intake.activityLog
+    }
+
+    /// Re-point the auto-intake watcher at a new directory (or, with `nil`,
+    /// reset to the default under `~/Documents`). Persists the choice so it
+    /// survives relaunches, and — in database mode — restarts the watcher
+    /// against the new path if it was already running.
+    func setIntakeDirectory(_ url: URL?) {
+        let resolved = url ?? IntakePaths.intakeDir
+        intakeDirURL = resolved
+        IntakeLocationStore.save(url)
+        if case .database = dataSource {
+            intake.switchDirectory(to: resolved)
+        }
+    }
+    #endif
 
     init(
         conversations: any ConversationRepository,
@@ -28,9 +90,12 @@ final class AppServices: ObservableObject {
         projectSuggestions: any ProjectSuggestionRepository,
         projectSuggester: any ProjectSuggester,
         rawExportVault: any RawExportVault,
+        rawAssetResolver: any RawAssetResolver,
+        rawConversationLoader: (any RawConversationLoader)? = nil,
         bookmarks: any BookmarkRepository,
         tags: any TagRepository,
         views: any ViewService,
+        stats: any StatsRepository,
         dataSource: DataSource
     ) {
         self.conversations = conversations
@@ -40,9 +105,12 @@ final class AppServices: ObservableObject {
         self.projectSuggestions = projectSuggestions
         self.projectSuggester = projectSuggester
         self.rawExportVault = rawExportVault
+        self.rawAssetResolver = rawAssetResolver
+        self.rawConversationLoader = rawConversationLoader
         self.bookmarks = bookmarks
         self.tags = tags
         self.views = views
+        self.stats = stats
         self.dataSource = dataSource
     }
 
@@ -58,6 +126,7 @@ final class AppServices: ObservableObject {
                 let projects = GRDBProjectRepository(dbQueue: dbQueue)
                 let projectMemberships = GRDBProjectMembershipRepository(dbQueue: dbQueue)
                 let projectSuggestions = GRDBProjectSuggestionRepository(dbQueue: dbQueue)
+                let vault = GRDBRawExportVault(dbQueue: dbQueue)
                 self.init(
                     conversations: conversations,
                     search: GRDBSearchRepository(dbQueue: dbQueue),
@@ -70,10 +139,13 @@ final class AppServices: ObservableObject {
                         memberships: projectMemberships,
                         suggestions: projectSuggestions
                     ),
-                    rawExportVault: GRDBRawExportVault(dbQueue: dbQueue),
+                    rawExportVault: vault,
+                    rawAssetResolver: GRDBRawAssetResolver(dbQueue: dbQueue),
+                    rawConversationLoader: GRDBRawConversationLoader(dbQueue: dbQueue, vault: vault),
                     bookmarks: GRDBBookmarkRepository(dbQueue: dbQueue),
                     tags: GRDBTagRepository(dbQueue: dbQueue),
                     views: GRDBViewService(dbQueue: dbQueue),
+                    stats: GRDBStatsRepository(dbQueue: dbQueue),
                     dataSource: .database(path: dbPath)
                 )
                 return
@@ -94,9 +166,11 @@ final class AppServices: ObservableObject {
             projectSuggestions: MockProjectSuggestionRepository(),
             projectSuggester: NoOpProjectSuggester(),
             rawExportVault: NoOpRawExportVault(),
+            rawAssetResolver: NoOpRawAssetResolver(),
             bookmarks: MockBookmarkRepository(),
             tags: MockTagRepository(),
             views: MockViewService(),
+            stats: MockStatsRepository(),
             dataSource: .mock
         )
     }
@@ -240,83 +314,141 @@ final class AppServices: ObservableObject {
                 CREATE INDEX IF NOT EXISTS idx_project_suggestions_state_score
                 ON project_suggestions(state, score DESC)
                 """)
+            // Raw Export Vault schema (5 tables + 2 indexes) lives next to the
+            // Vault implementation so the on-disk shape stays co-located with
+            // the code that reads it. `installSchema` is idempotent, so this
+            // plays nicely with the surrounding `CREATE ... IF NOT EXISTS`
+            // idioms in this bootstrap.
+            try GRDBRawExportVault.installSchema(in: db)
+
+            // conversation_raw_refs links a `conversations.id` (provider-native
+            // conversation ID, populated by the Python importer) back to the
+            // exact Raw Export Vault location where that conversation's source
+            // JSON lives. The reader uses this as an O(1) lookup — on miss,
+            // `RawConversationLoader` scans the newest matching snapshot and
+            // caches the hit here. Composite PK means one row per
+            // (conversation, snapshot) pair: the same conversation can appear
+            // in multiple snapshots (e.g. user re-exports later) and we keep
+            // the pointer per snapshot so deleting a snapshot CASCADEs the
+            // pointer with it.
             try db.execute(sql: """
-                CREATE TABLE IF NOT EXISTS raw_export_snapshots (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    provider TEXT NOT NULL,
-                    source_root TEXT,
-                    imported_at TEXT NOT NULL,
-                    manifest_hash TEXT NOT NULL,
-                    file_count INTEGER NOT NULL,
-                    new_blob_count INTEGER NOT NULL,
-                    reused_blob_count INTEGER NOT NULL,
-                    original_bytes INTEGER NOT NULL,
-                    stored_bytes INTEGER NOT NULL,
-                    manifest_path TEXT NOT NULL
-                )
-                """)
-            try db.execute(sql: """
-                CREATE INDEX IF NOT EXISTS idx_raw_export_snapshots_provider_time
-                ON raw_export_snapshots(provider, imported_at DESC, id DESC)
-                """)
-            try db.execute(sql: """
-                CREATE TABLE IF NOT EXISTS raw_export_blobs (
-                    hash TEXT PRIMARY KEY,
-                    size_bytes INTEGER NOT NULL,
-                    stored_size_bytes INTEGER NOT NULL,
-                    mime_type TEXT,
-                    compression TEXT NOT NULL,
-                    stored_path TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                )
-                """)
-            try db.execute(sql: """
-                CREATE TABLE IF NOT EXISTS raw_export_files (
+                CREATE TABLE IF NOT EXISTS conversation_raw_refs (
+                    conversation_id TEXT NOT NULL,
                     snapshot_id INTEGER NOT NULL,
                     relative_path TEXT NOT NULL,
-                    blob_hash TEXT NOT NULL,
-                    size_bytes INTEGER NOT NULL,
-                    mime_type TEXT,
-                    role TEXT NOT NULL,
-                    compression TEXT NOT NULL,
-                    stored_path TEXT NOT NULL,
+                    json_index INTEGER NOT NULL,
+                    provider TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    PRIMARY KEY (snapshot_id, relative_path),
-                    FOREIGN KEY(snapshot_id) REFERENCES raw_export_snapshots(id) ON DELETE CASCADE,
-                    FOREIGN KEY(blob_hash) REFERENCES raw_export_blobs(hash)
+                    PRIMARY KEY (conversation_id, snapshot_id),
+                    FOREIGN KEY (snapshot_id) REFERENCES raw_export_snapshots(id) ON DELETE CASCADE
                 )
                 """)
             try db.execute(sql: """
-                CREATE INDEX IF NOT EXISTS idx_raw_export_files_blob
-                ON raw_export_files(blob_hash)
+                CREATE INDEX IF NOT EXISTS idx_conversation_raw_refs_conv
+                ON conversation_raw_refs(conversation_id)
                 """)
-            try db.execute(sql: """
-                CREATE VIRTUAL TABLE IF NOT EXISTS raw_export_search_idx
-                USING fts5(
-                    snapshot_id UNINDEXED,
-                    blob_hash UNINDEXED,
-                    provider UNINDEXED,
-                    relative_path,
-                    content,
-                    tokenize="unicode61"
-                )
+
+            // Body-data search index (`search_idx`). The Swift app owns this
+            // index and uses FTS5 trigram tokenization so `title:マディニ`
+            // matches "マディニちゃん画像" style titles (substring search
+            // that the legacy `unicode61` tokenizer couldn't express for
+            // CJK text). See `SearchQueryParser` for the query grammar.
+            //
+            // Migration policy:
+            //   - Fresh DB: create empty trigram index. Rebuild is a no-op.
+            //   - Legacy index (unicode61, or any non-trigram config):
+            //     drop + recreate + repopulate from `conversations` +
+            //     `messages`. At ~1,000 conversations this finishes in well
+            //     under a second; scaling to ~100,000 (the 100x target) is
+            //     tracked as a separate task that hoists this out of the
+            //     synchronous bootstrap and wraps it with progress UI.
+            //
+            // We detect the need for migration by scanning the existing
+            // `CREATE VIRTUAL TABLE` statement in `sqlite_master` for the
+            // word "trigram". Any other tokenizer (or no table at all)
+            // triggers a rebuild.
+            let searchSchemaRow = try Row.fetchOne(db, sql: """
+                SELECT sql FROM sqlite_master
+                WHERE type = 'table' AND name = 'search_idx'
                 """)
-            try db.execute(sql: """
-                CREATE TABLE IF NOT EXISTS raw_export_asset_links (
-                    snapshot_id INTEGER NOT NULL,
-                    source_relative_path TEXT NOT NULL,
-                    asset_relative_path TEXT NOT NULL,
-                    blob_hash TEXT,
-                    kind TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    PRIMARY KEY (snapshot_id, source_relative_path, asset_relative_path),
-                    FOREIGN KEY(snapshot_id) REFERENCES raw_export_snapshots(id) ON DELETE CASCADE
-                )
-                """)
-            try db.execute(sql: """
-                CREATE INDEX IF NOT EXISTS idx_raw_export_asset_links_asset
-                ON raw_export_asset_links(snapshot_id, asset_relative_path)
-                """)
+            let existingSearchSQL = (searchSchemaRow?["sql"] as String?) ?? ""
+            let isTrigramIndex = existingSearchSQL.range(
+                of: "trigram",
+                options: .caseInsensitive
+            ) != nil
+            if !isTrigramIndex {
+                if !existingSearchSQL.isEmpty {
+                    try db.execute(sql: "DROP TABLE search_idx")
+                }
+                try db.execute(sql: """
+                    CREATE VIRTUAL TABLE IF NOT EXISTS search_idx USING fts5(
+                        conv_id UNINDEXED,
+                        title,
+                        content,
+                        tokenize = "trigram case_sensitive 0"
+                    )
+                    """)
+                // Only repopulate if the canonical tables are present.
+                // A fresh DB (no conversations yet) can skip rebuild — the
+                // import pipeline inserts into `search_idx` when a
+                // conversation is added.
+                let convTableExists = try Row.fetchOne(db, sql: """
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name = 'conversations'
+                    """) != nil
+                let messagesTableExists = try Row.fetchOne(db, sql: """
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name = 'messages'
+                    """) != nil
+                if convTableExists && messagesTableExists {
+                    // Emit a timing + size diagnostic so scale problems
+                    // show up in Console.app rather than as a silent
+                    // launch freeze. The threshold for "this will feel
+                    // slow" is roughly 10k conversations on M-series
+                    // hardware — beyond that we should hoist the
+                    // rebuild out of bootstrap (see TODO below).
+                    let convCount = try Int.fetchOne(
+                        db,
+                        sql: "SELECT COUNT(*) FROM conversations"
+                    ) ?? 0
+                    let startedAt = Date()
+                    if convCount > 10_000 {
+                        print("[search_idx] Rebuilding FTS5 trigram index over \(convCount) conversations. UI may appear frozen; see TODO in AppServices for progress-UI follow-up.")
+                    }
+                    try db.execute(sql: """
+                        INSERT INTO search_idx (conv_id, title, content)
+                        SELECT
+                            c.id,
+                            COALESCE(c.title, ''),
+                            COALESCE((
+                                SELECT GROUP_CONCAT(m.content, ' ')
+                                FROM messages m
+                                WHERE m.conv_id = c.id
+                            ), '')
+                        FROM conversations c
+                        """)
+                    let elapsed = Date().timeIntervalSince(startedAt)
+                    print(String(format: "[search_idx] Rebuilt trigram index: %d conversations in %.2fs", convCount, elapsed))
+                }
+            }
+            // TODO (100x-scale follow-up): hoist the trigram rebuild
+            // out of this synchronous bootstrap transaction once library
+            // sizes cross ~10k conversations. Proposed shape:
+            //
+            //   1. Add a `pending_migrations(name TEXT PRIMARY KEY)` table.
+            //   2. In bootstrap, insert `'search_idx_trigram'` into it
+            //      instead of running the INSERT inline.
+            //   3. On app launch, after AppServices is wired up, check
+            //      `pending_migrations` and run the rebuild in an async
+            //      task with a launch-screen progress view that reads
+            //      `SELECT COUNT(*) FROM search_idx` periodically.
+            //   4. Delete the pending-migrations row on success.
+            //
+            // At today's scale (hundreds-to-low-thousands of threads)
+            // the inline path is fast enough that the extra
+            // orchestration isn't worth the complexity; revisit when
+            // the live DB crosses the threshold or when a user reports
+            // a slow first-launch after upgrade.
 
             // Seed the Trash system tag. Trash is a "rescue lane" — when a
             // user-defined tag is deleted, the conversations that had it get
@@ -428,6 +560,66 @@ final class AppServices: ObservableObject {
                     DELETE FROM bookmarks WHERE target_type = 'prompt'
                     """)
                 try db.execute(sql: "PRAGMA user_version = 2")
+            }
+
+            // Migration 3: index timestamp columns + the primary_time
+            // COALESCE expression itself.
+            //
+            // `primary_time` is not a stored column — it's a SELECT-time
+            // COALESCE over (source_created_at → imported_at → date_str)
+            // defined verbatim as `primaryTimeSQL` in
+            // GRDBConversationRepository / GRDBSearchRepository (and,
+            // once the next commit lands, in `SearchFilterSQL`). Date-
+            // range predicates in the existing WHERE assembly and the
+            // upcoming Stats aggregations both compare against this
+            // exact expression.
+            //
+            // EXPLAIN QUERY PLAN (verified against an in-memory schema
+            // clone with 5,000 conversations / 10,000 messages):
+            //  - Indexing only the underlying columns leaves the planner
+            //    doing SCAN conversations for COALESCE-bound predicates
+            //    — the NULLIF/TRIM/COALESCE wrapper hides the column
+            //    lookup.
+            //  - An *expression* index whose key matches the COALESCE
+            //    expression byte-for-byte gets picked up
+            //    (SEARCH ... USING INDEX (<expr>>? AND <expr><?)).
+            //
+            // We register all three:
+            //   - idx_conversations_primary_time_expr is the one Stats
+            //     and date-range queries actually use; its key string
+            //     MUST stay byte-for-byte in sync with
+            //     `GRDBConversationRepository.primaryTimeSQL`. If the
+            //     COALESCE expression in that constant changes, register
+            //     a new migration that drops / recreates this index in
+            //     the same commit — do NOT modify Migration 3 in place.
+            //   - idx_conversations_source_created_at /
+            //     idx_conversations_imported_at cover direct-column
+            //     predicates. Current code does not query the columns
+            //     directly, but they're the natural sort keys for
+            //     future Stats axes and for any planner path that
+            //     prefers a covering index over the expression index.
+            //   - date_str is left unindexed — last-resort fallback,
+            //     write cost outweighs the benefit.
+            if userVersion < 3 {
+                try db.execute(sql: """
+                    CREATE INDEX IF NOT EXISTS idx_conversations_primary_time_expr
+                    ON conversations(
+                        COALESCE(
+                            NULLIF(TRIM(source_created_at), ''),
+                            NULLIF(TRIM(imported_at), ''),
+                            NULLIF(TRIM(date_str), '')
+                        )
+                    )
+                    """)
+                try db.execute(sql: """
+                    CREATE INDEX IF NOT EXISTS idx_conversations_source_created_at
+                    ON conversations(source_created_at)
+                    """)
+                try db.execute(sql: """
+                    CREATE INDEX IF NOT EXISTS idx_conversations_imported_at
+                    ON conversations(imported_at)
+                    """)
+                try db.execute(sql: "PRAGMA user_version = 3")
             }
         }
     }

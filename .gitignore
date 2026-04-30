@@ -6,6 +6,10 @@ xcuserdata/
 *.xcworkspace/
 Package.resolved
 
+# xcodegen output + xcodebuild derived data. Source of truth for the
+# Xcode project is `project.yml`; regenerate with `xcodegen generate`.
+/build/
+
 # --- User data safeguards ---
 # Madini の実データは ~/Library/Application Support/Madini Archive/ に
 # 置かれる設計で、リポジトリには入らない。デバッグ用に誤ってコピー

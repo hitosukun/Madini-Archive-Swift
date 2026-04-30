@@ -2,22 +2,12 @@ import SwiftUI
 
 struct ConversationRowView: View {
     let conversation: ConversationSummary
-    var tags: [TagEntry] = []
-    var onTapTag: ((TagEntry) -> Void)? = nil
-    /// Called when a `TagDragPayload` is dropped onto this row. When nil,
-    /// the row does not install a drop destination (iOS / Browse where
-    /// sidebar-tag drops don't apply).
-    var onAttachTag: ((String) -> Void)? = nil
-
-    @State private var isDropTargeted = false
 
     var body: some View {
-        // Two-column layout: main content (title, meta, tag chips) on the
-        // left, a narrow trailing rail carrying just the date on the right.
-        // The rail used to also host a per-card pin toggle; that was
-        // replaced by the right-pane Viewer Mode button (see
-        // `ReaderWorkspaceView.ViewerModeToggleButton`), so there's nothing
-        // else competing for the trailing column now.
+        // Single-column card body. The previous version also rendered
+        // per-tag chips and hosted a `TagDragPayload` drop destination;
+        // both were dropped when tags were retired in favor of the
+        // search-history surface.
         HStack(alignment: .top, spacing: 10) {
             VStack(alignment: .leading, spacing: 6) {
                 Text(conversation.displayTitle)
@@ -48,22 +38,6 @@ struct ConversationRowView: View {
                         .foregroundStyle(.secondary)
                         .labelStyle(.titleAndIcon)
                 }
-
-                // Tag chips. The previous `.spring` reveal animation + `.transition`
-                // on each chip fought with `.draggable`/`.dropDestination` on the
-                // row — during a drop the row view was animating while the drop
-                // target hit-testing was still active, causing the drop to be
-                // cancelled or swallowed. Static rendering now; DnD feedback
-                // comes from the row-level highlight overlay below.
-                if !tags.isEmpty {
-                    FlowLayout(horizontalSpacing: 4, verticalSpacing: 4) {
-                        ForEach(tags, id: \.id) { tag in
-                            ConversationCardTagChip(tag: tag) {
-                                onTapTag?(tag)
-                            }
-                        }
-                    }
-                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -76,106 +50,7 @@ struct ConversationRowView: View {
         }
         .padding(.vertical, 2)
         .padding(.horizontal, 4)
-        .background(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(Color.accentColor.opacity(isDropTargeted ? 0.14 : 0))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .strokeBorder(
-                    Color.accentColor.opacity(isDropTargeted ? 0.7 : 0),
-                    lineWidth: 1.5
-                )
-        )
-        // Animate ONLY the highlight color/opacity, not anything that
-        // could change layout — the chip-row note above explains why
-        // layout-affecting animation interferes with DnD hit testing.
-        // `value: isDropTargeted` scopes the animation so it doesn't fire
-        // for unrelated body re-evals (tag updates, selection changes).
-        .animation(.easeOut(duration: 0.12), value: isDropTargeted)
         .contentShape(Rectangle())
-        .modifier(
-            ConversationRowTagDropModifier(
-                isTargeted: $isDropTargeted,
-                onAttachTag: onAttachTag
-            )
-        )
-        .draggable(ConversationDragPayload(id: conversation.id)) {
-            // Compact drag preview: just the title so the user can see
-            // which card is being carried. Keeps the preview lightweight
-            // even when the source row has long tag chip rows.
-            Text(conversation.displayTitle)
-                .font(.caption)
-                .lineLimit(1)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(Color.accentColor.opacity(0.15))
-                )
-        }
-    }
-}
-
-/// Gates the tag-drop destination on whether a handler was supplied and
-/// provides the `isTargeted` highlight signal. Kept as a ViewModifier so
-/// the drop modifier only exists when `onAttachTag` is non-nil — applying
-/// `.dropDestination` unconditionally can interfere with surrounding
-/// gesture recognizers even when it does no work.
-private struct ConversationRowTagDropModifier: ViewModifier {
-    @Binding var isTargeted: Bool
-    let onAttachTag: ((String) -> Void)?
-
-    func body(content: Content) -> some View {
-        if let onAttachTag {
-            content.dropDestination(for: TagDragPayload.self) { payloads, _ in
-                guard let first = payloads.first else { return false }
-                onAttachTag(first.name)
-                return true
-            } isTargeted: { newValue in
-                // Guard redundant writes — SwiftUI fires this callback on
-                // every cursor-move tick during the drag, often with the
-                // same value as the prior call. Each write re-runs body
-                // and any `.animation(value:)` watchers. With dozens of
-                // visible rows each owning their own `isTargeted` state,
-                // the redundant churn was the bulk of the perceived lag.
-                if isTargeted != newValue { isTargeted = newValue }
-            }
-        } else {
-            content
-        }
-    }
-}
-
-private struct ConversationCardTagChip: View {
-    let tag: TagEntry
-    let onTap: () -> Void
-
-    var body: some View {
-        Button(action: onTap) {
-            Text("#\(tag.name)")
-                .font(.caption2)
-                .lineLimit(1)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 2)
-                // Monochrome chip — color was called out as too loud and
-                // colliding visually with other colored UI (JSON glyph
-                // green, filter-chip palette). The capsule shape + `#`
-                // prefix already reads unambiguously as "tag", so the
-                // chrome doesn't need to carry hue too. Neutral secondary
-                // fill + primary text = a quiet pill that defers to the
-                // card's title as the focal point.
-                .background(
-                    Capsule(style: .continuous)
-                        .fill(Color.secondary.opacity(0.14))
-                )
-                .overlay(
-                    Capsule(style: .continuous)
-                        .stroke(Color.secondary.opacity(0.22), lineWidth: 0.5)
-                )
-                .foregroundStyle(.secondary)
-        }
-        .buttonStyle(.plain)
     }
 }
 

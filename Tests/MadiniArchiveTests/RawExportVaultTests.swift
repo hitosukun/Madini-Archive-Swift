@@ -1,0 +1,486 @@
+import XCTest
+import GRDB
+@testable import MadiniArchive
+
+/// Integration tests for the Vault's ingest + restore contract.
+///
+/// These run against a temporary directory so they are hermetic — no
+/// `~/Library/Application Support/Madini Archive` pollution. The tests
+/// deliberately walk the full filesystem path (blobs on disk, SQLite queue)
+/// rather than mocking, because the whole point of the restore API is to
+/// prove that `ingest` really did put the bytes somewhere we can read back.
+final class RawExportVaultTests: XCTestCase {
+    private var tempRoot: URL!
+
+    override func setUpWithError() throws {
+        let base = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("MadiniVaultTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        tempRoot = base
+    }
+
+    override func tearDownWithError() throws {
+        if let tempRoot {
+            try? FileManager.default.removeItem(at: tempRoot)
+        }
+        tempRoot = nil
+    }
+
+    // MARK: - Fixtures
+
+    /// Build a scratch Vault + DatabaseQueue backed entirely by `tempRoot`.
+    private func makeVault() throws -> (vault: GRDBRawExportVault, dbQueue: DatabaseQueue) {
+        let dbURL = tempRoot.appendingPathComponent("vault.sqlite")
+        let dbQueue = try DatabaseQueue(path: dbURL.path)
+        try dbQueue.write { db in
+            try GRDBRawExportVault.installSchema(in: db)
+        }
+        let storage = GRDBRawExportVault.Storage(
+            blobsDir: tempRoot.appendingPathComponent("blobs", isDirectory: true),
+            snapshotsDir: tempRoot.appendingPathComponent("snapshots", isDirectory: true)
+        )
+        let vault = GRDBRawExportVault(dbQueue: dbQueue, storage: storage)
+        return (vault, dbQueue)
+    }
+
+    /// A minimal but provider-shaped ChatGPT export: one conversation chunk
+    /// whose first JSON element carries a `mapping` field (which is the
+    /// provider detector's ChatGPT marker) plus the companion manifest.
+    @discardableResult
+    private func makeChatGPTExport(named name: String = "chatgpt-export") throws -> URL {
+        let root = tempRoot.appendingPathComponent(name, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        let conversation = #"""
+        [
+          {
+            "title": "Vault roundtrip smoke",
+            "mapping": {
+              "root": {
+                "message": {
+                  "content": {
+                    "parts": ["hello test vault, the quick brown fox jumps over the lazy dog"]
+                  }
+                }
+              }
+            }
+          }
+        ]
+        """#.data(using: .utf8)!
+        try conversation.write(
+            to: root.appendingPathComponent("conversations-0001.json"),
+            options: .atomic
+        )
+
+        let manifest = #"""
+        { "version": 1, "chunks": ["conversations-0001.json"] }
+        """#.data(using: .utf8)!
+        try manifest.write(
+            to: root.appendingPathComponent("export_manifest.json"),
+            options: .atomic
+        )
+
+        return root
+    }
+
+    // MARK: - Round trip
+
+    func testIngestRestoreRoundTripByteForByte() async throws {
+        let (vault, _) = try makeVault()
+        let exportRoot = try makeChatGPTExport()
+
+        let result = try await vault.ingest([exportRoot])
+        let unwrapped = try XCTUnwrap(result, "ingest should return a result for a non-empty export")
+        XCTAssertEqual(unwrapped.provider, .chatGPT)
+        XCTAssertEqual(unwrapped.totalFiles, 2)
+        XCTAssertEqual(unwrapped.newBlobs, 2)
+        XCTAssertEqual(unwrapped.reusedBlobs, 0)
+
+        // Snapshot summary round-trips.
+        let summary = try await vault.getSnapshot(id: unwrapped.snapshotID)
+        let gotSummary = try XCTUnwrap(summary, "getSnapshot should find the ingested snapshot")
+        XCTAssertEqual(gotSummary.provider, .chatGPT)
+        XCTAssertEqual(gotSummary.fileCount, 2)
+
+        // File list paginates and preserves relative paths.
+        let files = try await vault.listFiles(
+            snapshotID: unwrapped.snapshotID,
+            offset: 0,
+            limit: 100
+        )
+        XCTAssertEqual(files.count, 2)
+        let relativePaths = Set(files.map(\.relativePath))
+        XCTAssertEqual(
+            relativePaths,
+            Set(["conversations-0001.json", "export_manifest.json"])
+        )
+
+        // Byte-for-byte round-trip via loadBlob.
+        for entry in files {
+            let originalURL = exportRoot.appendingPathComponent(entry.relativePath)
+            let original = try Data(contentsOf: originalURL)
+            let restored = try await vault.loadBlob(hash: entry.blobHash)
+            XCTAssertEqual(
+                restored,
+                original,
+                "loadBlob should return the original bytes for \(entry.relativePath)"
+            )
+        }
+
+        // loadFile combines metadata lookup + blob read + hash verification.
+        let payload = try await vault.loadFile(
+            snapshotID: unwrapped.snapshotID,
+            relativePath: "conversations-0001.json"
+        )
+        XCTAssertEqual(payload.entry.role, "conversation")
+        let expected = try Data(
+            contentsOf: exportRoot.appendingPathComponent("conversations-0001.json")
+        )
+        XCTAssertEqual(payload.data, expected)
+    }
+
+    // MARK: - Compression
+
+    func testLZFSECompressionRoundTripForLargeTextualFile() async throws {
+        let (vault, _) = try makeVault()
+        let root = tempRoot.appendingPathComponent("compressible-export", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        // Build a ~36 KiB highly-redundant JSON so the compression heuristic
+        // (≥ 4 KiB AND compressed < 92 %) kicks in.
+        let filler = String(repeating: "the quick brown fox jumps over the lazy dog ", count: 800)
+        let body = #"[{"mapping": {}, "content": ""# + filler + #""}]"#
+        let bytes = Data(body.utf8)
+        XCTAssertGreaterThan(bytes.count, 30_000)
+        try bytes.write(
+            to: root.appendingPathComponent("conversations-0001.json"),
+            options: .atomic
+        )
+
+        let result = try await vault.ingest([root])
+        let unwrapped = try XCTUnwrap(result)
+
+        let files = try await vault.listFiles(
+            snapshotID: unwrapped.snapshotID,
+            offset: 0,
+            limit: 100
+        )
+        let entry = try XCTUnwrap(
+            files.first { $0.relativePath == "conversations-0001.json" }
+        )
+        XCTAssertEqual(entry.compression, "lzfse", "redundant 36 KiB text should trip LZFSE")
+        XCTAssertLessThan(
+            entry.storedSizeBytes,
+            entry.sizeBytes,
+            "LZFSE should produce a smaller stored size"
+        )
+
+        // Decompress + SHA-256 verify should succeed.
+        let restored = try await vault.loadBlob(hash: entry.blobHash)
+        XCTAssertEqual(restored, bytes)
+    }
+
+    // MARK: - Dedupe
+
+    func testReingestSameExportIsTreatedAsDuplicate() async throws {
+        let (vault, dbQueue) = try makeVault()
+        let root = try makeChatGPTExport()
+
+        let first = try await vault.ingest([root])
+        let firstResult = try XCTUnwrap(first)
+        XCTAssertEqual(firstResult.newBlobs, 2)
+        XCTAssertEqual(firstResult.reusedBlobs, 0)
+        XCTAssertFalse(firstResult.wasDuplicate)
+
+        let second = try await vault.ingest([root])
+        let secondResult = try XCTUnwrap(second)
+        XCTAssertTrue(
+            secondResult.wasDuplicate,
+            "re-dropping the same export folder should be flagged as duplicate"
+        )
+        XCTAssertEqual(
+            secondResult.snapshotID,
+            firstResult.snapshotID,
+            "duplicate result should point back at the original snapshot"
+        )
+        XCTAssertEqual(secondResult.newBlobs, 0)
+        XCTAssertEqual(secondResult.reusedBlobs, 0)
+
+        // Confirm only one snapshot row exists in the DB.
+        let snapshotCount = try await dbQueue.read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM raw_export_snapshots") ?? -1
+        }
+        XCTAssertEqual(snapshotCount, 1, "duplicate ingest should not create a new snapshot row")
+    }
+
+    func testReingestCopyWithSamePathDedupesToSameSnapshot() async throws {
+        // Drop the same content twice from two different source paths. The
+        // content hash is path-independent, so the second ingest should still
+        // collapse onto the first snapshot.
+        let (vault, dbQueue) = try makeVault()
+        let firstRoot = try makeChatGPTExport(named: "chatgpt-export-a")
+        let secondRoot = try makeChatGPTExport(named: "chatgpt-export-b")
+
+        let firstRaw = try await vault.ingest([firstRoot])
+        let first = try XCTUnwrap(firstRaw)
+        let secondRaw = try await vault.ingest([secondRoot])
+        let second = try XCTUnwrap(secondRaw)
+
+        XCTAssertTrue(second.wasDuplicate)
+        XCTAssertEqual(second.snapshotID, first.snapshotID)
+
+        let snapshotCount = try await dbQueue.read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM raw_export_snapshots") ?? -1
+        }
+        XCTAssertEqual(snapshotCount, 1)
+    }
+
+    func testDifferentContentProducesDistinctSnapshots() async throws {
+        let (vault, dbQueue) = try makeVault()
+        let firstRoot = try makeChatGPTExport(named: "export-1")
+
+        // Second export has an extra file so the content hash diverges.
+        let secondRoot = try makeChatGPTExport(named: "export-2")
+        try Data("different".utf8).write(
+            to: secondRoot.appendingPathComponent("extra.txt"),
+            options: .atomic
+        )
+
+        let firstRaw = try await vault.ingest([firstRoot])
+        let first = try XCTUnwrap(firstRaw)
+        let secondRaw = try await vault.ingest([secondRoot])
+        let second = try XCTUnwrap(secondRaw)
+
+        XCTAssertFalse(first.wasDuplicate)
+        XCTAssertFalse(second.wasDuplicate)
+        XCTAssertNotEqual(first.snapshotID, second.snapshotID)
+
+        let snapshotCount = try await dbQueue.read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM raw_export_snapshots") ?? -1
+        }
+        XCTAssertEqual(snapshotCount, 2)
+    }
+
+    func testContentHashBackfillFillsLegacySnapshot() async throws {
+        let (vault, dbQueue) = try makeVault()
+        let root = try makeChatGPTExport()
+        let firstRaw = try await vault.ingest([root])
+        let first = try XCTUnwrap(firstRaw)
+
+        // Simulate a pre-backfill database by blanking the content_hash.
+        try await dbQueue.write { db in
+            try db.execute(
+                sql: "UPDATE raw_export_snapshots SET content_hash = '' WHERE id = ?",
+                arguments: [first.snapshotID]
+            )
+        }
+
+        // Re-running the schema installer should backfill the stable hash.
+        try await dbQueue.write { db in
+            try GRDBRawExportVault.installSchema(in: db)
+        }
+
+        let hashAfter: String? = try await dbQueue.read { db in
+            try String.fetchOne(
+                db,
+                sql: "SELECT content_hash FROM raw_export_snapshots WHERE id = ?",
+                arguments: [first.snapshotID]
+            )
+        }
+        XCTAssertNotNil(hashAfter)
+        XCTAssertFalse(hashAfter?.isEmpty ?? true, "backfill should populate a non-empty hash")
+
+        // And a subsequent ingest of the same bytes should now dedupe
+        // correctly onto the backfilled snapshot.
+        let secondRaw = try await vault.ingest([root])
+        let second = try XCTUnwrap(secondRaw)
+        XCTAssertTrue(second.wasDuplicate)
+        XCTAssertEqual(second.snapshotID, first.snapshotID)
+    }
+
+    // MARK: - Search
+
+    func testSearchFindsIngestedConversationBody() async throws {
+        let (vault, _) = try makeVault()
+        _ = try await vault.ingest([try makeChatGPTExport()])
+
+        let hits = try await vault.search(
+            query: "quick brown fox",
+            provider: nil,
+            offset: 0,
+            limit: 10
+        )
+        XCTAssertFalse(hits.isEmpty, "search should match content from the ingested conversation")
+        XCTAssertTrue(hits.contains { $0.relativePath == "conversations-0001.json" })
+    }
+
+    func testSearchRespectsProviderFilter() async throws {
+        let (vault, _) = try makeVault()
+        _ = try await vault.ingest([try makeChatGPTExport()])
+
+        let chatgptHits = try await vault.search(
+            query: "quick brown fox",
+            provider: .chatGPT,
+            offset: 0,
+            limit: 10
+        )
+        XCTAssertFalse(chatgptHits.isEmpty)
+
+        let claudeHits = try await vault.search(
+            query: "quick brown fox",
+            provider: .claude,
+            offset: 0,
+            limit: 10
+        )
+        XCTAssertTrue(
+            claudeHits.isEmpty,
+            "scoping the search to .claude should filter out chatGPT snapshots"
+        )
+    }
+
+    // MARK: - Restore errors
+
+    func testGetSnapshotReturnsNilForUnknownID() async throws {
+        let (vault, _) = try makeVault()
+        let got = try await vault.getSnapshot(id: 99_999)
+        XCTAssertNil(got)
+    }
+
+    func testLoadBlobThrowsBlobNotFoundForUnknownHash() async throws {
+        let (vault, _) = try makeVault()
+        do {
+            _ = try await vault.loadBlob(
+                hash: String(repeating: "0", count: 64)
+            )
+            XCTFail("expected RawExportVaultError.blobNotFound")
+        } catch let error as RawExportVaultError {
+            guard case .blobNotFound = error else {
+                XCTFail("expected .blobNotFound, got \(error)")
+                return
+            }
+        }
+    }
+
+    func testLoadFileThrowsFileNotFoundForUnknownPath() async throws {
+        let (vault, _) = try makeVault()
+        let result = try await vault.ingest([try makeChatGPTExport()])
+        let unwrapped = try XCTUnwrap(result)
+
+        do {
+            _ = try await vault.loadFile(
+                snapshotID: unwrapped.snapshotID,
+                relativePath: "does-not-exist.json"
+            )
+            XCTFail("expected RawExportVaultError.fileNotFound")
+        } catch let error as RawExportVaultError {
+            guard case .fileNotFound = error else {
+                XCTFail("expected .fileNotFound, got \(error)")
+                return
+            }
+        }
+    }
+
+    func testListFilesThrowsSnapshotNotFoundForUnknownSnapshot() async throws {
+        let (vault, _) = try makeVault()
+        // No ingest: every snapshotID is unknown.
+        do {
+            _ = try await vault.listFiles(
+                snapshotID: 999_999,
+                offset: 0,
+                limit: 10
+            )
+            XCTFail("expected RawExportVaultError.snapshotNotFound")
+        } catch let error as RawExportVaultError {
+            guard case .snapshotNotFound(let snapshotID) = error else {
+                XCTFail("expected .snapshotNotFound, got \(error)")
+                return
+            }
+            XCTAssertEqual(snapshotID, 999_999)
+        }
+    }
+
+    func testLoadFileThrowsSnapshotNotFoundForUnknownSnapshot() async throws {
+        let (vault, _) = try makeVault()
+        // Even ingesting something doesn't make a bogus ID resolvable.
+        _ = try await vault.ingest([try makeChatGPTExport()])
+        do {
+            _ = try await vault.loadFile(
+                snapshotID: 999_999,
+                relativePath: "anything.json"
+            )
+            XCTFail("expected RawExportVaultError.snapshotNotFound")
+        } catch let error as RawExportVaultError {
+            guard case .snapshotNotFound(let snapshotID) = error else {
+                XCTFail("expected .snapshotNotFound (not .fileNotFound), got \(error)")
+                return
+            }
+            XCTAssertEqual(snapshotID, 999_999)
+        }
+    }
+
+    func testLoadBlobResolvesCanonicalPathEvenWhenStoredPathIsStale() async throws {
+        // Vault must be portable: if the data directory moves between machines
+        // the absolute `stored_path` recorded at ingest becomes stale, but the
+        // canonical `blobs/<prefix>/<hash>.<ext>` layout under the current
+        // `Storage.blobsDir` still resolves. loadBlob should honour that.
+        let (vault, dbQueue) = try makeVault()
+        let result = try await vault.ingest([try makeChatGPTExport()])
+        let unwrapped = try XCTUnwrap(result)
+
+        let files = try await vault.listFiles(
+            snapshotID: unwrapped.snapshotID,
+            offset: 0,
+            limit: 100
+        )
+        let target = try XCTUnwrap(files.first)
+
+        // Clobber the DB's stored_path so the legacy fallback points at a
+        // nonexistent location. The on-disk blob under `storage.blobsDir`
+        // is untouched — canonical resolution should still find it.
+        let bogusPath = "/does/not/exist/\(target.blobHash).blob"
+        try await GRDBAsync.write(to: dbQueue) { db in
+            try db.execute(
+                sql: "UPDATE raw_export_blobs SET stored_path = ? WHERE hash = ?",
+                arguments: [bogusPath, target.blobHash]
+            )
+        }
+
+        // Still readable, because we derive the path from hash + compression
+        // against the current Storage.
+        let restored = try await vault.loadBlob(hash: target.blobHash)
+        let originalURL = tempRoot
+            .appendingPathComponent("chatgpt-export", isDirectory: true)
+            .appendingPathComponent(target.relativePath)
+        XCTAssertEqual(restored, try Data(contentsOf: originalURL))
+    }
+
+    func testLoadBlobDetectsHashMismatchAfterTampering() async throws {
+        let (vault, _) = try makeVault()
+        let root = try makeChatGPTExport()
+        let result = try await vault.ingest([root])
+        let unwrapped = try XCTUnwrap(result)
+
+        let files = try await vault.listFiles(
+            snapshotID: unwrapped.snapshotID,
+            offset: 0,
+            limit: 100
+        )
+        let target = try XCTUnwrap(files.first)
+
+        // Tamper with the on-disk blob so the SHA-256 no longer matches.
+        let storedURL = URL(fileURLWithPath: target.storedPath)
+        try Data(repeating: 0x41, count: 16).write(to: storedURL, options: .atomic)
+
+        do {
+            _ = try await vault.loadBlob(hash: target.blobHash)
+            XCTFail("expected RawExportVaultError.hashMismatch or .decompressionFailed")
+        } catch let error as RawExportVaultError {
+            switch error {
+            case .hashMismatch, .decompressionFailed:
+                break // either is an acceptable integrity failure
+            default:
+                XCTFail("expected hash/decompression failure, got \(error)")
+            }
+        }
+    }
+}

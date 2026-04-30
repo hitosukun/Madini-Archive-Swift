@@ -18,11 +18,10 @@ import AppKit
 /// can use the control that matches its UX without compromises.
 ///
 /// **Data flow.** Reads `viewModel.conversations` (already filtered by
-/// the sidebar) and `viewModel.conversationTags` for per-row tag
-/// chips. Rows are wrapped in a local `Row` struct so the
+/// the sidebar). Rows are wrapped in a local `Row` struct so the
 /// `KeyPathComparator` sort path has non-optional, easy-to-compare
 /// fields (titles as `String`, dates as `String` for lexicographic
-/// ISO sorting, prompt counts as `Int`, tags as comma-joined `String`).
+/// ISO sorting, prompt counts as `Int`).
 ///
 /// **Sort persistence.** Selected column + ascending flag live in
 /// `@AppStorage`, so reopening the app restores the user's last
@@ -63,7 +62,6 @@ struct ConversationTableView: View {
         case title
         case date
         case model
-        case tags
         case promptCount
     }
 
@@ -287,11 +285,6 @@ struct ConversationTableView: View {
         }
         .width(min: 80, ideal: 140, max: 220)
 
-        TableColumn("タグ", value: \Row.tagsSortKey) { (row: Row) in
-            TagsCell(row: row)
-        }
-        .width(min: 100, ideal: 200)
-
         TableColumn("プロンプト数", value: \Row.promptCount) { (row: Row) in
             PromptCountCell(row: row)
         }
@@ -302,9 +295,6 @@ struct ConversationTableView: View {
 
     private func buildRows() -> [Row] {
         viewModel.conversations.map { summary in
-            let tags = (viewModel.conversationTags[summary.id] ?? [])
-                .map(\.name)
-                .sorted()
             // Model column: prefer the concrete model string when
             // present (e.g. "gpt-5-4-thinking"); fall back to the
             // source brand (e.g. "claude", "gemini") so Claude/Gemini
@@ -327,8 +317,6 @@ struct ConversationTableView: View {
                 model: modelDisplay,
                 source: summary.source,
                 rawModel: summary.model,
-                tags: tags,
-                tagsSortKey: tags.joined(separator: ","),
                 promptCount: summary.messageCount,
                 isBookmarked: summary.isBookmarked
             )
@@ -380,8 +368,6 @@ struct ConversationTableView: View {
             return KeyPathComparator(\Row.dateSortKey, order: order)
         case .model:
             return KeyPathComparator(\Row.model, order: order)
-        case .tags:
-            return KeyPathComparator(\Row.tagsSortKey, order: order)
         case .promptCount:
             return KeyPathComparator(\Row.promptCount, order: order)
         }
@@ -392,7 +378,6 @@ struct ConversationTableView: View {
         case \Row.title: return .title
         case \Row.dateSortKey: return .date
         case \Row.model: return .model
-        case \Row.tagsSortKey: return .tags
         case \Row.promptCount: return .promptCount
         default: return .date
         }
@@ -438,8 +423,6 @@ struct ConversationTableView: View {
         /// `gpt-*` from `claude-*` when both would map to the same
         /// source color family.
         let rawModel: String?
-        let tags: [String]
-        let tagsSortKey: String
         let promptCount: Int
         let isBookmarked: Bool
     }
@@ -597,35 +580,6 @@ private struct ModelCell: View {
             return SourceAppearance.color(for: s)
         }
         return .secondary
-    }
-}
-
-/// Chip-strip rather than comma text — tags already read as chips
-/// everywhere else in the UI (sidebar, list card header), so the
-/// table should match. `Row.tagsSortKey` (comma-joined) drives the
-/// column sort alphabetically; these chips are the prettier
-/// presentation of the same data.
-private struct TagsCell: View {
-    let row: ConversationTableView.Row
-
-    var body: some View {
-        if row.tags.isEmpty {
-            Text("—")
-                .foregroundStyle(.tertiary)
-        } else {
-            HStack(spacing: 4) {
-                ForEach(row.tags, id: \.self) { name in
-                    Text("#\(name)")
-                        .font(.caption)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 1)
-                        .background(
-                            Capsule().fill(Color.secondary.opacity(0.12))
-                        )
-                }
-            }
-            .lineLimit(1)
-        }
     }
 }
 

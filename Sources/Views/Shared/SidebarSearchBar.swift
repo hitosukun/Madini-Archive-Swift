@@ -58,7 +58,7 @@ struct SidebarSearchBar: View {
                     .font(.body.weight(.semibold))
                     .foregroundStyle(.secondary)
 
-                TextField("Search archive  (use #tag)", text: $draft)
+                TextField("Search  (\"phrase\", title:foo, -word, #tag)", text: $draft)
                     .textFieldStyle(.plain)
                     .onChange(of: draft) { _, newValue in
                         commitParsed(newValue)
