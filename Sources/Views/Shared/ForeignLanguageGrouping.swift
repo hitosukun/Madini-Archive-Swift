@@ -111,8 +111,28 @@ enum ForeignLanguageGrouping {
             if combined.count >= sampleLimit { break }
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { continue }
-            if !combined.isEmpty { combined.append("\n\n") }
-            let remaining = sampleLimit - combined.count
+            // Phase 9 hotfix — compute remaining capacity AFTER
+            // accounting for the separator we're about to append, and
+            // bail out when capacity has run out. The previous version
+            // appended `"\n\n"` first and then computed
+            // `remaining = sampleLimit - combined.count`, which could
+            // land at -1 / -2 when an earlier iteration had filled
+            // `combined` to within 1-2 chars of `sampleLimit` (the
+            // outer `>= sampleLimit` break only catches the exact
+            // overshoot, not the off-by-2 caused by the separator).
+            // Negative `remaining` then crashed `trimmed.prefix(_:)`
+            // with "Can't take a prefix of negative length from a
+            // collection" (SIGTRAP, observed in the wild on a real
+            // conversation whose message lengths happened to land
+            // `combined.count` at `sampleLimit - 1` mid-iteration).
+            // Reordering the calculation and adding the early-break
+            // removes both the negative-length path AND the silent
+            // overshoot where `combined` could exceed `sampleLimit`
+            // by the separator length.
+            let separator = combined.isEmpty ? "" : "\n\n"
+            let remaining = sampleLimit - combined.count - separator.count
+            if remaining <= 0 { break }
+            combined.append(separator)
             if trimmed.count <= remaining {
                 combined.append(trimmed)
             } else {
