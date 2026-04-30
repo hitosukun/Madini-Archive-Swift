@@ -196,9 +196,41 @@ struct MessageBubbleView: View, Equatable {
     /// raw JSON isn't vaulted, or the brief window before extraction
     /// resolves — bubbles render text-only, same as before.
     @Environment(\.messageAssetContext) private var messageAssetContext
+    /// Browser-style zoom for the body column. Drives paragraph,
+    /// list-item, blockquote, code-block, math-block, and table-cell
+    /// font sizes. Headings and the smaller meta captions (image alt,
+    /// "loading…" bands, unresolved-image error rows) intentionally
+    /// stay at their fixed Layout sizes so the chrome doesn't pump
+    /// when the user zooms reading text. Default 1.0 keeps the
+    /// pre-zoom baseline when the env value isn't injected (Previews,
+    /// non-app contexts).
+    @Environment(\.bodyTextSizeMultiplier) private var bodyTextSizeMultiplier
     #if os(macOS)
     @Environment(\.openSettings) private var openSettings
     #endif
+
+    /// Body paragraph / list / blockquote / table-cell size, scaled by
+    /// the user's reader-zoom preference. Use this in place of
+    /// `Layout.bodyFontSize` everywhere the result is body reading
+    /// text. Auxiliary captions that derive from `Layout.bodyFontSize`
+    /// with a `-1` / `-2` / `-3` offset deliberately keep using the
+    /// raw constant — they're metadata, not body.
+    private var scaledBodyFontSize: CGFloat {
+        Layout.bodyFontSize * bodyTextSizeMultiplier
+    }
+
+    /// Code-block font size, scaled. Code is part of the body reading
+    /// flow; if the prose bumps up, the code that documents the prose
+    /// has to come along or the relative weight inverts.
+    private var scaledCodeFontSize: CGFloat {
+        Layout.codeFontSize * bodyTextSizeMultiplier
+    }
+
+    /// Display-math block size, scaled. Same rationale as code: math
+    /// blocks are body content rendered alongside the prose.
+    private var scaledMathFontSize: CGFloat {
+        Layout.mathFontSize * bodyTextSizeMultiplier
+    }
 
     var body: some View {
         bodyContent
@@ -296,7 +328,7 @@ struct MessageBubbleView: View, Equatable {
             attachmentImagesView(alignment: .trailing)
 
             Text(highlightedVerbatim(message.content, blockAnchorID: message.id))
-                .font(.system(size: Layout.bodyFontSize))
+                .font(.system(size: scaledBodyFontSize))
                 .textSelection(.enabled)
                 .multilineTextAlignment(.leading)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -410,7 +442,7 @@ struct MessageBubbleView: View, Equatable {
             attachmentImagesView(alignment: .trailing)
 
             Text(highlightedVerbatim(message.content, blockAnchorID: message.id))
-                .font(.system(size: Layout.bodyFontSize))
+                .font(.system(size: scaledBodyFontSize))
                 .textSelection(.enabled)
                 .multilineTextAlignment(.leading)
                 .padding(12)
@@ -455,7 +487,7 @@ struct MessageBubbleView: View, Equatable {
                 // content without losing formatting chars.
                 if displayMode == .plain {
                     Text(highlightedVerbatim(message.content, blockAnchorID: message.id))
-                        .font(.system(size: Layout.bodyFontSize))
+                        .font(.system(size: scaledBodyFontSize))
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 } else {
@@ -557,22 +589,22 @@ struct MessageBubbleView: View, Equatable {
         case .blockquote(let text):
             blockquoteView(text, blockAnchorID: blockAnchorID)
         case .code(let language, let code):
-            CodeBlockView(language: language, code: code, fontSize: Layout.codeFontSize)
+            CodeBlockView(language: language, code: code, fontSize: scaledCodeFontSize)
         case .math(let source):
-            MathBlockView(source: source, fontSize: Layout.mathFontSize)
+            MathBlockView(source: source, fontSize: scaledMathFontSize)
         case .table(let headers, let rows, let alignments):
             TableBlockView(
                 headers: headers,
                 rows: rows,
                 alignments: alignments,
-                fontSize: Layout.bodyFontSize,
+                fontSize: scaledBodyFontSize,
                 renderInline: { text in
                     // Capture this block's anchor so the table's inline
                     // cells flow through the same hot/dim decision as
                     // top-level paragraphs in this block.
                     renderInlineRich(
                         text,
-                        fontSize: Layout.bodyFontSize,
+                        fontSize: scaledBodyFontSize,
                         blockAnchorID: blockAnchorID
                     )
                 }
@@ -594,7 +626,7 @@ struct MessageBubbleView: View, Equatable {
             if canRenderMarkdown(text) {
                 return renderInlineRich(
                     text,
-                    fontSize: Layout.bodyFontSize,
+                    fontSize: scaledBodyFontSize,
                     blockAnchorID: blockAnchorID
                 )
             }
@@ -602,7 +634,7 @@ struct MessageBubbleView: View, Equatable {
         }()
 
         rendered
-            .font(.system(size: Layout.bodyFontSize))
+            .font(.system(size: scaledBodyFontSize))
             .textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)
             .fixedSize(horizontal: false, vertical: true)
@@ -642,16 +674,16 @@ struct MessageBubbleView: View, Equatable {
     ) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 6) {
             Text(marker)
-                .font(.system(size: Layout.bodyFontSize).monospacedDigit())
+                .font(.system(size: scaledBodyFontSize).monospacedDigit())
                 .foregroundStyle(.secondary)
                 .frame(minWidth: ordered ? 22 : 14, alignment: .trailing)
 
             renderInlineRich(
                 text,
-                fontSize: Layout.bodyFontSize,
+                fontSize: scaledBodyFontSize,
                 blockAnchorID: blockAnchorID
             )
-                .font(.system(size: Layout.bodyFontSize))
+                .font(.system(size: scaledBodyFontSize))
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .fixedSize(horizontal: false, vertical: true)
@@ -671,10 +703,10 @@ struct MessageBubbleView: View, Equatable {
 
             renderInlineRich(
                 text,
-                fontSize: Layout.bodyFontSize,
+                fontSize: scaledBodyFontSize,
                 blockAnchorID: blockAnchorID
             )
-                .font(.system(size: Layout.bodyFontSize).italic())
+                .font(.system(size: scaledBodyFontSize).italic())
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
