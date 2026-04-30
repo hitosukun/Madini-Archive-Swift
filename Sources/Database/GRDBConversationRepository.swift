@@ -77,7 +77,7 @@ final class GRDBConversationRepository: ConversationRepository, @unchecked Senda
             let messageRows = try Row.fetchAll(
                 db,
                 sql: """
-                    SELECT id, role, content
+                    SELECT id, role, content, content_json
                     FROM messages
                     WHERE conv_id = ?
                     ORDER BY msg_index
@@ -89,7 +89,17 @@ final class GRDBConversationRepository: ConversationRepository, @unchecked Senda
                 Message(
                     id: "\(id):\(row["id"] as Int64? ?? 0)",
                     role: MessageRole(databaseValue: row["role"]),
-                    content: row["content"] ?? ""
+                    content: row["content"] ?? "",
+                    // Phase 3 forward-compat read. The Python core
+                    // (Phase 2 / 2b) writes a JSON-serialized block
+                    // list into `content_json` for Claude messages
+                    // with thinking / tool calls and ChatGPT
+                    // messages with reasoning. Decode lazily here
+                    // and pass through to the view layer; Phase 4
+                    // will dispatch rendering on the structured
+                    // form when present and fall back to the flat
+                    // `content` path otherwise.
+                    contentBlocks: Self.decodeContentBlocks(row["content_json"])
                 )
             }
 
@@ -343,5 +353,23 @@ final class GRDBConversationRepository: ConversationRepository, @unchecked Senda
             title: row["title"],
             firstMessage: row["first_message_snippet"]
         )
+    }
+
+    /// Decode the per-message structured block list out of the
+    /// `messages.content_json` column. Returns `nil` for rows that
+    /// haven't been populated yet (legacy data, plain-text messages),
+    /// for rows whose JSON is malformed, and for rows whose JSON
+    /// decodes into an empty array. Decode failures are silently
+    /// converted to `nil` rather than thrown — the caller renders
+    /// such a message via the flat `content` path, which is the same
+    /// fallback used for legacy rows. We deliberately don't surface
+    /// the decode error: a bad JSON blob in one message must not
+    /// abort the whole `fetchDetail` call.
+    private static func decodeContentBlocks(_ raw: String?) -> [MessageBlock]? {
+        guard let raw, !raw.isEmpty else { return nil }
+        guard let data = raw.data(using: .utf8) else { return nil }
+        let blocks = try? JSONDecoder().decode([MessageBlock].self, from: data)
+        guard let blocks, !blocks.isEmpty else { return nil }
+        return blocks
     }
 }
