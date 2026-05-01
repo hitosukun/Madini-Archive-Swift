@@ -95,16 +95,51 @@ struct MadiniArchiveApp: App {
         .defaultSize(width: 1200, height: 800)
         .commands {
             // Madini is single-window by design (see AGENTS.md "Window
-            // model"). SwiftUI's `WindowGroup` would otherwise auto-publish
-            // a File > "New Window" item bound to ⌘N, which would let the
-            // user spawn additional main scenes whose per-window
-            // isolation is currently incidental rather than designed.
-            // Replacing the `.newItem` command group with empty content
-            // removes the menu item and unbinds ⌘N. Settings (⌘,) is a
-            // separate Scene and is unaffected; ad-hoc helper windows
-            // opened directly via `NSWindow(...)` (see
-            // `RawTranscriptImageView`, `TextPreviewWindow`) also remain.
-            CommandGroup(replacing: .newItem) { }
+            // Model"). SwiftUI's `WindowGroup` would otherwise auto-
+            // publish a File > "New Window" item bound to ⌘N, which
+            // would let the user spawn additional main scenes whose
+            // per-window isolation is currently incidental rather than
+            // designed.
+            //
+            // Replacing the `.newItem` command group removes the auto-
+            // injected items in that placement. SwiftUI bundles BOTH
+            // "New Window" and "Close" into `.newItem`, so an empty
+            // replacement hides the entire File menu — ⌘W still works
+            // (Cocoa wires it at the AppKit level) but the menu item
+            // disappears, which is unexpected for macOS users and
+            // unfriendly to accessibility tools that scan the menu
+            // tree. We re-publish a single Close item so the File menu
+            // reappears with just that one entry — matching the shape
+            // Console.app and Disk Utility ship.
+            //
+            // `NSApp.keyWindow?.performClose(_:)` is the right action
+            // here: SwiftUI's `DismissAction` only operates on Scenes
+            // opened via `openWindow` / sheets, not on the primary
+            // WindowGroup window, so AppKit interop is the canonical
+            // path. This stays consistent with `MadiniAppDelegate`
+            // which already reaches into NSApp for activation /
+            // tabbing-mode wiring — there's no parallel SwiftUI API.
+            //
+            // Tradeoff to document: AppKit also auto-injects standard
+            // "Close" and "Close All" items into the File menu when
+            // `.newItem` is non-empty, and there is no SwiftUI-side
+            // hook to suppress them (`.commandsRemoved()`, hidden /
+            // empty / Divider anchors all fail to remove or replace
+            // them; only `.newItem` being completely empty hides the
+            // entire File menu, which takes our custom Close with it).
+            // The result is a File menu that shows three items —
+            // our Close, AppKit's Close, AppKit's Close All — all of
+            // which call `performClose:` against the key window, so
+            // the redundancy is functionally harmless. Suppressing
+            // the AppKit auto items would require post-launch NSMenu
+            // surgery in `MadiniAppDelegate`, which is more invasive
+            // than the policy is worth; we accept the duplication.
+            CommandGroup(replacing: .newItem) {
+                Button("Close") {
+                    NSApp.keyWindow?.performClose(nil)
+                }
+                .keyboardShortcut("w", modifiers: .command)
+            }
             AppCommands(bodyTextSize: bodyTextSize)
         }
         #endif
