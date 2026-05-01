@@ -1053,9 +1053,20 @@ struct MessageBubbleView: View, Equatable {
             // Phase 4 structural path. Uses Python-annotated thinking
             // — no NLLanguageRecognizer involved, no false positives
             // on math notation or short Japanese paragraphs.
+            //
+            // Important dedup step: Claude's export `message.text`
+            // field (the source of `messages.content`) already
+            // concatenates the thinking text alongside the response
+            // — so without filtering, the same thinking would render
+            // twice (once as the lifted `ThinkingGroupView` at the
+            // top, once inline as part of the markdown body). Strip
+            // each thinking block's text out of the flat content
+            // before re-parsing so the body renders the response
+            // alone.
+            let responseFlatBlocks = contentBlocksExcludingThinking(structured: structured)
             items = StructuredBlockGrouper.group(
                 structured: structured,
-                flatContent: contentBlocks,
+                flatContent: responseFlatBlocks,
                 profile: profile
             )
         } else {
@@ -1078,6 +1089,53 @@ struct MessageBubbleView: View, Equatable {
             source: identityContext?.source,
             model: identityContext?.model
         )
+    }
+
+    /// Build the `[ContentBlock]` for the response body of a message
+    /// whose structural-thinking path is active, with each thinking
+    /// block's text stripped out of the flat-content source before
+    /// markdown parsing. Required because Claude's export
+    /// pre-concatenates thinking onto the user-visible response in
+    /// `message.text` — `messages.content` therefore carries the
+    /// thinking inline, which would otherwise render a second time
+    /// underneath the lifted `ThinkingGroupView`.
+    ///
+    /// Strategy: serially `range(of:)`-search each thinking text in
+    /// the flat content and remove the first match. Whitespace at the
+    /// extraction boundary is trimmed so the markdown parser doesn't
+    /// produce stray empty paragraphs where thinking used to be.
+    /// Falls back gracefully when a thinking text is not present in
+    /// the flat content (defensive — happens with manually-edited
+    /// rows or future format changes): the un-stripped flat content
+    /// is parsed instead.
+    private func contentBlocksExcludingThinking(structured: [MessageBlock]) -> [ContentBlock] {
+        let thinkingTexts: [String] = structured.compactMap { block in
+            if case .thinking(_, let text, _) = block {
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? nil : trimmed
+            }
+            return nil
+        }
+        guard !thinkingTexts.isEmpty else { return contentBlocks }
+
+        var working = message.content
+        for text in thinkingTexts {
+            if let range = working.range(of: text) {
+                working.removeSubrange(range)
+            }
+        }
+        // Collapse the blank paragraphs left behind by the removal
+        // (Claude's flat text often has blank-line separators around
+        // each thinking segment; after the segment goes, those
+        // separators stack up).
+        let collapsed = working
+            .replacingOccurrences(
+                of: #"\n{3,}"#,
+                with: "\n\n",
+                options: .regularExpression
+            )
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return ContentBlock.parse(collapsed)
     }
 
     private static let renderItemsCache: NSCache<NSString, RenderItemsBox> = {
@@ -1109,6 +1167,43 @@ struct MessageBubbleView: View, Equatable {
         "\(SearchBlockAnchor.idPrefix)\(messageID)#\(blockIndex)"
     }
 
+    /// Static counterpart to the instance-side
+    /// `contentBlocksExcludingThinking(structured:)`. Used by
+    /// `searchableBlocks` (a `static` API) so the search-anchor list
+    /// stays in lockstep with the instance-side render. Logic is the
+    /// same: strip each thinking block's text out of `rawContent`,
+    /// collapse the resulting blank-paragraph runs, then markdown-
+    /// parse.
+    static func parseFlatContentExcludingThinking(
+        rawContent: String,
+        structured: [MessageBlock]
+    ) -> [ContentBlock] {
+        let thinkingTexts: [String] = structured.compactMap { block in
+            if case .thinking(_, let text, _) = block {
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? nil : trimmed
+            }
+            return nil
+        }
+        guard !thinkingTexts.isEmpty else {
+            return ContentBlock.parse(rawContent)
+        }
+        var working = rawContent
+        for text in thinkingTexts {
+            if let range = working.range(of: text) {
+                working.removeSubrange(range)
+            }
+        }
+        let collapsed = working
+            .replacingOccurrences(
+                of: #"\n{3,}"#,
+                with: "\n\n",
+                options: .regularExpression
+            )
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return ContentBlock.parse(collapsed)
+    }
+
     /// Build the (text, anchorID) list the in-thread search scanner
     /// needs — one entry per addressable render block inside the
     /// message, in the same order the view lays them out.
@@ -1132,7 +1227,6 @@ struct MessageBubbleView: View, Equatable {
         if message.isUser {
             return [(message.content, message.id)]
         }
-        let parsed = ContentBlock.parse(message.content)
         // MUST mirror the grouping decision `renderItems` makes, or
         // the per-block occurrence indices produced here will not line
         // up with `applyingSearchHighlight`'s render-time scan. Take
@@ -1146,12 +1240,21 @@ struct MessageBubbleView: View, Equatable {
             }) ?? false)
         let items: [MessageRenderItem]
         if useStructured, let structured = message.contentBlocks {
+            // Same dedup the instance path uses — strip thinking text
+            // out of the flat content before parsing, so the search
+            // anchor count matches the (post-dedup) rendered block
+            // count exactly.
+            let parsed = parseFlatContentExcludingThinking(
+                rawContent: message.content,
+                structured: structured
+            )
             items = StructuredBlockGrouper.group(
                 structured: structured,
                 flatContent: parsed,
                 profile: profile
             )
         } else {
+            let parsed = ContentBlock.parse(message.content)
             items = ForeignLanguageGrouping.items(
                 from: parsed,
                 collapseForeignRuns: profile.collapsesForeignLanguageRuns,
