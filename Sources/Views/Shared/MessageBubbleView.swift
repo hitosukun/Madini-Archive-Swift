@@ -489,8 +489,8 @@ struct MessageBubbleView: View, Equatable {
             // side's trailing-column avatar) so the two speakers feel
             // visually balanced — an earlier draft shrank the assistant
             // avatar to 22pt to match a caption baseline, but that made
-            // the persona suddenly feel smaller than Jenna's, which read
-            // as a downgrade.
+            // the assistant persona suddenly feel smaller than the
+            // user's, which read as a downgrade.
             HStack(alignment: .center, spacing: 8) {
                 avatarButton(size: Layout.avatarSize)
 

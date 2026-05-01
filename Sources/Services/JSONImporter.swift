@@ -23,26 +23,56 @@ struct JSONImportResult: Sendable {
 /// The Swift app itself is read-only against `archive.db`. All write-side
 /// conversation parsing — Claude's array-per-file format, ChatGPT's
 /// nested `mapping`, Gemini's `messages` layout, source-file registration,
-/// the 20+ GRDB tables the schema spans — lives in a ~3000-line Python
-/// stack under `/Users/ichijouhotaru/Madini_Dev`. Re-porting that logic to
-/// Swift just to support drag-and-drop would duplicate a living codebase
-/// (the Python side gets regular updates as export formats change) and
-/// immediately drift. Shelling out keeps both sides in sync: whatever the
-/// Python importer accepts today, drag-and-drop accepts today.
+/// the 20+ GRDB tables the schema spans — lives in a Python core that
+/// ships alongside this Swift app (see `Python/` in the repo root) and is
+/// also kept available at `~/Madini_Dev` on developer machines for
+/// historical reasons. Re-porting that logic to Swift just to support
+/// drag-and-drop would duplicate a living codebase (the Python side gets
+/// regular updates as export formats change) and immediately drift.
+/// Shelling out keeps both sides in sync: whatever the Python importer
+/// accepts today, drag-and-drop accepts today.
 ///
 /// The "importer directory" — the directory containing `split_chatlog.py`
-/// and its `archive_store.py` companion — is resolved from the environment
-/// variable `MADINI_IMPORTER_DIR` when set, otherwise falls back to the
-/// current dev-box location. Keep the default aligned with
-/// `/Users/ichijouhotaru/Madini_Dev`; when packaging the app for
-/// distribution, either (a) set the env var via the app's Info.plist or
-/// launchd plist, or (b) bundle the scripts under `Resources/` and update
-/// `defaultImporterDirectory` to resolve from `Bundle.main.resourceURL`.
+/// and its `archive_store.py` companion — is resolved with this priority:
+///
+///   1. `MADINI_IMPORTER_DIR` environment variable (full override).
+///   2. `Python/` directory inside the app bundle (`Bundle.main.resourceURL`),
+///      for installed `.app` builds that ship the Python core as a resource.
+///   3. `Python/` relative to the current working directory, for source-tree
+///      development runs (`swift run` from the repo root).
+///   4. `~/Madini_Dev` legacy location (resolved via `expandingTildeInPath`).
+///
+/// `defaultImporterDirectory` returns the legacy `~/Madini_Dev` entry as a
+/// last-resort fallback so a fresh checkout keeps working on machines that
+/// still have the historical Python checkout in place.
 enum JSONImporter {
-    /// Default location for the Python importer. Matches the current
-    /// dev-environment checkout. Override with `MADINI_IMPORTER_DIR` if the
-    /// scripts live elsewhere on a given machine.
-    static let defaultImporterDirectory = "/Users/ichijouhotaru/Madini_Dev"
+    /// Last-resort fallback location for the Python importer when no
+    /// in-tree / in-bundle copy is found. Tilde-expanded at load so the
+    /// resolved path includes the current user's home directory rather
+    /// than a hard-coded developer username.
+    static let defaultImporterDirectory: String = {
+        ("~/Madini_Dev" as NSString).expandingTildeInPath
+    }()
+
+    /// Resolved importer directory — see the type-level docs for the
+    /// search order. Public so tests can pin a specific path.
+    static func resolvedImporterDirectory() -> String {
+        let fm = FileManager.default
+        if let env = ProcessInfo.processInfo.environment["MADINI_IMPORTER_DIR"], !env.isEmpty {
+            return env
+        }
+        if let bundleResources = Bundle.main.resourceURL?.appendingPathComponent("Python") {
+            let candidate = bundleResources.appendingPathComponent(scriptName).path
+            if fm.fileExists(atPath: candidate) {
+                return bundleResources.path
+            }
+        }
+        let cwdPython = URL(fileURLWithPath: "Python")
+        if fm.fileExists(atPath: cwdPython.appendingPathComponent(scriptName).path) {
+            return cwdPython.path
+        }
+        return defaultImporterDirectory
+    }
     /// Script invoked by the CLI — `python3 split_chatlog.py file1 file2 …`.
     static let scriptName = "split_chatlog.py"
 
@@ -60,8 +90,7 @@ enum JSONImporter {
     static func importFiles(_ urls: [URL]) async throws -> JSONImportResult {
         precondition(!urls.isEmpty, "importFiles called with empty URL list")
 
-        let importerDir = ProcessInfo.processInfo.environment["MADINI_IMPORTER_DIR"]
-            ?? defaultImporterDirectory
+        let importerDir = resolvedImporterDirectory()
         let scriptURL = URL(fileURLWithPath: importerDir)
             .appendingPathComponent(scriptName)
 

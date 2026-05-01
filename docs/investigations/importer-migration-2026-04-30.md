@@ -13,20 +13,20 @@
 
 直近の調査（`rendering-framework-2026-04-30.md`）で、Python importer が Claude エクスポート JSON の `thinking` ブロックを flat text に結合してしまっており、これが view 層の不具合 Bug B（日本語応答の誤折りたたみ）の root cause となっていることが判明した。
 
-raw export JSON では:
+raw export JSON では（実例の構造を保った合成サンプル）:
 
 ```json
 "content": [
   { "type": "text", "text": " " },
-  { "type": "thinking", "thinking": "The user wants me to..." },
-  { "type": "text", "text": "わあ、ケイン生物学だね！..." }
+  { "type": "thinking", "thinking": "[English thinking preamble — model reasoning before response]" },
+  { "type": "text", "text": "[Japanese response body]" }
 ]
 ```
 
 これが Python importer 後の `messages.content` では:
 
 ```text
-The user wants me to act as Madini...わあ、ケイン生物学だね！...
+[English thinking preamble][Japanese response body]
 ```
 
 と結合され、構造的境界が消失している。
@@ -38,7 +38,7 @@ The user wants me to act as Madini...わあ、ケイン生物学だね！...
 - **延命**: Python importer に手を入れて thinking を保存する形に改修する
 - **移行**: Python importer の延命をやめて Swift importer に完全移行する
 
-ジェンナの長期計画として「Python core 分離 → SwiftUI 移行」があると申告されているが、後述（§5.1）の通り**現行ドキュメントの方針はこれと逆向き**であるため、まず方針整理が必要。本レポートでは Swift 移行に必要な作業量を見積もりつつ、現行方針との不整合も明示する。
+オーナーの長期計画として「Python core 分離 → SwiftUI 移行」があると申告されているが、後述（§5.1）の通り**現行ドキュメントの方針はこれと逆向き**であるため、まず方針整理が必要。本レポートでは Swift 移行に必要な作業量を見積もりつつ、現行方針との不整合も明示する。
 
 ---
 
@@ -213,7 +213,7 @@ AGENTS.md (lines 68-75) の Repository Inventory 表に:
 
 ### 3.1 規模
 
-ロケーション: `/Users/ichijouhotaru/Madini_Dev/`
+ロケーション: `~/Madini_Dev/`
 
 | ファイル | 行数 | 役割 |
 |---------|------|------|
@@ -275,7 +275,7 @@ for node in nodes:
 #### Markdown (`parse_markdown_file`, lines 233-268)
 
 - セクションヘッダーで role 判定
-- キーワード: ai/assistant/gpt/claude/gemini/madini/user/ジェンナ/自分
+- キーワード: ai/assistant/gpt/claude/gemini/madini/user/オーナー/自分
 - title: ファイル名 stem
 - timestamp: ファイルの mtime/birth time
 
@@ -491,7 +491,7 @@ view 層で必要な時に raw_export blob を読み出してパースする。
 **問題**:
 - raw vault に無い古い conversation は失われる
 - bookmarks の target_id が dangling になる
-- ジェンナの import 履歴メタデータも失われる
+- オーナーの import 履歴メタデータも失われる
 
 → **採用不可**。
 
@@ -513,9 +513,9 @@ view 層で必要な時に raw_export blob を読み出してパースする。
 
 ## 5. SwiftUI 移行計画との整合
 
-### 5.1 ジェンナの長期計画と現行ドキュメントの**重大な乖離**
+### 5.1 オーナーの長期計画と現行ドキュメントの**重大な乖離**
 
-ジェンナ申告の長期計画: 「Python core 分離 → SwiftUI 移行」
+オーナー申告の長期計画: 「Python core 分離 → SwiftUI 移行」
 
 **ところが現行ドキュメントは正反対の立場を取っている**:
 
@@ -532,7 +532,7 @@ view 層で必要な時に raw_export blob を読み出してパースする。
 > The SQLite schema must remain compatible with the Python version. Do not rename tables or columns without a migration path that both versions can consume.
 
 `Sources/Services/JSONImporter.swift` lines 21-31（**特に重要**）:
-> "The Swift app itself is read-only against `archive.db`. All write-side conversation parsing — Claude's array-per-file format, ChatGPT's nested `mapping`, Gemini's `messages` layout, source-file registration, the 20+ GRDB tables the schema spans — lives in a ~3000-line Python stack under `/Users/ichijouhotaru/Madini_Dev`. **Re-porting that logic to Swift just to support drag-and-drop would duplicate a living codebase** (the Python side gets regular updates as export formats change) **and immediately drift**. Shelling out keeps both sides in sync: whatever the Python importer accepts today, drag-and-drop accepts today."
+> "The Swift app itself is read-only against `archive.db`. All write-side conversation parsing — Claude's array-per-file format, ChatGPT's nested `mapping`, Gemini's `messages` layout, source-file registration, the 20+ GRDB tables the schema spans — lives in a ~3000-line Python stack under `~/Madini_Dev`. **Re-porting that logic to Swift just to support drag-and-drop would duplicate a living codebase** (the Python side gets regular updates as export formats change) **and immediately drift**. Shelling out keeps both sides in sync: whatever the Python importer accepts today, drag-and-drop accepts today."
 
 **つまり現行コードベースは「Python は canonical で残す、Swift は frontend として載る」という設計を**明示的に**選んでいる**。Swift importer に完全移行するということは、
 
@@ -542,7 +542,7 @@ view 層で必要な時に raw_export blob を読み出してパースする。
 
 を伴う**方針転換**になる。
 
-これは技術的判断の前に、ジェンナと方針整合の確認が必要な事項。
+これは技術的判断の前に、オーナーと方針整合の確認が必要な事項。
 
 ### 5.2 importer の位置付け（仕様文書の見方）
 
@@ -601,7 +601,7 @@ AGENTS.md の repository inventory（line 75）:
 - 今は Python のまま延命
 - thinking ブロックを保存するために Python に最小限の改修（例: thinking を `<thinking>...</thinking>` でマークアップして結合）
 - Swift importer は SwiftUI 移行 Phase（将来）で実装
-- ジェンナの長期計画と直接整合
+- オーナーの長期計画と直接整合
 
 **メリット**:
 - 直近のバグ修正コストが最小
@@ -621,7 +621,7 @@ AGENTS.md の repository inventory（line 75）:
 | 直近のバグ修正コスト | 大 | 特大 | 小 |
 | 長期コスト | 中 | 小 | 中 |
 | 現行ドキュメントとの整合 | △ (要 README/AGENTS 改訂) | ✗ (大幅改訂) | ◎ |
-| ジェンナ申告の長期計画との整合 | ◎ | ◎ | ◎ |
+| オーナー申告の長期計画との整合 | ◎ | ◎ | ◎ |
 | Python 並行維持の負担 | 不要 | 不要 | 必要 |
 | ChatGPT DAG 戦略変更の影響 | 中 | 大 | 小 (Python のまま) |
 | AGENTS.md "core 分離" 方針 | △ | △ | ◎ |
@@ -668,7 +668,7 @@ AGENTS.md の repository inventory（line 75）:
 **Phase A-5: Markdown extractor 実装** (小)
 - 新規 `Sources/Services/MarkdownTranscriptExtractor.swift`（約 100-150 行）
 - セクションヘッダーから role 判定
-- 既存パターンキーワード（ai/assistant/gpt/claude/gemini/madini/user/ジェンナ/自分）
+- 既存パターンキーワード（ai/assistant/gpt/claude/gemini/madini/user/オーナー/自分）
 
 **Phase A-6: ChatGPT DAG 戦略の選択** (小だが重要)
 - Swift の walk-up 戦略を維持するか、Python の timestamp-sort 戦略に合わせるか
@@ -781,7 +781,7 @@ AGENTS.md の repository inventory（line 75）:
 
 理由:
 
-1. **現行ドキュメントとの整合**: README.md / AGENTS.md は明示的に「Python が canonical、Swift は frontend」と書かれている。戦略 A/B はこれを覆す方針転換であり、ジェンナと**まず方針確認すべき**。
+1. **現行ドキュメントとの整合**: README.md / AGENTS.md は明示的に「Python が canonical、Swift は frontend」と書かれている。戦略 A/B はこれを覆す方針転換であり、オーナーと**まず方針確認すべき**。
 2. **直近のバグ修正コストが最小**: Bug B は Python 側の数十行の改修と Swift 側の rendering-framework Phase 1 で解決可能。
 3. **戻せる**: Python 改修なら revert 一発で元に戻せる。
 4. **Swift importer は寿命の長い投資**: 戦略 A/B は数週間の集中開発を要する。短期不具合修正の手段としてはオーバーキル。
@@ -805,7 +805,7 @@ AGENTS.md の repository inventory（line 75）:
 
 ### 7.3 戦略 C を採用しない場合の選択肢
 
-ジェンナが「**もう Python は廃止したい**」と判断した場合は、戦略 A が次点。理由:
+オーナーが「**もう Python は廃止したい**」と判断した場合は、戦略 A が次点。理由:
 
 - 戦略 B の "DB 再生成" は不可逆性が高すぎる
 - 戦略 A は新規 import から切り替え、過去データは raw vault 経由でアクセスする構成が現実的
@@ -816,7 +816,7 @@ AGENTS.md の repository inventory（line 75）:
 
 ---
 
-## 8. ジェンナと相談すべき判断ポイント
+## 8. オーナーと相談すべき判断ポイント
 
 ### 8.1 方針整合（最優先）
 
@@ -829,7 +829,7 @@ AGENTS.md の repository inventory（line 75）:
 
 ### 8.2 戦略の選択
 
-戦略 A / B / C のどれを採用するか。本レポートは戦略 C を推奨するが、ジェンナの判断材料を再確認:
+戦略 A / B / C のどれを採用するか。本レポートは戦略 C を推奨するが、オーナーの判断材料を再確認:
 
 - 戦略 A: 1-2 ヶ月の集中作業、AGENTS/README 改訂、Python 廃止
 - 戦略 B: 戦略 A + 既存データ再生成（高リスク、推奨しない）

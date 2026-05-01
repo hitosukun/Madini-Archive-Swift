@@ -285,8 +285,9 @@ enum ForeignLanguageGrouping {
             // The 0.55 threshold was tuned against observed false
             // positives ("eml(x, y) = eˣ – ln(y)" ≈ 45 % letters,
             // "d(x, y) = d(y, x)（対称性）" ≈ 38 %) without dropping
-            // genuine prose ("The user wants me to act as Madini"
-            // ≈ 86 %, "あたしはマディニだよ〜！" ≈ 94 %).
+            // genuine prose (typical English paragraph ≈ 80 %+ letters,
+            // typical Japanese paragraph ≈ 90 %+ since punctuation is
+            // proportionally rarer per character).
             //
             // TODO: Remove this guard when Phase 6 cleanup of
             // ForeignLanguageGrouping completes. See

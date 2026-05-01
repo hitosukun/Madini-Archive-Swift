@@ -5,7 +5,7 @@ Madini is a local archive browser for long-term accumulation of LLM logs.
 It is not primarily an editor, an auto-summary tool, or a judgment engine.
 Its main purpose is to support rereading, exploration, comparison, and reconstruction over time.
 
-This is the SwiftUI implementation, and **it is the canonical version**. macOS is the primary platform; iOS and other platforms are derived from this codebase. An earlier Python prototype exists but is unpublished and no longer drives schema decisions — the Swift SQLite schema evolves on its own terms, with one-way compatibility ("we can ingest a legacy Python DB via migration") rather than two-way lock-step.
+This is the SwiftUI implementation, and **it is the canonical user-facing application**. macOS is the primary platform; iOS and other platforms are derived from this codebase. The repository is a mono-repo: the Swift app under `Sources/` and a Python importer core under `Python/` ship together. Python's role is bounded — it parses provider export JSON (Claude / ChatGPT / Gemini) and writes to `archive.db`. The Swift app is read-only against `archive.db` and owns the schema. Schema decisions are made on Swift's terms; the Python importer is updated to match. An older standalone Python prototype historically lived at `~/Madini_Dev` and that path remains as a last-resort fallback in the importer driver, but the in-repo `Python/` copy is canonical going forward.
 
 ## Core Principles
 - Preserve originals by default, with explicit exceptions for storage-heavy binaries.
@@ -29,7 +29,7 @@ This is the SwiftUI implementation, and **it is the canonical version**. macOS i
 - Avoid internal-only storage designs that are hard to inspect, migrate, or export.
 - New persistent structures should have a plausible export path before they are adopted.
 - Users must be able to keep and move their data without being locked into Madini.
-- The SQLite schema is owned by the Swift codebase. Breaking changes are allowed when they serve the Mac-first design, as long as `DatabaseMigrator` migrations upgrade existing Swift databases and (where relevant) can ingest a legacy Python-era database as a one-way import. Two-way lock-step with the Python prototype is no longer required.
+- The SQLite schema is owned by the Swift codebase. Breaking changes are allowed when they serve the Mac-first design, as long as `DatabaseMigrator` migrations upgrade existing Swift databases. The Python importer (`Python/`) is updated in the same change to match — the in-repo Python core is treated as a co-located worker, not an independent product. Legacy Python-era databases (from before the mono-repo) may still be ingested via a one-way import migration.
 
 ## Scale Resistance
 - Assume logs will continue to grow for years.
@@ -89,15 +89,16 @@ WHERE-clause assembly is centralized in `Database/SearchFilterSQL.swift` so the 
 - Never modify an already-released migration block. Add a new migration instead — migrator ordering is how we preserve upgrade paths for existing users.
 - The FTS5 virtual table `search_idx` tokenizer is a deliberate design choice, not a compatibility freeze. Changing it (or the column set) requires: (1) a new migration that rebuilds the index from `conversations` + `messages`, (2) UI progress feedback for large libraries (10x–100x today's scale), and (3) an updated spec note describing why the change was made.
 - `primary_time` is a derived expression: `COALESCE(NULLIF(TRIM(source_created_at),''), NULLIF(TRIM(imported_at),''), NULLIF(TRIM(date_str),''))`. This precedence order must be consistent across all query paths.
-- Legacy Python-era databases may be ingested via a one-way import migration, but the live schema is no longer constrained by what the Python prototype writes.
+- Legacy Python-era databases (pre-mono-repo) may be ingested via a one-way import migration. The live schema is owned by Swift; the in-repo Python importer is updated in lock-step rather than driving schema changes from its side.
 
 ## Import Rules
-- Import logic lives in `ImportService` and parser files under `Import/`, not in UI code.
-- The UI collects file URLs and passes them to `ImportService.importFiles()`. Nothing else.
+- The Swift app is read-only against `archive.db`. All write-side parsing and ingestion lives in the Python importer at `Python/` (`split_chatlog.py` + `archive_store.py`).
+- Drag-and-drop in the Swift UI shells out to the Python importer via `JSONImporter` (see `Sources/Services/JSONImporter.swift`). Resolution priority for the importer directory: `MADINI_IMPORTER_DIR` env var → `Python/` inside the app bundle (for `.app` builds) → `Python/` relative to the working directory (for `swift run` from the repo) → `~/Madini_Dev` (legacy fallback).
 - Every text-based import must store a `raw_sources` record with the original text.
 - Conversation deduplication uses MD5 hash of `title + full_text`, stored in `conversations.hash`.
 - If a conversation already exists (hash collision), update provenance metadata (`model`, `source_file`, `raw_source_id`, `source_created_at`) without overwriting the conversation body.
-- Parser format detection follows this order: if `mapping` key exists → ChatGPT; if `chat_messages` → Claude; if `time` + `title` → Gemini; `.md` / `.markdown` suffix → Markdown.
+- Parser format detection (in the Python core) follows this order: if `mapping` key exists → ChatGPT; if `chat_messages` → Claude; if `time` + `title` → Gemini; `.md` / `.markdown` suffix → Markdown.
+- Schema-shaping changes (new column, new block kind in `messages.content_json`, new provider) ship as a single change touching both `Database/GRDB*.swift` (Swift read path + migration) and `Python/` (writer). Do not land one side without the other.
 
 ## SwiftUI Rules
 

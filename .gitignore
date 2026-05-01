@@ -24,5 +24,15 @@ history.json
 themes.json
 custom.css
 
+# --- Python importer artefacts ---
+# Python core lives under `Python/` but its compiled cache and
+# packaging build outputs are not part of the source tree.
+__pycache__/
+*.pyc
+*.pyo
+Python/build/
+Python/dist/
+Python/*.egg-info/
+
 # --- Local tooling ---
 .claude/

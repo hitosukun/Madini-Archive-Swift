@@ -58,6 +58,14 @@ targets:
         buildPhase: resources
       - path: App/Support/MadiniArchive.icns
         buildPhase: resources
+      # Bundle the Python importer alongside the app so distribution
+      # builds resolve `Bundle.main.resourceURL/Python/split_chatlog.py`
+      # without depending on `~/Madini_Dev` being installed on the
+      # target machine. See `Sources/Services/JSONImporter.swift` for
+      # the resolution order.
+      - path: Python
+        type: folder
+        buildPhase: resources
     dependencies:
       - package: GRDB
         product: GRDB

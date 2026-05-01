@@ -1,60 +1,33 @@
-# Madini Archive — SwiftUI Frontend
+# Madini Archive
 
-macOS 向けの read-only archive viewer。既存の Python 版 Madini Archive が canonical な実装であり、この SwiftUI 版はその上に載るフロントエンドとして設計されている。
+LLM 会話ログ（Claude / ChatGPT / Gemini）の長期蓄積と再閲覧のためのローカル archive viewer。
 
-## この実装の責務
+[English README](./README.en.md)
 
-- Presentation: 会話一覧・詳細の表示
-- Navigation: sidebar / detail の Finder ライクな操作
-- UI State: 選択、フィルタ入力、表示モードなど一時的な状態
+## このリポジトリの構成
 
-## やらないこと
+このリポジトリは mono-repo です。次の 2 つのコンポーネントが同じツリーで一緒に進化します。
 
-- Import / search / bookmark / virtual thread の本質的な業務ロジックの再実装
-- SQLite schema に強く依存した画面実装の拡大
-- Python core の機能の完全な再現
-- iOS 対応の作り込み
+- `Sources/` — **macOS SwiftUI app**（canonical な user-facing 実装）
+- `Python/` — **Python importer core**（provider export JSON を `archive.db` に書き込むワーカー）
 
-## 将来の接続先
+Swift app は `archive.db` に対して **read-only** で動作し、SQLite schema を所有します。Python importer は schema に合わせて更新される従属コンポーネントで、Swift 側からのドラッグ＆ドロップで子プロセスとして起動されます。
 
-`~/Library/Application Support/Madini Archive/archive.db` が存在すれば GRDB 経由で読み取り専用で接続する。なければモックデータにフォールバック。
+## 設計思想
 
-将来的に以下に差し替え可能:
+- **Preserve originals** — text-based import は raw source を保持する。normalized layer は派生としてのみ扱う
+- **Local-first** — ローカル SQLite で完結。クラウド sync を前提にしない
+- **Portable formats** — SQL / JSON / Markdown / HTML を優先。閉じた独自フォーマットを増やさない
+- **Scale resistance** — 10x / 100x のログ量増加を前提に、indexed / paginated / FTS5 ベースの参照経路を選ぶ
+- **Support human judgment** — 自動評価や自動要約より、再読・比較・再構成を支援する
 
-- Python core が提供する JSON API / IPC
-- Service layer protocol の別実装
-
-接続方法が変わっても、`ConversationRepository` protocol の実装を差し替えるだけで View / ViewModel は影響を受けない。
-
-## ディレクトリ構成
-
-```
-Sources/
-├── MadiniArchiveApp.swift      @main + MainView
-├── Models/                     DTO (GRDB 非依存)
-├── Repositories/
-│   ├── Protocols/              UI が依存するインターフェース
-│   ├── GRDB/                   archive.db 読み取り実装
-│   └── Mock/                   開発・Preview 用モック
-├── Services/                   依存コンテナ (AppServices)
-├── ViewModels/                 UI 状態管理
-├── Views/                      SwiftUI View コンポーネント
-├── Utilities/                  汎用ヘルパー (AppPaths)
-└── Fixtures/                   Preview 用サンプルデータ
-```
-
-## 設計原則
-
-- **UI は protocol にだけ依存する** — View / ViewModel は `ConversationRepository` protocol を通じてのみデータにアクセスする
-- **canonical data は外に置く** — SwiftUI 側にデータの真実を持たせない
-- **canonical / derived / UI state を混ぜない** — Model は DTO、ViewModel は UI state、View は presentation に専念
-- **DB は readonly で開く** — SwiftUI 側からの書き込みは行わない
+詳細な規約は [AGENTS.md](./AGENTS.md) を参照。
 
 ## ビルドと実行
 
 ### CLI (Swift Package Manager)
 
-日常の開発・テスト用。
+日常開発・テスト用。
 
 ```sh
 swift build
@@ -62,19 +35,17 @@ swift test
 open .build/debug/MadiniArchive
 ```
 
-### Xcode (SPM を開く)
+### Xcode
 
-1. Xcode で `Package.swift` を開く (File → Open)
-2. Scheme を `MadiniArchive` に設定
-3. Run (Cmd+R)
+```sh
+open Package.swift
+```
 
-Xcode で開くと SwiftUI Preview (`#Preview`) も利用可能。
+Scheme を `MadiniArchive` に設定して Run (Cmd+R)。SwiftUI Preview (`#Preview`) も利用可能。
 
 ### 配布用 `.app` をビルドする
 
-`xcodegen` で `project.yml` から `Madini Archive.xcodeproj` を生成し、
-`xcodebuild` で Release ビルドする。 `.xcodeproj` は git 管理外。
-`project.yml` を変更した時だけ再生成すれば OK。
+`xcodegen` で `project.yml` から `Madini Archive.xcodeproj` を生成し、`xcodebuild` で Release ビルドする。`.xcodeproj` は git 管理外。
 
 ```sh
 brew install xcodegen                      # 初回のみ
@@ -96,17 +67,49 @@ rm -rf "/Applications/Madini Archive.app"
 cp -R "build/derived/Build/Products/Release/Madini Archive.app" /Applications/
 ```
 
-SPM と Xcode で同じソースツリー (`Sources/`) を共有する。依存
-バージョンは `Package.swift` と `project.yml` の両方に書かれているので、
-どちらか片方を更新したら必ず両方を揃える。
-
 ### 動作要件
 
 - macOS 14 Sonoma+
 - Xcode 15+ (Swift 5.9+)
-- GRDB.swift 7.0+ / SwiftMath 1.7+ (どちらも自動取得)
-- xcodegen 2.40+ (`.app` ビルド時のみ)
+- GRDB.swift 7.0+ / SwiftMath 1.7+ （いずれも自動取得）
+- xcodegen 2.40+ （`.app` ビルド時のみ）
+- Python 3.10+ （importer 利用時、システム Python / Homebrew / pyenv いずれも可）
 
 ## データソース
 
-`~/Library/Application Support/Madini Archive/archive.db` を Python 版と共有。Python 版で作成された DB をそのまま読み取れる。
+`~/Library/Application Support/Madini Archive/archive.db` を読みます。存在しなければモックデータにフォールバックします。
+
+## Importer の解決順
+
+ドラッグ＆ドロップ時、Swift app は次の順で `split_chatlog.py` を探します（詳細は `Sources/Services/JSONImporter.swift`）。
+
+1. `MADINI_IMPORTER_DIR` 環境変数（明示指定）
+2. `.app` バンドル内の `Contents/Resources/Python/`（配布ビルド）
+3. 作業ディレクトリ直下の `Python/`（リポジトリでの `swift run`）
+4. `~/Madini_Dev`（旧来の standalone Python チェックアウト、後方互換）
+
+## ディレクトリ構成
+
+```
+Sources/
+├── MadiniArchiveApp.swift        @main + MainView
+├── Core/                         protocol 定義 + AppServices
+├── Database/                     GRDB 実装
+├── Preferences/                  UserDefaults bound state
+├── Services/                     JSONImporter, ImportService
+├── ViewModels/                   UI 状態
+├── Views/                        SwiftUI View
+│   ├── Shared/                   両 OS 共通
+│   ├── macOS/                    macOS 専用
+│   └── iOS/                      iOS 専用
+├── Utilities/                    AppPaths など
+└── Resources/                    Asset / バンドルデータ
+
+Python/                           importer core（split_chatlog.py + archive_store.py）
+
+docs/                             investigation note / migration plan
+```
+
+## ライセンス
+
+MIT。詳細は [LICENSE](./LICENSE) を参照。

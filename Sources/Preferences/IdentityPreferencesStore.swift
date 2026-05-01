@@ -8,7 +8,7 @@ struct IdentityPreferences: Codable, Hashable, Sendable {
 
     static let `default` = IdentityPreferences(
         user: IdentityProfilePreference(
-            displayName: "Jenna",
+            displayName: "User",
             avatar: .defaultAvatar(.user)
         ),
         agent: IdentityProfilePreference(
@@ -32,16 +32,22 @@ enum IdentityDefaultAvatar: String, Codable, Hashable, Sendable, CaseIterable, I
     var displayName: String {
         switch self {
         case .user:
-            return "Jenna"
+            return "User"
         case .agent:
             return "Madini"
         }
     }
 
-    var bundledImageName: String {
+    /// Bundled image filename for the default avatar, or `nil` to fall
+    /// through to the SF Symbol fallback in `IdentityAvatarView`. The
+    /// public release ships only the agent-side avatar (the app's
+    /// "Madini" persona); the user side leaves the slot empty so first-
+    /// run users get a neutral SF Symbol until they pick their own
+    /// avatar via Settings → Identity.
+    var bundledImageName: String? {
         switch self {
         case .user:
-            return "avatar_jenna"
+            return nil
         case .agent:
             return "avatar_madini"
         }
@@ -117,7 +123,7 @@ enum IdentityPreferenceRole: String, CaseIterable, Identifiable, Sendable {
     var defaultDisplayName: String {
         switch self {
         case .user:
-            return "Jenna"
+            return "User"
         case .assistant:
             return "Madini"
         }

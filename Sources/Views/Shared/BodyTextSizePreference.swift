@@ -1,12 +1,12 @@
 import SwiftUI
 
 /// Browser-style zoom for the conversation reader's body text. The
-/// reader pane is the surface where Jenna spends the longest unbroken
-/// reading sessions, and a fixed point size that's comfortable on a
-/// 14" laptop is too small on an external display and too large on a
-/// hi-dpi touch screen. Adjusting the OS-level "Larger Text" setting
-/// would scale the entire chrome too, which is overkill — we only
-/// want to retune the body column.
+/// reader pane is where the user spends the longest unbroken reading
+/// sessions, and a fixed point size that's comfortable on a 14" laptop
+/// is too small on an external display and too large on a hi-dpi touch
+/// screen. Adjusting the OS-level "Larger Text" setting would scale
+/// the entire chrome too, which is overkill — we only want to retune
+/// the body column.
 ///
 /// Scope:
 /// - Applies to paragraphs, list items, blockquotes, code blocks,

@@ -13,14 +13,14 @@
   - `docs/plans/thinking-preservation-2026-04-30.md`（本実装計画の本体）
   - `docs/plans/phase-1-decision-points.md`（判断結果はこのファイル末尾参照）
 - 新規 worktree を main HEAD から切る（ブランチ名: `claude/phase-1-python-schema-migration`）
-- Python 環境の確認（`/Users/ichijouhotaru/Madini_Dev/` で `python3 -c "import sqlite3, json, hashlib"` が成功すること）
+- Python 環境の確認（`~/Madini_Dev/` で `python3 -c "import sqlite3, json, hashlib"` が成功すること）
 - 既存の Python テストが通る状態であることを確認（テストが存在する場合のみ）
 
 ---
 
 ## 確定した方針（前提）
 
-ジェンナとの議論で確定した方針を再掲:
+オーナーとの議論で確定した方針を再掲:
 
 - **アーキテクチャ宣言**: Python core は永続的な portable 土台。Swift への完全移行はしない。GUI 層が着せ替え可能なシェル。
 - **直近の解決対象**: Bug B（Claude の thinking ブロックが Python importer の段階で flat text に結合される）を、Python core の改修で構造保存することにより解決する。
@@ -31,7 +31,7 @@
 
 ## 確定した判断（`phase-1-decision-points.md` より）
 
-以下のプレースホルダをジェンナの判断結果で置換してから Code に投げる:
+以下のプレースホルダをオーナーの判断結果で置換してから Code に投げる:
 
 - **スキーマ案**: <<<判断 1: 結論。例「案 1（messages.content_json TEXT 列追加）」>>>
 - **一括 vs 段階**: <<<判断 3: 結論。例「案 A（一括移行、Phase 5 で `backfill_content_json.py` 一回実行）」>>>
@@ -89,9 +89,9 @@
 
 | ファイル | 行範囲 | 改修内容 |
 |---------|-------|---------|
-| `/Users/ichijouhotaru/Madini_Dev/archive_store.py` | 37-51 周辺 | `messages` CREATE TABLE に `content_json TEXT` 追加 |
-| `/Users/ichijouhotaru/Madini_Dev/archive_store.py` | `_ensure_conversation_columns` 直後 | `_ensure_message_columns()` 新設 |
-| `/Users/ichijouhotaru/Madini_Dev/archive_store.py` | `init_db()` 内 | `_ensure_message_columns(cursor)` 呼び出し追加 |
+| `~/Madini_Dev/archive_store.py` | 37-51 周辺 | `messages` CREATE TABLE に `content_json TEXT` 追加 |
+| `~/Madini_Dev/archive_store.py` | `_ensure_conversation_columns` 直後 | `_ensure_message_columns()` 新設 |
+| `~/Madini_Dev/archive_store.py` | `init_db()` 内 | `_ensure_message_columns(cursor)` 呼び出し追加 |
 
 詳細なファイル一覧は `phase-1-affected-files.md` を参照。
 
