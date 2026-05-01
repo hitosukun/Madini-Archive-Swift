@@ -19,20 +19,15 @@ import Foundation
 /// a closure bag. Rendering logic stays in the view; the profile just
 /// says which branches to take.
 struct MessageRenderProfile: Hashable, Sendable {
-    /// Fold consecutive foreign-language (relative to system language)
-    /// blocks into a single de-emphasized group. See
-    /// `ForeignLanguageGrouping`. Useful for Claude, which routinely
-    /// produces multi-paragraph English preambles in Japanese-primary
-    /// conversations; harmful for ChatGPT, where English code-block
-    /// payloads get misdetected as prose.
-    ///
-    /// Phase 4 leaves this on for `.claude` because legacy archive
-    /// rows (content_json IS NULL) still need the language-detection
-    /// fallback. Phase 6 cleanup will flip it off once Phase 5
-    /// backfill has populated content_json for every Claude message
-    /// that ever had thinking — at that point the structural path
-    /// (`collapsesThinking`) will catch every case the heuristic
-    /// path used to guess at.
+    /// Legacy NLLanguageRecognizer-based fold. Phase 6 retired this:
+    /// every built-in profile sets it to `false`, so `MessageBubble-
+    /// View`'s render path no longer calls
+    /// `ForeignLanguageGrouping.items(...)` for grouping. Kept on the
+    /// profile struct rather than removed outright so an unforeseen
+    /// regression in the structural path still has an opt-in escape
+    /// hatch — flip the flag back to `true` and the legacy heuristic
+    /// fires again. Future cleanup may remove the flag entirely once
+    /// the structural path has stabilised in real use.
     var collapsesForeignLanguageRuns: Bool
 
     /// Phase 4 structural-thinking fold. When true and the message
@@ -60,14 +55,18 @@ struct MessageRenderProfile: Hashable, Sendable {
         collapsesThinking: false
     )
 
-    /// Claude. Collapses English monologue runs (legacy heuristic for
-    /// un-backfilled rows) AND structural thinking blocks (Phase 4
-    /// path for content_json-populated rows). Both paths run in
-    /// parallel so reading experience improves immediately for newly-
-    /// imported messages while older rows keep their pre-Phase-4
-    /// behavior until Phase 5 backfill.
+    /// Claude. Phase 6 cleanup retired the language-detection legacy
+    /// path: `collapsesForeignLanguageRuns` is now `false` for every
+    /// profile, including this one. Structural thinking detection
+    /// (`collapsesThinking`) is the only fold mechanism that fires.
+    /// Messages whose `content_json` is still NULL after Phase 5
+    /// backfill render their flat content as-is — those are
+    /// overwhelmingly conversations whose original raw export was
+    /// never preserved (no `raw_sources` row, no `raw_export_blobs`
+    /// blob), so re-running the backfill would not recover them
+    /// anyway.
     static let claude = MessageRenderProfile(
-        collapsesForeignLanguageRuns: true,
+        collapsesForeignLanguageRuns: false,
         collapsesThinking: true
     )
 
