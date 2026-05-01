@@ -128,6 +128,10 @@ Python/                           importer core（split_chatlog.py + archive_sto
 docs/                             investigation note / migration plan
 ```
 
+## セキュリティ・プライバシー
+
+LLM の会話ログには、直接的な機密情報（パスワード・API キー等）だけでなく、間接的な個人特定材料（生年月日・家族名・勤務地・趣味など）が大量に含まれます。改造・コントリビュート・企業内利用時の方針は [SECURITY.md](./SECURITY.md) を参照してください。脆弱性の報告も同ファイルに記載しています。
+
 ## ライセンス
 
 MIT。詳細は [LICENSE](./LICENSE) を参照。

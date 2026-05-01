@@ -127,6 +127,10 @@ Python/                           importer core (split_chatlog.py + archive_stor
 docs/                             investigation notes and migration plans
 ```
 
+## Security & Privacy
+
+LLM conversation logs contain not only direct credentials (passwords, API keys) but also a long list of indirect identifiers (birthdays, family names, workplaces, hobbies, etc.) that combine into real attack material. See [SECURITY.en.md](./SECURITY.en.md) for the policy on modification, contribution, and corporate use, plus the vulnerability-reporting process.
+
 ## License
 
 MIT. See [LICENSE](./LICENSE).
