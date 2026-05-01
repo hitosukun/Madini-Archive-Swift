@@ -6,9 +6,14 @@ struct IdentityPreferences: Codable, Hashable, Sendable {
     var user: IdentityProfilePreference
     var agent: IdentityProfilePreference
 
+    /// Defaults shipped with the app on first run. Both names are the
+    /// author's personal handles in alphabetic form so they survive
+    /// systems without Japanese fonts and don't trap a non-IME user
+    /// in a hard-to-edit field. Anything customizable at runtime —
+    /// see Settings → Identity (`IdentityPreferencesView`).
     static let `default` = IdentityPreferences(
         user: IdentityProfilePreference(
-            displayName: "User",
+            displayName: "Jenna",
             avatar: .defaultAvatar(.user)
         ),
         agent: IdentityProfilePreference(
@@ -32,22 +37,23 @@ enum IdentityDefaultAvatar: String, Codable, Hashable, Sendable, CaseIterable, I
     var displayName: String {
         switch self {
         case .user:
-            return "User"
+            return "Jenna"
         case .agent:
             return "Madini"
         }
     }
 
     /// Bundled image filename for the default avatar, or `nil` to fall
-    /// through to the SF Symbol fallback in `IdentityAvatarView`. The
-    /// public release ships only the agent-side avatar (the app's
-    /// "Madini" persona); the user side leaves the slot empty so first-
-    /// run users get a neutral SF Symbol until they pick their own
-    /// avatar via Settings → Identity.
+    /// through to the SF Symbol fallback in `IdentityAvatarView`.
+    /// Public release ships both default avatars: the user side is
+    /// "Jenna" (the author's handle), the agent side is "Madini" (the
+    /// app's namesake AI persona). Either side can be replaced from
+    /// Settings → Identity, and `resetAvatar(for:)` returns to these
+    /// bundled defaults.
     var bundledImageName: String? {
         switch self {
         case .user:
-            return nil
+            return "avatar_jenna"
         case .agent:
             return "avatar_madini"
         }

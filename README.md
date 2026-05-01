@@ -79,6 +79,10 @@ cp -R "build/derived/Build/Products/Release/Madini Archive.app" /Applications/
 
 `~/Library/Application Support/Madini Archive/archive.db` を読みます。存在しなければモックデータにフォールバックします。
 
+## デフォルトの表示名について
+
+初回起動時のユーザー名は `Jenna`、アシスタント名は `Madini` です。これはどちらも作者のハンドルネーム（本名ではない）に由来します。アバター画像も同梱されています。**両方とも Settings（⌘,）→ Identity から自由に変更可能** です — 名前、画像、デフォルトに戻すボタンが揃っています。
+
 ## Importer の解決順
 
 ドラッグ＆ドロップ時、Swift app は次の順で `split_chatlog.py` を探します（詳細は `Sources/Services/JSONImporter.swift`）。

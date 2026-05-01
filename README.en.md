@@ -78,6 +78,10 @@ cp -R "build/derived/Build/Products/Release/Madini Archive.app" /Applications/
 
 The app reads `~/Library/Application Support/Madini Archive/archive.db`. If the file is absent, the UI falls back to mock data.
 
+## Default Display Names
+
+On first launch the user side is named `Jenna` and the assistant side is named `Madini`. Both are the author's personal handles (not legal names) and both ship with bundled avatar images. **Either can be changed freely from Settings (⌘,) → Identity** — name, image, and a reset-to-default button are all there.
+
 ## Importer Resolution Order
 
 When the user drops files onto the Swift app, the importer driver looks for `split_chatlog.py` in the following order (see `Sources/Services/JSONImporter.swift`):
