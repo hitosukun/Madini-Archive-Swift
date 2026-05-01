@@ -4,6 +4,18 @@ import NaturalLanguage
 import Translation
 #endif
 
+/// **Deprecated as of Phase 6.** Pairs with the legacy
+/// `ForeignLanguageGrouping` enum — the
+/// `.foreignLanguageGroup(...)` `MessageRenderItem` case that wraps
+/// instances of this view is no longer produced by either render
+/// path in the shipping build. The view is retained so the escape
+/// hatch on `MessageRenderProfile.collapsesForeignLanguageRuns`
+/// still has something to instantiate, and so the rich
+/// `Translation.framework` integration here can be lifted into a
+/// standalone "translate this passage" component the user can
+/// summon on demand (a future enhancement, not part of the Phase 6
+/// scope).
+///
 /// Renders a contiguous run of foreign-language blocks as one
 /// de-emphasized box with an expand toggle and an in-place translate
 /// affordance. Tapping translate rewrites the block contents using

@@ -555,71 +555,20 @@ private struct LoadedConversationDetailView: View {
                     .onPreferenceChange(ReaderViewportSizePreferenceKey.self) { h in
                         readerViewportHeight = h
                     }
-                    .task(id: detail.summary.id) {
-                        // Detect once per conversation. Sampling +
-                        // recognition runs on a background priority
-                        // task because `NLLanguageRecognizer` is fast
-                        // but isn't free at multi-thousand-character
-                        // inputs, and we don't want to delay first
-                        // paint waiting for it. The `nil` initial
-                        // state means the grouper falls back to the
-                        // system locale; the `@State` write below
-                        // replaces that with the detected value once
-                        // the work finishes.
-                        //
-                        // Temporary fix for Bug B (Japanese response
-                        // text folded as "Japanese" inside Claude
-                        // threads). Sampling all messages mixes the
-                        // user's prompts with the assistant's reply,
-                        // and on Claude threads the assistant emits
-                        // long English "thinking out loud" preambles
-                        // that get concatenated into messages.content
-                        // by the Python importer. The combined sample
-                        // skews English even when the user is clearly
-                        // operating in Japanese, so the grouper then
-                        // treats the assistant's Japanese answer as
-                        // "foreign" and folds it.
-                        //
-                        // Strategy: try user-only detection first with
-                        // an aggressively-lowered character threshold
-                        // (user prompts are sometimes a single short
-                        // sentence — "これを読んで、続きを話そう。" is
-                        // only ~14 chars — but the language signal is
-                        // already strong at that length when the
-                        // script is non-Latin. NLLanguageRecognizer
-                        // separately enforces a 0.6 confidence floor,
-                        // which catches the ambiguous short-Latin
-                        // cases. Fall back to the all-messages sample
-                        // (with the default threshold) only when user-
-                        // only detection fails — that way short user-
-                        // side exchanges still get the user-bias
-                        // benefit instead of regressing to the all-
-                        // messages skew.
-                        //
-                        // TODO: Remove this user-bias when Phase 4 of
-                        // the thinking-preservation plan ships and
-                        // structural thinking blocks replace the
-                        // language-based grouping. See
-                        // docs/plans/thinking-preservation-2026-04-30.md.
-                        let userTexts = detail.messages
-                            .filter(\.isUser)
-                            .map(\.content)
-                        let allTexts = detail.messages.map(\.content)
-                        let detected: NLLanguage? = await Task.detached(priority: .utility) { () -> NLLanguage? in
-                            if let userPrimary = ForeignLanguageGrouping.primaryLanguage(
-                                ofMessageTexts: userTexts,
-                                minCharacters: 10
-                            ) {
-                                return userPrimary
-                            }
-                            return ForeignLanguageGrouping.primaryLanguage(
-                                ofMessageTexts: allTexts
-                            )
-                        }.value
-                        await MainActor.run {
-                            conversationPrimaryLanguage = detected
-                        }
-                    }
+                    // Phase 6 retired the conversation-level
+                    // language detection (and the Bug B v1/v2/v3
+                    // hotfixes that lived inside it). The structural
+                    // thinking path (`MessageRenderProfile.collapses-
+                    // Thinking`) now identifies monologue blocks
+                    // explicitly via `messages.content_json`, so
+                    // there's no native-language baseline to compute
+                    // any more. `conversationPrimaryLanguage` stays
+                    // declared on the view for binary compatibility
+                    // with the `MessageBubbleView` parameter list,
+                    // but it remains at its initial `nil` for the
+                    // entire lifetime of the view — the grouper that
+                    // used to consume it is no longer on the call
+                    // path.
                     .scrollContentBackground(.hidden)
                     // Reserve scroll-overshoot room at the bottom equal to
                     // the bottom-fade height. Without this the last line

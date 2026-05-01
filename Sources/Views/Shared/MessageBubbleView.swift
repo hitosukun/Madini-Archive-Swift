@@ -1070,13 +1070,19 @@ struct MessageBubbleView: View, Equatable {
                 profile: profile
             )
         } else {
-            // Legacy language-fold path. Still needed for un-back-
-            // filled rows and for messages that don't carry thinking.
-            items = ForeignLanguageGrouping.items(
-                from: contentBlocks,
-                collapseForeignRuns: collapse,
-                nativeLanguage: conversationPrimaryLanguage
-            )
+            // Phase 6 retired the language-detection legacy path.
+            // Messages without a populated `contentBlocks` (legacy
+            // archive rows whose original raw export was never
+            // preserved, plus regular text-only assistant turns) now
+            // render their flat content as-is. The previous fallback
+            // ran each block through `ForeignLanguageGrouping`, but
+            // its NLLanguageRecognizer-based heuristic accumulated
+            // four hotfix layers (listItem exclusion, formula text
+            // exclusion, user-bias primary-language detection, short-
+            // run fold gate) before still misfiring on real
+            // conversations — the structural path is the supported
+            // mechanism now.
+            items = contentBlocks.map { .block($0) }
         }
         Self.renderItemsCache.setObject(RenderItemsBox(items), forKey: key)
         return items
@@ -1254,12 +1260,14 @@ struct MessageBubbleView: View, Equatable {
                 profile: profile
             )
         } else {
+            // Phase 6: legacy language-detection grouper retired.
+            // Search-anchor enumeration must mirror whatever
+            // `renderItems` actually does, so when the structural
+            // path doesn't take over we just wrap each parsed block
+            // as `.block(_)` — same shape `renderItems` produces in
+            // the corresponding branch.
             let parsed = ContentBlock.parse(message.content)
-            items = ForeignLanguageGrouping.items(
-                from: parsed,
-                collapseForeignRuns: profile.collapsesForeignLanguageRuns,
-                nativeLanguage: nativeLanguage
-            )
+            items = parsed.map { .block($0) }
         }
         return items.enumerated().map { offset, item in
             let anchorID = searchBlockAnchorID(

@@ -20,6 +20,20 @@ enum MessageRenderItem {
     case thinkingGroup(provider: String, blocks: [MessageBlock])
 }
 
+/// **Deprecated as of Phase 6** — kept compiling so the
+/// `MessageRenderProfile.collapsesForeignLanguageRuns` escape hatch
+/// still works if a future regression in the structural-thinking
+/// path forces us to flip the flag back on. No render path in the
+/// shipping build calls these grouping APIs after Phase 6: the
+/// `MessageBubbleView.renderItems` legacy branch was retired in the
+/// same commit, and `ConversationDetailView` no longer pre-computes
+/// the per-conversation primary language. The four hotfix layers
+/// embedded here (listItem exclusion, formula-text exclusion, user-
+/// biased primary-language detection, short-run fold gate) are kept
+/// inside the implementation rather than reverted — if the escape
+/// hatch is ever re-enabled, those guards still protect against the
+/// Bug A / Bug B classes the hotfixes were chasing.
+///
 /// Detects per-block dominant language via `NLLanguageRecognizer` and
 /// folds consecutive blocks whose language differs from the system
 /// language into a single grouped item. Grouping reduces visual
