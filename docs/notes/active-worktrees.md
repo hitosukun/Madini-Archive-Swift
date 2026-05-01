@@ -1,64 +1,88 @@
 # Active Worktrees — 整理メモ
 
-2026-04-30 時点の worktree 棚卸し。明日朝以降、ジェンナが「これ消して大丈夫？」を判断するための材料。
+**最終更新: 2026-05-01**
 
 `.claude/worktrees/` 配下に存在する worktree を列挙し、目的・現状・削除可否を明示する。
+ジェンナが「これ消して大丈夫？」を判断するための材料。
 
 ---
 
-## 削除可（調査・設計フェーズの完了済み worktree）
+## 削除可（thinking-preservation 関連で役目を終えたもの）
 
-これら 3 つは今夜のレポート作成に使ったが、レポートはすべて main の `docs/` 配下に保存済み。worktree 内の作業状態は main マージで保全されているので削除して問題ない。
+`docs/plans/thinking-preservation-2026-04-30.md` の Phase 1〜6 が完了した結果、これらの調査・設計用 worktree は不要になった。すべてのレポート・成果物は main の `docs/` 配下に保存済み、コード変更も main にマージ済み。
 
 ### `claude/investigate-rendering-framework`
 - **path**: `.claude/worktrees/tender-heisenberg-06101d`
-- **目的**: 「内的独白の折りたたみブロック化」機能の判定ロジック調査と、ソース×モデル別レンダリング設定フレームワークの設計提案
-- **現状**: 調査完了。レポート `docs/investigations/rendering-framework-2026-04-30.md` が main に保存済み
+- **目的**: monologue 折りたたみ判定ロジック調査 + ソース×モデル別レンダリングフレームワーク設計
+- **成果物**: `docs/investigations/rendering-framework-2026-04-30.md`（main 保存済み）
 - **削除可否**: ✅ 削除可
-- **削除コマンド**: `git worktree remove .claude/worktrees/tender-heisenberg-06101d` 実行後、`git branch -D claude/investigate-rendering-framework`
+- **削除コマンド**:
+  ```sh
+  git worktree remove .claude/worktrees/tender-heisenberg-06101d
+  git branch -D claude/investigate-rendering-framework
+  ```
 
 ### `claude/investigate-importer-migration`
 - **path**: `.claude/worktrees/investigate-importer-migration`
-- **目的**: Python importer から Swift importer への完全移行の作業量見積もり
-- **現状**: 調査完了。レポート `docs/investigations/importer-migration-2026-04-30.md` が main に保存済み。結論は戦略 C 採用（Python core 維持）
+- **目的**: Python importer → Swift importer 移行の作業量見積もり
+- **成果物**: `docs/investigations/importer-migration-2026-04-30.md`（main 保存済み、結論: 戦略 C = Python core 維持を採用）
 - **削除可否**: ✅ 削除可
-- **削除コマンド**: `git worktree remove .claude/worktrees/investigate-importer-migration` 実行後、`git branch -D claude/investigate-importer-migration`
+- **削除コマンド**:
+  ```sh
+  git worktree remove .claude/worktrees/investigate-importer-migration
+  git branch -D claude/investigate-importer-migration
+  ```
 
 ### `claude/plan-thinking-preservation`
 - **path**: `.claude/worktrees/plan-thinking-preservation`
 - **目的**: thinking 保存対応プロジェクトの詳細実装計画
-- **現状**: 設計完了。レポート `docs/plans/thinking-preservation-2026-04-30.md` が main に保存済み
+- **成果物**: `docs/plans/thinking-preservation-2026-04-30.md`（main 保存済み、Phase 1〜6 全実装完了）
 - **削除可否**: ✅ 削除可
-- **削除コマンド**: `git worktree remove .claude/worktrees/plan-thinking-preservation` 実行後、`git branch -D claude/plan-thinking-preservation`
+- **削除コマンド**:
+  ```sh
+  git worktree remove .claude/worktrees/plan-thinking-preservation
+  git branch -D claude/plan-thinking-preservation
+  ```
 
 ---
 
-## 削除可（今夜の作業用 worktree）
+## 削除可（実装ベースの一時 worktree）
 
-### `claude/phase-1-preparation`（このブランチ自体）
+### `claude/mark-thinking-preservation-complete`（このブランチ自体）
 - **path**: `.claude/worktrees/tonight-integration`
-- **目的**: 今夜のタスク 1〜5 全体の作業ベース
-- **現状**: タスク 1〜5 完了予定。すべての成果物は main にマージ済み（または最終マージ予定）
-- **削除可否**: ✅ Task 5 マージ後に削除可
-- **削除コマンド**: main マージ後、`git worktree remove .claude/worktrees/tonight-integration` 実行後、`git branch -D claude/phase-1-preparation`
-- **注意**: この worktree から複数のサブブランチを作成・マージしたため、削除前に `git branch | grep claude/` で枝が残っていないか確認
+- **目的**: 4/30 夜〜5/1 朝の thinking-preservation 一連実装の作業ベース
+- **現状**: 全 Phase の Swift 側実装と doc 更新が main にマージ済み
+- **削除可否**: ✅ 本 doc commit + main マージ後に削除可
+- **削除コマンド**: main マージ完了後、
+  ```sh
+  git worktree remove .claude/worktrees/tonight-integration
+  git branch -D claude/mark-thinking-preservation-complete
+  ```
 
-#### このブランチから作成された hotfix 系サブブランチ（main にマージ済み）
+#### この worktree から派生して main にマージ済みのサブブランチ
 
-以下は今夜の作業中に作って main へ merge 済みのサブブランチ。worktree は持たないので `git branch -D` だけでよい:
+ローカル branch ガベージコレクション対象（worktree は持たない）:
 
-- `claude/save-investigation-reports`
-- `claude/phase-0-merge-vault-phase-c`
-- `claude/bug-a-listitem-exclusion`
-- `claude/bug-a-formula-text-exclusion`
-- `claude/bug-b-user-message-primary-language`
-- `claude/bug-b-user-message-primary-language-v2`
-- `claude/bug-b-user-message-primary-language-v3`
-- `claude/skip-fold-on-short-runs`
-- `claude/body-text-size-control`
-- `claude/phase-1-preparation`（最後にマージしたら）
+```
+claude/save-investigation-reports
+claude/phase-0-merge-vault-phase-c
+claude/bug-a-listitem-exclusion              ← Phase 6 で deprecated 化
+claude/bug-a-formula-text-exclusion           ← 同上
+claude/bug-b-user-message-primary-language    ← 同上
+claude/bug-b-user-message-primary-language-v2 ← 同上
+claude/bug-b-user-message-primary-language-v3 ← 同上
+claude/skip-fold-on-short-runs                ← 同上
+claude/body-text-size-control
+claude/phase-1-preparation
+claude/readable-text-layout
+claude/phase-3-swift-content-json-read
+claude/phase-4-structural-thinking-render
+claude/phase-4-thinking-duplicate-fix
+claude/phase-6-deprecate-language-fold
+claude/mark-thinking-preservation-complete
+```
 
-一括削除するなら:
+一括削除:
 ```sh
 for b in claude/save-investigation-reports \
          claude/phase-0-merge-vault-phase-c \
@@ -69,7 +93,13 @@ for b in claude/save-investigation-reports \
          claude/bug-b-user-message-primary-language-v3 \
          claude/skip-fold-on-short-runs \
          claude/body-text-size-control \
-         claude/phase-1-preparation
+         claude/phase-1-preparation \
+         claude/readable-text-layout \
+         claude/phase-3-swift-content-json-read \
+         claude/phase-4-structural-thinking-render \
+         claude/phase-4-thinking-duplicate-fix \
+         claude/phase-6-deprecate-language-fold \
+         claude/mark-thinking-preservation-complete
 do
     git branch -D "$b" 2>/dev/null || true
 done
@@ -79,28 +109,21 @@ done
 
 ## 判断保留（ジェンナの実機状態に関わる worktree）
 
-これらは vault/phase-c 以降の Phase 4〜9 系の累積で、ジェンナの実機運用や検証履歴と紐づく可能性がある。**今夜は判断しない**ため一律保留。明日以降ジェンナが見直して整理する。
+vault/phase-c-importer-audit ブランチの累積 phase 系。Phase 0 で main に取り込み済みなので技術的には main から再生可能だが、各 worktree に検証メモや未コミット作業が残っている可能性がある。**機械的に削除せず、ジェンナが各 worktree の `git status` を確認してから判断**する。
 
-- **`claude/phase4-sidebar`** (`.claude/worktrees/phase4-sidebar`)
-  - HEAD: `827157c` Phase 4: Sidebar User/Library restructure
-- **`claude/phase5-stats-detail`** (`.claude/worktrees/phase5-stats-detail`)
-  - HEAD: `69c87af` Phase 5 gamma: Stats chart selection
-- **`claude/phase5-stats-drilldown`** (`.claude/worktrees/phase5-stats-drilldown`)
-  - HEAD: `03e6397` Merge Phase 4
-- **`claude/phase5.1-dashboard-lock`** (`.claude/worktrees/phase5.1-dashboard-lock`)
-  - HEAD: `9070441` Merge Phase 5 gamma
-- **`claude/phase5.2-passive-source-rows`** (`.claude/worktrees/phase5.2-passive-source-rows`)
-  - HEAD: `08929ba` Phase 5.2
-- **`claude/phase6-stats-mode-redefine`** (`.claude/worktrees/phase6-stats-mode-redefine`)
-  - HEAD: `08929ba` Phase 5.2（同 sha、ブランチが追従しているだけ）
-- **`claude/phase7-stats-user-prompt-filter`** (`.claude/worktrees/phase7-stats-user-prompt-filter`)
-  - HEAD: `277feba` Phase 6 + 7
-- **`claude/phase8-dashboard-sidebar-filter`** (`.claude/worktrees/phase8-dashboard-sidebar-filter`)
-  - HEAD: `656d518` Phase 8
-- **`claude/phase9-foreign-language-grouping-prefix-trap-fix`** (`.claude/worktrees/phase9-foreign-language-grouping-prefix-trap-fix`)
-  - HEAD: `3e9fc36` Phase 9 hotfix（vault/phase-c の最終 commit と同じ）
+| ブランチ | path | HEAD | 由来 |
+|---------|------|------|------|
+| `claude/phase4-sidebar` | `.claude/worktrees/phase4-sidebar` | `827157c` | Phase 4: Sidebar restructure |
+| `claude/phase5-stats-detail` | `.claude/worktrees/phase5-stats-detail` | `69c87af` | Phase 5 gamma: Stats chart selection |
+| `claude/phase5-stats-drilldown` | `.claude/worktrees/phase5-stats-drilldown` | `03e6397` | Merge Phase 4 |
+| `claude/phase5.1-dashboard-lock` | `.claude/worktrees/phase5.1-dashboard-lock` | `9070441` | Merge Phase 5 gamma |
+| `claude/phase5.2-passive-source-rows` | `.claude/worktrees/phase5.2-passive-source-rows` | `08929ba` | Phase 5.2 |
+| `claude/phase6-stats-mode-redefine` | `.claude/worktrees/phase6-stats-mode-redefine` | `08929ba` | Phase 5.2（同 sha） |
+| `claude/phase7-stats-user-prompt-filter` | `.claude/worktrees/phase7-stats-user-prompt-filter` | `277feba` | Phase 6+7 |
+| `claude/phase8-dashboard-sidebar-filter` | `.claude/worktrees/phase8-dashboard-sidebar-filter` | `656d518` | Phase 8 |
+| `claude/phase9-foreign-language-grouping-prefix-trap-fix` | `.claude/worktrees/phase9-foreign-language-grouping-prefix-trap-fix` | `3e9fc36` | Phase 9 hotfix（vault/phase-c の最終 commit） |
 
-これらの内容は Task 2（vault/phase-c マージ）で main に取り込み済みなので、技術的には削除して main から再生可能。ただし worktree 自体に何か検証メモ・未コミット作業が残っている可能性があるため、機械的に削除せず、ジェンナが各 worktree の `git status` を確認してから判断する。
+これらは UI 関連の旧 phase 群で、本サマリーが対象とする **thinking-preservation プロジェクトとは別系統**。後者は完了したが、これらは独立に整理する案件。
 
 ---
 
@@ -108,34 +131,53 @@ done
 
 ### `claude/busy-bardeen-87607b`
 - **path**: `.claude/worktrees/busy-bardeen-87607b`
-- HEAD: `92bf6d9` (= 旧 main HEAD)
+- **HEAD**: `92bf6d9`（旧 main HEAD、Phase 0 マージ前）
 - 命名から自動生成された worktree と推測。**ジェンナに用途確認**してから判断
 - 削除可否: 保留
 
 ### `claude/interesting-chaum-a48d33`
 - **path**: `.claude/worktrees/interesting-chaum-a48d33`
-- HEAD: `70a0b2c`（main / vault/phase-c の系譜にない sha）
+- **HEAD**: `70a0b2c`（main / vault/phase-c のいずれの系譜にもない sha）
 - 何らかの独立した試行ブランチの可能性。**ジェンナに用途確認**してから判断
 - 削除可否: 保留
 
 ### `claude/stats-mode-impl`
 - **path**: `.claude/worktrees/stats-mode-impl`
-- HEAD: `06ffcea` Align SPEC.md / AGENTS.md with Phase 2 Stats implementation
+- **HEAD**: `06ffcea` Align SPEC.md / AGENTS.md with Phase 2 Stats implementation
 - Phase 2 Stats 実装の作業 worktree。Phase 系と類似の事情で保留
 - 削除可否: 保留
 
 ### `design/parts`
 - **path**: `.claude/worktrees/parts`
-- HEAD: `92f14f6` Refine design mock navigation shell（vault/phase-c 系譜）
+- **HEAD**: `92f14f6` Refine design mock navigation shell（vault/phase-c 系譜）
 - デザインモック作業。**ジェンナに用途確認**してから判断
 - 削除可否: 保留
 
-### `vault/phase-c-importer-audit`（主 worktree）
-- **path**: `/Users/ichijouhotaru/Projects/Madini Archive`（リポジトリのルート）
-- HEAD: `3e9fc36` Phase 9 hotfix
-- 主 worktree。`git status` 上で `docs/tasks/` の untracked と stash@{0} がある
-- **削除しない**（リポジトリのルート worktree。チェックアウト先を切り替えるだけ可能）
-- 主 worktree の checkout 先を main に切り替えたい場合: `git checkout main` を実行する前に stash と untracked の処理方針をジェンナと相談する
+### `vault/phase-c-importer-audit`(主 worktree)
+- **path**: `/Users/ichijouhotaru/Projects/Madini Archive`(リポジトリのルート)
+- **HEAD**: `3e9fc36` Phase 9 hotfix
+- 主 worktree。`git status` 上で `docs/tasks/` 等の untracked と stash@{0} がある可能性
+- **削除しない**(リポジトリのルート worktree)
+- **注意**: thinking-preservation 一連の Swift commit は main ブランチに 159 個積まれているが、主 worktree は依然として `vault/phase-c-importer-audit` ブランチを指している。`git checkout main` する場合は untracked / stash の処理を先に行う必要あり
+- 主 worktree のブランチを main に切り替えたい場合の手順:
+  ```sh
+  cd "/Users/ichijouhotaru/Projects/Madini Archive"
+  git status                    # untracked と stash を確認
+  git stash list                # 残ってる stash を確認
+  # 必要なものを処理してから:
+  git checkout main
+  ```
+
+---
+
+## origin への push 状況（2026-05-01）
+
+| repo | 状態 |
+|------|------|
+| Madini Archive (Swift) | 159 commits ahead of origin/main、未 push |
+| Madini_Dev (Python) | Phase 1+2+2b は `claude/phase-1-python-schema-migration` branch、Phase 5 は `claude/phase-5-backfill-content-json` branch、いずれも main 未マージ・未 push |
+
+ジェンナの判断で push 実施。Python 側は2ブランチを順次 main へマージしてから push する必要あり。
 
 ---
 
@@ -150,19 +192,19 @@ git worktree remove .claude/worktrees/<path>
 git branch -D claude/<branch-name>
 ```
 
-### 一括削除（"削除可" カテゴリの 4 つを処分する場合）
+### 一括削除（"削除可" カテゴリ全部を処分する場合）
 ```sh
 cd /Users/ichijouhotaru/Projects/Madini\ Archive
 
-# Task 5 までマージ済みであることを確認
-git log --oneline -3
+# 削除前に main にマージ済みであることを確認
+git log --oneline -5
 
 # 削除可な worktree を順次削除
 for entry in \
     "tender-heisenberg-06101d:claude/investigate-rendering-framework" \
     "investigate-importer-migration:claude/investigate-importer-migration" \
     "plan-thinking-preservation:claude/plan-thinking-preservation" \
-    "tonight-integration:claude/phase-1-preparation"
+    "tonight-integration:claude/mark-thinking-preservation-complete"
 do
     path="${entry%%:*}"
     branch="${entry##*:}"

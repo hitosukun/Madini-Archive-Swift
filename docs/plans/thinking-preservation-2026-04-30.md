@@ -9,6 +9,87 @@
 
 ---
 
+## ✅ 実施結果サマリー（2026-05-01 追記）
+
+本計画は **Phase 0〜6 全て完了**。実機（`/Applications/Madini Archive.app`）に反映済み。
+
+### Phase 別の到達状況
+
+| Phase | 内容 | 状態 | 主要 commit |
+|-------|------|------|-------------|
+| 0 | vault/phase-c-importer-audit を main にマージ | ✅ | Swift `5b6c0f0` |
+| 1 | Python: `messages.content_json` 列追加 + `_ensure_message_columns()` | ✅ | Madini_Dev `3db2a79` |
+| 2 | Python: Claude parser に thinking 抽出 (`_build_claude_message_blocks`) | ✅ | Madini_Dev `1ac010f`（2b と同一 commit） |
+| 2b | Python: ChatGPT o3 系 `thoughts` / `reasoning_recap` 抽出 | ✅ | Madini_Dev `1ac010f` |
+| 3 | Swift: `MessageBlock` enum + `Message.contentBlocks` + GRDB 読み込み | ✅ | Swift `3e9f67b` |
+| 4 | Swift: `MessageRenderProfile.collapsesThinking` + `StructuredBlockGrouper` + `ThinkingGroupView` | ✅ | Swift `e6d124d` |
+| 4 hotfix | flat content からの thinking dedup（substring 削除） | ✅ | Swift `70778b9` |
+| 5 | `Scripts/backfill_content_json.py`（raw_sources + vault 2 パス） | ✅ | Madini_Dev `62ff8fb` |
+| 6 | `ForeignLanguageGrouping` deprecation + 今夜の hotfix 4 層除去 | ✅ | Swift `ea902fe` |
+
+### スキーマ migration 結果（実 archive.db）
+
+```
+PRAGMA table_info(messages):
+  0|id|INTEGER|0||1
+  1|conv_id|TEXT|0||0
+  2|role|TEXT|0||0
+  3|content|TEXT|0||0          ← 既存、無変更
+  4|content_json|TEXT|0||0     ← Phase 1 で追加、Phase 5 で 1396 行 populate
+  5|msg_index|INTEGER|0||0
+```
+
+### Backfill カバレッジ（Phase 5 実行結果）
+
+```
+Total messages:    58,857
+Backfilled:         1,396 (2.4 %)
+
+Pass 1 (raw_sources):    110 messages from 3 Python-importer batches
+Pass 2 (raw_export vault): 1,286 messages from 18 Swift-vault blobs (LZFSE-decompressed via swift CLI)
+
+By source:
+  Claude:   40 conversations,   217 messages now carry thinking blocks
+  ChatGPT: 250 conversations, 1,179 messages now carry o3 reasoning
+```
+
+backfill 不可だった残り 57,461 行は (a) raw_text を保管していなかった古い import か (b) thinking のない通常応答のいずれか。Phase 6 で legacy 言語検出 path を引退させたため、これらは flat content をそのまま render（誤ラベル fold は消滅）。
+
+### 解決された不具合
+
+| 不具合 | 解決経路 |
+|--------|---------|
+| Bug A: 数式 (`d(x,y)=d(y,x)`) が "Spanish" / "Polish" で誤折りたたみ | Phase 6 で legacy 言語検出 path 引退 → 該当 hotfix（listItem 除外、formula 除外）も deprecated に |
+| Bug B: 日本語応答が "Japanese" として誤折りたたみ | Phase 4 で `MessageRenderProfile.collapsesThinking` 経路に切り替え、Phase 5 で 1,396 messages を backfill。Phase 6 で legacy path 引退 |
+| Phase 4 hotfix: Claude `message.text` の事前結合による thinking 二重表示 | `contentBlocksExcludingThinking` で flat content から thinking text を substring 除去 |
+
+### 残された判断ポイントとその結論
+
+レポート §8 の判断ポイントを実装中の判断結果で更新:
+
+1. **スキーマ案**: 案 1（`messages.content_json` 列追加）採用 ✅
+2. **bookmarks 整合性**: thread-level のみ存在を確認、prompt-level は migration 1-2 で既に lift 済み。UPDATE-only backfill で完全保護 ✅
+3. **一括 vs 段階移行**: 案 A（一括 `backfill_content_json.py`）採用 ✅
+4. **vault/phase-c マージ**: 一括（30+ commits を Phase 0 で取り込み済み） ✅
+5. **Phase 0 着手順序**: Phase 0 → Python (Phase 1, 2, 2b) → Swift (Phase 3, 4) → Phase 5 → Phase 6 の直列で実施 ✅
+6. **ChatGPT reasoning 同時実装**: Phase 2 と 2b を同 commit で実装 ✅
+7. **翻訳ボタンの処遇**: Phase 4 では一旦省略。`ForeignLanguageBlockView` の `Translation.framework` 統合は deprecated 化しつつコード保持（将来「任意テキストの翻訳ボタン」候補として再利用余地） ⏸
+8. **Phase 0 後の Bug B 再現確認**: 不要だった（hotfix 4 層が先行して効いていたため） ✅
+
+### 残された作業 / 未対応
+
+- **Push**: 全 commit が origin に push されていない（ローカルのみ）。ジェンナの判断で実施。
+- `ForeignLanguageGrouping` / `ForeignLanguageBlockView` の **完全削除**: 現状は file-level deprecation banner のみ。escape hatch として保持。本格削除は次回以降の判断。
+- `Translation.framework` 統合の `InlineTranslationButton` への抽出: 別フェーズ（任意）。
+- Phase 5 で取りこぼした 57,461 messages: raw_text が無い古い conversation は構造的に救済不可。許容。
+
+### 関連ドキュメントへの影響
+
+- `docs/notes/active-worktrees.md`: thinking-preservation 関連の worktree（tender-heisenberg, investigate-importer-migration, plan-thinking-preservation）はレポート main 保存済み・実装完了で削除可。
+- `docs/plans/phase-1-decision-points.md` / `phase-1-implementation-prompt-draft.md` / `phase-1-affected-files.md`: 各判断項目の結論を本サマリーに集約済み。準備物としては役目を終えたが、過去の意思決定経緯を残す資料として保持。
+
+---
+
 ## 1. 確定した方針の再掲
 
 ### 1.1 アーキテクチャ宣言: core + skinnable-shell
