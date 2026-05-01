@@ -4,6 +4,12 @@ A local archive viewer for the long-term accumulation and rereading of LLM conve
 
 [日本語 README](./README.md)
 
+## Why This Exists
+
+LLM conversation logs are scattered across multiple services (ChatGPT, Claude, Gemini), accumulating inside each provider's app. Per-service search rarely scales to historical depth, cross-service search doesn't exist, and any service shutdown puts those records at risk. Madini Archive consolidates a user's conversation logs into a single local SQLite file so they can be reread, searched, and revisited over the long term.
+
+Composition and formatting tools (Obsidian, etc.) already exist; Madini Archive is specifically tuned for **reading, searching, and revisiting** rather than authoring. Imports are preserved verbatim — normalization and formatting live in derived layers, not the source data.
+
 ## Repository Layout
 
 This is a mono-repo. Two components live in the same tree and evolve together:
@@ -22,6 +28,14 @@ The Swift app is **read-only** against `archive.db` and owns the SQLite schema. 
 - **Support human judgment** — favor rereading, comparison, and reconstruction over automatic scoring or summarization.
 
 See [AGENTS.md](./AGENTS.md) for the full set of repository rules.
+
+## Extending with Coding AIs
+
+This repository is designed to be modified with coding AIs such as Claude Code, Cursor, or Codex.
+
+- **Have the AI read `AGENTS.md` first.** It records the repository's design rules — layer separation, the Repository protocol, the Window Model, Localization, Reader Typography, and so on. Coding AIs that have read AGENTS.md tend to respect those boundaries; coding AIs that haven't tend to drift across them.
+- **Pin the requirements before you ask the AI to implement.** Coding AIs are skilled at implementing whatever instruction they're given, even when the high-level direction is wrong. Brainstorm with a regular chat LLM first to articulate what you actually want; then hand the agreed plan to the coding AI.
+- **A three-layer workflow — human ↔ chat LLM ↔ coding AI — reduces friction.** When the coding AI surfaces a detailed technical question, ask a chat LLM to translate it into plain language, decide, and then ask the chat LLM to translate your decision back into a coding-AI-ready prompt with the right jargon.
 
 ## Build & Run
 
