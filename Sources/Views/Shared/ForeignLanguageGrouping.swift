@@ -1,13 +1,23 @@
 import Foundation
 import NaturalLanguage
 
-/// One unit produced by `ForeignLanguageGrouping.group(_:)`. Either a
-/// regular content block (rendered as before) or a contiguous run of
-/// foreign-language blocks bundled into a de-emphasized group with an
-/// opt-in translate affordance.
+/// One unit produced by `ForeignLanguageGrouping.group(_:)` or
+/// `StructuredBlockGrouper.group(_:)`. Either a regular content block
+/// (rendered as before), a contiguous run of foreign-language blocks
+/// bundled into a de-emphasized group with an opt-in translate
+/// affordance, or — Phase 4 — a structural thinking group lifted out
+/// of `Message.contentBlocks` (Python-annotated thinking instead of
+/// NLLanguageRecognizer-guessed monologue).
 enum MessageRenderItem {
     case block(ContentBlock)
     case foreignLanguageGroup(language: NLLanguage, blocks: [ContentBlock])
+    /// Phase 4: contiguous run of `.thinking` blocks pulled from a
+    /// message's `content_json`. The `provider` (claude / chatgpt /
+    /// future) lets the rendering view tag the fold's header
+    /// appropriately. Carries the original `MessageBlock` payload so
+    /// metadata (timestamps, signatures, recap flag) reaches the view
+    /// untouched.
+    case thinkingGroup(provider: String, blocks: [MessageBlock])
 }
 
 /// Detects per-block dominant language via `NLLanguageRecognizer` and
