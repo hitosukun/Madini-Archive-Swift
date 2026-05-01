@@ -660,15 +660,21 @@ struct MessageBubbleView: View, Equatable {
         _ text: String,
         blockAnchorID: String
     ) -> some View {
+        // Inject ZWSPs into long unbreakable runs so URLs / dotted
+        // identifier chains in plain English prose break cleanly inside
+        // the bubble width. Markdown-link syntax `[text](url)` and
+        // inline code spans are skipped — see `LineBreakHints` for
+        // the contract.
+        let wrapped = LineBreakHints.softWrap(text)
         let rendered: Text = {
-            if canRenderMarkdown(text) {
+            if canRenderMarkdown(wrapped) {
                 return renderInlineRich(
-                    text,
+                    wrapped,
                     fontSize: scaledBodyFontSize,
                     blockAnchorID: blockAnchorID
                 )
             }
-            return Text(highlightedVerbatim(text, blockAnchorID: blockAnchorID))
+            return Text(highlightedVerbatim(wrapped, blockAnchorID: blockAnchorID))
         }()
 
         rendered
@@ -694,11 +700,18 @@ struct MessageBubbleView: View, Equatable {
             }
         }()
 
-        renderInlineRich(text, fontSize: size, blockAnchorID: blockAnchorID)
+        // Heading padding is bumped from (top: 6/2, bottom: 2) to
+        // (top: 8/4, bottom: 4) to give English ascenders / descenders
+        // (the H, l, g, y in "Heading Examples") breathing room. Tight
+        // 2-pt bottoms read fine with Japanese glyphs (which sit closer
+        // to the baseline), but English heading runs felt cramped
+        // against the next paragraph. See AGENTS.md "Reader Typography".
+        let wrapped = LineBreakHints.softWrap(text)
+        renderInlineRich(wrapped, fontSize: size, blockAnchorID: blockAnchorID)
             .font(.system(size: size, weight: .semibold))
             .textSelection(.enabled)
-            .padding(.top, level <= 2 ? 6 : 2)
-            .padding(.bottom, 2)
+            .padding(.top, level <= 2 ? 8 : 4)
+            .padding(.bottom, 4)
             .frame(maxWidth: .infinity, alignment: .leading)
             .fixedSize(horizontal: false, vertical: true)
     }
@@ -715,10 +728,17 @@ struct MessageBubbleView: View, Equatable {
             Text(marker)
                 .font(.system(size: scaledBodyFontSize).monospacedDigit())
                 .foregroundStyle(.secondary)
-                .frame(minWidth: ordered ? 22 : 14, alignment: .trailing)
+                // Ordered-list marker minWidth: 28 fits "100." with the
+                // monospacedDigit() variant of SF Pro at the body font
+                // size. Original 22 was tuned against single-digit
+                // Japanese-prose lists; English numbered lists routinely
+                // run into the teens, and double-digit markers ("10.")
+                // were starting to nudge the text column. See AGENTS.md
+                // "Reader Typography".
+                .frame(minWidth: ordered ? 28 : 14, alignment: .trailing)
 
             renderInlineRich(
-                text,
+                LineBreakHints.softWrap(text),
                 fontSize: scaledBodyFontSize,
                 blockAnchorID: blockAnchorID
             )
@@ -742,7 +762,7 @@ struct MessageBubbleView: View, Equatable {
                 .frame(width: 3)
 
             renderInlineRich(
-                text,
+                LineBreakHints.softWrap(text),
                 fontSize: scaledBodyFontSize,
                 blockAnchorID: blockAnchorID
             )
@@ -2506,12 +2526,25 @@ private struct CodeBlockView: View {
             // on the workspace split view (`ViewerModeSwipeGesture`) eats
             // events when the user actually meant to scroll the code
             // sideways. Wrapping also matches the reading flow of the
-            // surrounding paragraphs; very long single-token lines (URLs,
-            // dotted identifier chains) still wrap because Text breaks at
-            // word boundaries including `.` and `/`. Colored via
+            // surrounding paragraphs.
+            //
+            // Long single-token lines (URLs, dotted identifier chains,
+            // hashed filenames) need explicit help: SwiftUI's `Text`
+            // does not break inside non-CJK tokens regardless of how
+            // many slashes / dots / underscores they contain.
+            // `LineBreakHints.softWrap(_:inMarkdown: false)` injects
+            // zero-width spaces after path-like delimiters so CoreText
+            // gets break opportunities. `inMarkdown: false` because the
+            // code is rendered verbatim — no markdown link syntax to
+            // protect, and inline-code-span backticks inside source
+            // shouldn't be treated specially. Colored via
             // `SyntaxHighlighter` so the per-language palette stays in
             // sync with whatever `bodyFontSize` the bubble is using.
-            Text(SyntaxHighlighter.highlight(code, language: language, fontSize: fontSize))
+            Text(SyntaxHighlighter.highlight(
+                LineBreakHints.softWrap(code, inMarkdown: false),
+                language: language,
+                fontSize: fontSize
+            ))
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .fixedSize(horizontal: false, vertical: true)
@@ -2570,7 +2603,10 @@ private struct TableBlockView: View {
                     cellText(cell, alignment: alignment(at: index))
                         .font(.system(size: fontSize, weight: .semibold))
                         .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
+                        // Vertical 8 (was 6) so English descenders
+                        // (g, j, p, q, y) clear the row separator. See
+                        // AGENTS.md "Reader Typography".
+                        .padding(.vertical, 8)
                         .gridColumnAlignment(alignment(at: index).gridColumnAlignment)
                 }
             }
@@ -2584,7 +2620,9 @@ private struct TableBlockView: View {
                         cellText(cell, alignment: alignment(at: idx))
                             .font(.system(size: fontSize))
                             .padding(.horizontal, 10)
-                            .padding(.vertical, 6)
+                            // Match header vertical 8 (see header
+                            // padding above).
+                            .padding(.vertical, 8)
                     }
                 }
             }
@@ -2599,7 +2637,12 @@ private struct TableBlockView: View {
     }
 
     private func cellText(_ text: String, alignment: TableAlignment) -> some View {
-        renderInline(text)
+        // Soft-break injection: cells often hold URLs / model identifiers
+        // / hash-like values that would otherwise overflow the column.
+        // Routed through the markdown-aware variant because the cell
+        // body still goes through the inline markdown renderer (links
+        // and inline code may appear inside cells).
+        renderInline(LineBreakHints.softWrap(text))
             .multilineTextAlignment(alignment.textAlignment)
             .textSelection(.enabled)
             .fixedSize(horizontal: false, vertical: true)
