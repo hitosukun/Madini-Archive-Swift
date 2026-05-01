@@ -109,7 +109,7 @@ enum TextPreviewWindow {
         window.toolbarStyle = .unified
 
         window.title = galleryEntries[clampedIndex].relativePath
-            .components(separatedBy: "/").last ?? "プレビュー"
+            .components(separatedBy: "/").last ?? String(localized: "Preview")
 
         let observer = NotificationCenter.default.addObserver(
             forName: NSWindow.willCloseNotification,
@@ -287,14 +287,14 @@ private struct TextPreviewWindowContent: View {
         case .failed(let message):
             placeholder(
                 systemImage: "xmark.octagon",
-                title: "読み込みに失敗しました",
+                title: String(localized: "Failed to load"),
                 detail: message
             )
         case .loaded(let loaded):
             if let binaryReason = loaded.binaryReason {
                 placeholder(
                     systemImage: "doc.badge.gearshape",
-                    title: "プレビュー非対応のファイル",
+                    title: String(localized: "File type not previewable"),
                     detail: binaryReason
                 )
             } else {
@@ -324,7 +324,7 @@ private struct TextPreviewWindowContent: View {
         HStack(spacing: 8) {
             Image(systemName: "scissors")
                 .foregroundStyle(.secondary)
-            Text("先頭 \(Self.formatBytes(TextPreviewWindow.previewByteCap)) のみ表示しています（全体 \(Self.formatBytes(fullByteCount))）。続きは「外部で開く」から。")
+            Text("Showing only the first \(Self.formatBytes(TextPreviewWindow.previewByteCap)) (total \(Self.formatBytes(fullByteCount))). Use “Open Externally” to see the rest.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Spacer(minLength: 0)
@@ -410,7 +410,7 @@ private struct TextPreviewWindowContent: View {
                 binaryReason = nil
             case .binary:
                 previewText = ""
-                binaryReason = "UTF-8 として読めないバイト列です（\(Self.formatBytes(fullByteCount))）。「外部で開く」から既定のアプリで開いてください。"
+                binaryReason = String(localized: "Bytes don’t decode as UTF-8 (\(Self.formatBytes(fullByteCount))). Use “Open Externally” to open it in the default app.")
             }
             let loaded = TextPreviewLoaded(
                 entry: entry,
@@ -519,7 +519,7 @@ final class TextPreviewToolbarCoordinator: NSObject, NSToolbarDelegate {
         case Self.copyID:
             return makeItem(
                 identifier: itemIdentifier,
-                label: "テキストをコピー",
+                label: String(localized: "Copy Text"),
                 symbol: "doc.on.doc",
                 action: #selector(copyTapped),
                 buttonKey: \.copyButton
@@ -527,7 +527,7 @@ final class TextPreviewToolbarCoordinator: NSObject, NSToolbarDelegate {
         case Self.saveID:
             return makeItem(
                 identifier: itemIdentifier,
-                label: "ファイルを保存",
+                label: String(localized: "Save File"),
                 symbol: "square.and.arrow.down",
                 action: #selector(saveTapped),
                 buttonKey: \.saveButton
@@ -535,7 +535,7 @@ final class TextPreviewToolbarCoordinator: NSObject, NSToolbarDelegate {
         case Self.openExternallyID:
             return makeItem(
                 identifier: itemIdentifier,
-                label: "外部で開く",
+                label: String(localized: "Open Externally"),
                 symbol: "arrow.up.forward.app",
                 action: #selector(openExternallyTapped),
                 buttonKey: \.openExternallyButton
@@ -628,7 +628,7 @@ final class TextPreviewToolbarCoordinator: NSObject, NSToolbarDelegate {
             let bytes = try await vault.loadBlob(hash: loaded.entry.blobHash)
             try bytes.write(to: url, options: .atomic)
         } catch {
-            presentError(title: "保存に失敗しました", error: error)
+            presentError(title: String(localized: "Save failed"), error: error)
         }
     }
 
@@ -656,7 +656,7 @@ final class TextPreviewToolbarCoordinator: NSObject, NSToolbarDelegate {
             try bytes.write(to: url, options: .atomic)
             NSWorkspace.shared.open(url)
         } catch {
-            presentError(title: "外部アプリで開けませんでした", error: error)
+            presentError(title: String(localized: "Couldn’t open in external app"), error: error)
         }
     }
 

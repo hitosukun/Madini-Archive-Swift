@@ -288,7 +288,7 @@ struct ReaderHeaderActivityPill: View {
             )
         }
         .disabled(activeDetail == nil && conversations.isEmpty)
-        .help("会話を切り替え")
+        .help("Switch conversation")
         .popover(isPresented: $isThreadPopoverPresented, arrowEdge: .bottom) {
             ConversationListPopover(
                 conversations: conversations,
@@ -338,7 +338,7 @@ struct ReaderHeaderActivityPill: View {
             )
         }
         .disabled(promptOutline.isEmpty)
-        .help("プロンプトを切り替え")
+        .help("Switch prompt")
         .popover(isPresented: $isPromptPopoverPresented, arrowEdge: .bottom) {
             PromptOutlinePopover(
                 prompts: promptOutline,

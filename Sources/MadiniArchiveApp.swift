@@ -5,12 +5,88 @@ import AppKit
 
 #if os(macOS)
 final class MadiniAppDelegate: NSObject, NSApplicationDelegate {
+    /// Disable macOS-native window tabbing app-wide. We're a single-
+    /// window archive viewer — the system "Show Tab Bar" / "Merge All
+    /// Windows" / ⌘T flow doesn't compose with the three-pane
+    /// navigation model and merged tabs would hide the Library /
+    /// Archive / Settings menus behind a tab strip the user didn't ask
+    /// for.
+    ///
+    /// Two-pronged fix because the class-level default and the per-
+    /// window mode govern different things:
+    ///
+    ///   * `NSWindow.allowsAutomaticWindowTabbing = false` fires in
+    ///     `applicationWillFinishLaunching` — *before* SwiftUI builds
+    ///     the menu bar — and stops AppKit from auto-merging new
+    ///     windows into a tab group. Setting it later (in
+    ///     `applicationDidFinishLaunching`) doesn't take effect on the
+    ///     menu bar because by then SwiftUI has already wired up "Show
+    ///     Tab Bar" / "Show All Tabs" using the value it observed
+    ///     during scene construction.
+    ///   * `window.tabbingMode = .disallowed` runs per-window after the
+    ///     scene exists. This is what actually removes "Show Tab Bar"
+    ///     and "Show All Tabs" from the View menu and disables
+    ///     "Merge All Windows" / drag-to-merge for that specific
+    ///     window. We apply it to every window NSApp already knows
+    ///     about and observe `didBecomeKey` so any future scene
+    ///     (Settings, etc.) gets the same treatment.
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        NSWindow.allowsAutomaticWindowTabbing = false
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        for window in NSApp.windows {
+            window.tabbingMode = .disallowed
+        }
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(disableTabbingOnWindow(_:)),
+            name: NSWindow.didBecomeKeyNotification,
+            object: nil
+        )
+
         NSApp.setActivationPolicy(.regular)
         DispatchQueue.main.async {
             NSApp.activate(ignoringOtherApps: true)
             NSApp.windows.first?.makeKeyAndOrderFront(nil)
         }
+
+        // NB: an earlier revision attempted post-launch NSMenu surgery
+        // here to remove the SwiftUI anchor item from the File menu so
+        // the bar would show only AppKit's auto Close + Close All. The
+        // attempt was abandoned. Findings, in case anyone returns to it:
+        //
+        //   * `removeItem(_:)` on the anchor → SwiftUI's reactive
+        //     command engine reacts by REMOVING THE ENTIRE File menu
+        //     from `mainMenu.items` within a few seconds (verified by
+        //     a delayed dump). End state: no File menu in the bar,
+        //     even worse than the pre-surgery duplicate.
+        //   * Setting `anchor.isHidden = true` instead → SwiftUI
+        //     un-hides the item on its next rebuild (or AppKit
+        //     ignores `isHidden` for items with `keyEquivalent` set).
+        //     The anchor reappears.
+        //   * Replacing the anchor with a zero-width-space label or
+        //     hidden Button → SwiftUI treats `.newItem` as effectively
+        //     empty and collapses the File menu, taking the AppKit
+        //     auto items with it.
+        //   * `NSMenuDelegate.menuNeedsUpdate(_:)` re-fixing on each
+        //     open → doesn't help because the File menu is already
+        //     missing from the bar by the time the user goes to click
+        //     it.
+        //
+        // Conclusion: SwiftUI's reactive ownership of the menu items
+        // it published via `Commands` is fundamental and not safely
+        // mutable from AppKit. The result is that `MadiniArchiveApp`
+        // ships with a 3-item File menu (anchor Close + AppKit auto
+        // Close + AppKit auto Close All), all dispatching to
+        // `performClose:`. The redundancy is documented in AGENTS.md
+        // "Window Model" so future readers don't relitigate the
+        // surgery attempt.
+    }
+
+    @objc private func disableTabbingOnWindow(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow else { return }
+        window.tabbingMode = .disallowed
     }
 }
 #endif
@@ -50,6 +126,49 @@ struct MadiniArchiveApp: App {
         #if os(macOS)
         .defaultSize(width: 1200, height: 800)
         .commands {
+            // Madini is single-window by design (see AGENTS.md "Window
+            // Model"). SwiftUI's `WindowGroup` would otherwise auto-
+            // publish a File > "New Window" item bound to ⌘N, which
+            // would let the user spawn additional main scenes whose
+            // per-window isolation is currently incidental rather than
+            // designed.
+            //
+            // Replacing the `.newItem` command group removes the auto-
+            // injected items in that placement. SwiftUI bundles BOTH
+            // "New Window" and "Close" into `.newItem`, so an empty
+            // replacement hides the entire File menu — ⌘W still works
+            // (Cocoa wires it at the AppKit level) but the menu item
+            // disappears, which is unexpected for macOS users and
+            // unfriendly to accessibility tools that scan the menu
+            // tree. We re-publish a single Close item so the File menu
+            // reappears with just that one entry — matching the shape
+            // Console.app and Disk Utility ship.
+            //
+            // The Button below is an *anchor*, not the user-visible
+            // Close. Its only purpose is to keep `.newItem` non-empty
+            // so AppKit re-injects its standard "Close" / "Close All"
+            // pair into the File menu — when `.newItem` replaces with
+            // empty content, SwiftUI collapses the entire File menu
+            // and the AppKit pair vanishes with it (verified
+            // empirically on macOS 14/15: `.commandsRemoved()`, hidden
+            // Buttons, and Dividers all fail to keep the menu open).
+            //
+            // `MadiniAppDelegate.removeAnchorCloseFromFileMenu()`
+            // surgically removes this Button from the constructed
+            // NSMenu after launch, leaving the File menu in its
+            // canonical macOS shape (Close + Close All only). The
+            // Button's action wires to `performClose:` on the key
+            // window so that — even if the menu surgery later fails
+            // for any reason — ⌘W still closes the window. SwiftUI's
+            // `DismissAction` is not a substitute here: it operates
+            // only on Scenes opened via `openWindow` / sheets, not on
+            // the primary WindowGroup window.
+            CommandGroup(replacing: .newItem) {
+                Button("Close") {
+                    NSApp.keyWindow?.performClose(nil)
+                }
+                .keyboardShortcut("w", modifiers: .command)
+            }
             AppCommands(bodyTextSize: bodyTextSize)
         }
         #endif

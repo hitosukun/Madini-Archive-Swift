@@ -2,13 +2,13 @@
 
 `thinking-preservation-2026-04-30.md` §3.1 のファイル特定結果を再掲し、各ファイルの現状と Phase 1 でどう変わる予定かを 1-2 行で要約。Phase 1 のスコープは Python core 側のスキーマ migration のみ。
 
-実在性の確認: 2026-04-30 時点で `/Users/ichijouhotaru/Madini_Dev/` 配下に対象ファイルが存在することを確認済み（`ls /Users/ichijouhotaru/Madini_Dev/` 実行結果より `archive_store.py`, `split_chatlog.py`, `madini_gui.py`, `viewer_builder.py`, `app_paths.py`, `app_metadata.py` を確認）。
+実在性の確認: 2026-04-30 時点で `~/Madini_Dev/` 配下に対象ファイルが存在することを確認済み（`ls ~/Madini_Dev/` 実行結果より `archive_store.py`, `split_chatlog.py`, `madini_gui.py`, `viewer_builder.py`, `app_paths.py`, `app_metadata.py` を確認）。
 
 ---
 
 ## Python 側 — Phase 1 で改修するファイル
 
-### `/Users/ichijouhotaru/Madini_Dev/archive_store.py`（3,269 行）
+### `~/Madini_Dev/archive_store.py`（3,269 行）
 
 DB スキーマ定義 + 全ストア操作（import + view 両方）。Phase 1 の改修対象はこのファイルのみ。
 
@@ -87,7 +87,7 @@ def _ensure_message_columns(cursor):
 
 ## Python 側 — Phase 1 では改修しないが関連するファイル
 
-### `/Users/ichijouhotaru/Madini_Dev/split_chatlog.py`（655 行）
+### `~/Madini_Dev/split_chatlog.py`（655 行）
 
 import orchestration + 各 provider parser。Phase 2 / 2b で改修するが、**Phase 1 では無変更**。
 
@@ -96,11 +96,11 @@ import orchestration + 各 provider parser。Phase 2 / 2b で改修するが、*
 - `_build_claude_message_text()` (lines 374-403): 既存挙動維持（content 列用）
 - `parse_chatgpt_export()` (lines 271-324): `_build_chatgpt_message_blocks()` 新設で thoughts / reasoning_recap 抽出
 
-### `/Users/ichijouhotaru/Madini_Dev/madini_gui.py`（885 行）
+### `~/Madini_Dev/madini_gui.py`（885 行）
 
 PyQt6 GUI。`fetch_conversation_detail()` 等を呼ぶだけで `content_json` は読まない。**Phase 1 では完全に無変更**。将来 thinking を Python GUI でも表示したい場合は別 Phase で扱う。
 
-### `/Users/ichijouhotaru/Madini_Dev/viewer_builder.py`（359 行）
+### `~/Madini_Dev/viewer_builder.py`（359 行）
 
 HTML viewer 生成。Python GUI 内部で使われる。**Phase 1 では無変更**。
 
@@ -142,6 +142,6 @@ Madini Archive は SQLite + Python の組み合わせで、**専用の migration
 
 ## まとめ
 
-Phase 1 で実際に編集するファイルは **`/Users/ichijouhotaru/Madini_Dev/archive_store.py` の 1 ファイルのみ**、追加行数は約 20 行。他のファイルは無変更。
+Phase 1 で実際に編集するファイルは **`~/Madini_Dev/archive_store.py` の 1 ファイルのみ**、追加行数は約 20 行。他のファイルは無変更。
 
 Phase 2（Claude parser 改修）から `split_chatlog.py` も対象に入る。Phase 3 から Swift 側に影響が及ぶ。

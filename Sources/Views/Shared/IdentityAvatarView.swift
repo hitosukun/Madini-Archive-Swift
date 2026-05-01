@@ -155,7 +155,7 @@ private struct DefaultIdentityAvatarView: View {
     }
 
     private var bundledAvatarImageName: String? {
-        IdentityDefaultAvatar(rawValue: avatarID)?.bundledImageName
+        IdentityDefaultAvatar(rawValue: avatarID).flatMap(\.bundledImageName)
     }
 
     private var symbolName: String {

@@ -1,6 +1,6 @@
 # Phase 1 着手前の判断ポイント
 
-`docs/plans/thinking-preservation-2026-04-30.md` §8 に列挙された 8 つの判断ポイントを、ジェンナがすぐ目を通せる形に整理したもの。明日以降、Phase 1 の実装指示文 (`phase-1-implementation-prompt-draft.md`) に反映するため、各項目の「ジェンナの判断」欄を埋めて使う。
+`docs/plans/thinking-preservation-2026-04-30.md` §8 に列挙された 8 つの判断ポイントを、オーナーがすぐ目を通せる形に整理したもの。明日以降、Phase 1 の実装指示文 (`phase-1-implementation-prompt-draft.md`) に反映するため、各項目の「オーナーの判断」欄を埋めて使う。
 
 詳細・代替案・トレードオフはレポート本文 §8 と関連セクションを参照。
 
@@ -14,7 +14,7 @@
 
 **推奨案**: 案 1（`messages.content_json` 列追加）。`content` 列を温存して後方互換、Python と Swift の二重対応コスト最小、vault 不在の古い conversation も backfill で救済可。
 
-**ジェンナの判断**:
+**オーナーの判断**:
 ```
 [ ] 案 1（content_json 列追加） — 推奨
 [ ] 案 2（messages_blocks 別テーブル）
@@ -34,7 +34,7 @@
 
 **推奨案**: 推奨案無し（結論は「無傷」）。ただし念のため Phase 5 の backfill 直前に `SELECT target_type, COUNT(*) FROM bookmarks GROUP BY target_type` で prompt 型が残っていないことを確認する。
 
-**ジェンナの判断**:
+**オーナーの判断**:
 ```
 [ ] 推奨どおり進める（事前確認のみ）
 [ ] 追加対応が必要 — 内容:
@@ -55,7 +55,7 @@
 
 **推奨案**: 一括移行（案 A）。`backfill_content_json.py` を一回実行し全 raw_source を処理。段階移行は Swift 側からの DB 書き込みを発生させるため AGENTS.md の "DB は readonly で開く" 原則に反する。
 
-**ジェンナの判断**:
+**オーナーの判断**:
 ```
 [ ] 案 A（一括移行） — 推奨
 [ ] 案 B（段階移行 / lazy）
@@ -74,7 +74,7 @@
 
 **推奨案**: 一括マージ（既に Task 2 で実施済み、main HEAD に取り込み完了）。
 
-**ジェンナの判断**:
+**オーナーの判断**:
 ```
 [x] 一括マージ済み（Task 2 で実施、merge commit 5b6c0f0）
 
@@ -91,7 +91,7 @@
 
 **推奨案**: Phase 0 はすでに完了。次は Python の Phase 1 → 2 を直列で進めるのが安全。Swift 側 Phase 3〜4 は Python 完了後に並列着手可能。
 
-**ジェンナの判断**:
+**オーナーの判断**:
 ```
 [x] Phase 0 完了済み（Task 2）
 
@@ -112,7 +112,7 @@
 
 **推奨案**: 同時に実装（手戻り回避）。スキーマと Swift 側ロジックは provider-agnostic に設計済みなので、ChatGPT 用 parser を別ヘルパーとして並べるだけで完結する。
 
-**ジェンナの判断**:
+**オーナーの判断**:
 ```
 [ ] Phase 2 と Phase 2b を同時実装 — 推奨
 [ ] Phase 2b は後回し（Bug B 解決優先）
@@ -130,7 +130,7 @@
 
 **推奨案**: 翻訳機能のみ別 component（`InlineTranslationButton`）に抽出して、thinking block 内の翻訳に再利用。本文中の引用文への翻訳機能は将来拡張余地として保留。
 
-**ジェンナの判断**:
+**オーナーの判断**:
 ```
 [ ] 案 A: 翻訳機能を thinking block 限定で残す — 推奨
 [ ] 案 B: 任意のテキスト範囲に対する翻訳ボタン（リッチ、Phase 6 範囲外）
@@ -149,7 +149,7 @@
 
 **推奨案**: 必要。ただし Task 1〜3 の hotfix 群（main `fd85dca` 時点）で Bug B は既に部分的に緩和されているため、「hotfix 後の状態」を新しいベースラインとして記録するのが現実的。
 
-**ジェンナの判断**:
+**オーナーの判断**:
 ```
 [x] hotfix 後の現状をベースラインとして記録（実機の既存挙動を撮影/メモ）
 [ ] スキップ

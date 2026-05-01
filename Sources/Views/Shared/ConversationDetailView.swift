@@ -1643,7 +1643,7 @@ func conversationShareMenuItems(
                 suggestedFilename: exportFilename(for: detail, extension: "md")
             )
         } label: {
-            Label("Markdown (.md) として書き出し…",
+            Label("Export as Markdown (.md)…",
                   systemImage: "doc.text")
         }
         Button {
@@ -1652,7 +1652,7 @@ func conversationShareMenuItems(
                 suggestedFilename: exportFilename(for: detail, extension: "txt")
             )
         } label: {
-            Label("プレーンテキスト (.txt) として書き出し… — LLM 向け",
+            Label("Export as plain text (.txt)… — for LLMs",
                   systemImage: "text.alignleft")
         }
         #else
@@ -1667,7 +1667,7 @@ func conversationShareMenuItems(
                     image: Image(systemName: "doc.text")
                 )
             ) {
-                Label("Markdown (.md) として書き出し…", systemImage: "doc.text")
+                Label("Export as Markdown (.md)…", systemImage: "doc.text")
             }
         }
         if let plainTextURL {
@@ -1678,7 +1678,7 @@ func conversationShareMenuItems(
                     image: Image(systemName: "text.alignleft")
                 )
             ) {
-                Label("プレーンテキスト (.txt) として書き出し… — LLM 向け",
+                Label("Export as plain text (.txt)… — for LLMs",
                       systemImage: "text.alignleft")
             }
         }
@@ -1687,14 +1687,14 @@ func conversationShareMenuItems(
         Button {
             LLMPromptClipboard.copy(detail)
         } label: {
-            Label("LLM プロンプトとしてコピー",
+            Label("Copy as LLM prompt",
                   systemImage: "doc.on.clipboard")
         }
     } else {
         // No conversation selected — show a single disabled row so
         // the menu isn't empty when the user opens it by accident.
         Button {} label: {
-            Label("会話が選択されていません", systemImage: "square.and.arrow.up")
+            Label("No conversation selected", systemImage: "square.and.arrow.up")
         }
         .disabled(true)
     }

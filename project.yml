@@ -33,6 +33,9 @@ settings:
     CODE_SIGN_STYLE: Automatic
     ENABLE_HARDENED_RUNTIME: NO
     DEAD_CODE_STRIPPING: YES
+    # Use the modern .xcstrings catalog instead of legacy
+    # Localizable.strings. See AGENTS.md "Localization".
+    LOCALIZATION_PREFERS_STRING_CATALOGS: YES
 
 # Swift Package dependencies mirror `Package.swift`. Keep these versions
 # in sync with the SPM manifest or the two build systems will diverge.
@@ -53,10 +56,24 @@ targets:
       - path: Sources
         excludes:
           - "Resources/**"
+      # Resources are picked up as a regular group (not `type: folder`)
+      # so Xcode applies the right Build Rule per file: PNG avatars go
+      # through the asset copy step, while `Localizable.xcstrings` is
+      # compiled into `*.lproj/Localizable.strings` by the Strings
+      # Catalog compiler. With `type: folder` the directory is treated
+      # as a verbatim copy and the catalog is bundled uncompiled, which
+      # breaks `LocalizedStringKey` lookups at runtime.
       - path: Sources/Resources
-        type: folder
         buildPhase: resources
       - path: App/Support/MadiniArchive.icns
+        buildPhase: resources
+      # Bundle the Python importer alongside the app so distribution
+      # builds resolve `Bundle.main.resourceURL/Python/split_chatlog.py`
+      # without depending on `~/Madini_Dev` being installed on the
+      # target machine. See `Sources/Services/JSONImporter.swift` for
+      # the resolution order.
+      - path: Python
+        type: folder
         buildPhase: resources
     dependencies:
       - package: GRDB

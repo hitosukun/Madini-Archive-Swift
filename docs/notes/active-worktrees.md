@@ -3,7 +3,7 @@
 **最終更新: 2026-05-01**
 
 `.claude/worktrees/` 配下に存在する worktree を列挙し、目的・現状・削除可否を明示する。
-ジェンナが「これ消して大丈夫？」を判断するための材料。
+オーナーが「これ消して大丈夫？」を判断するための材料。
 
 ---
 
@@ -107,9 +107,9 @@ done
 
 ---
 
-## 判断保留（ジェンナの実機状態に関わる worktree）
+## 判断保留（オーナーの実機状態に関わる worktree）
 
-vault/phase-c-importer-audit ブランチの累積 phase 系。Phase 0 で main に取り込み済みなので技術的には main から再生可能だが、各 worktree に検証メモや未コミット作業が残っている可能性がある。**機械的に削除せず、ジェンナが各 worktree の `git status` を確認してから判断**する。
+vault/phase-c-importer-audit ブランチの累積 phase 系。Phase 0 で main に取り込み済みなので技術的には main から再生可能だが、各 worktree に検証メモや未コミット作業が残っている可能性がある。**機械的に削除せず、オーナーが各 worktree の `git status` を確認してから判断**する。
 
 | ブランチ | path | HEAD | 由来 |
 |---------|------|------|------|
@@ -132,13 +132,13 @@ vault/phase-c-importer-audit ブランチの累積 phase 系。Phase 0 で main 
 ### `claude/busy-bardeen-87607b`
 - **path**: `.claude/worktrees/busy-bardeen-87607b`
 - **HEAD**: `92bf6d9`（旧 main HEAD、Phase 0 マージ前）
-- 命名から自動生成された worktree と推測。**ジェンナに用途確認**してから判断
+- 命名から自動生成された worktree と推測。**オーナーに用途確認**してから判断
 - 削除可否: 保留
 
 ### `claude/interesting-chaum-a48d33`
 - **path**: `.claude/worktrees/interesting-chaum-a48d33`
 - **HEAD**: `70a0b2c`（main / vault/phase-c のいずれの系譜にもない sha）
-- 何らかの独立した試行ブランチの可能性。**ジェンナに用途確認**してから判断
+- 何らかの独立した試行ブランチの可能性。**オーナーに用途確認**してから判断
 - 削除可否: 保留
 
 ### `claude/stats-mode-impl`
@@ -150,18 +150,18 @@ vault/phase-c-importer-audit ブランチの累積 phase 系。Phase 0 で main 
 ### `design/parts`
 - **path**: `.claude/worktrees/parts`
 - **HEAD**: `92f14f6` Refine design mock navigation shell（vault/phase-c 系譜）
-- デザインモック作業。**ジェンナに用途確認**してから判断
+- デザインモック作業。**オーナーに用途確認**してから判断
 - 削除可否: 保留
 
 ### `vault/phase-c-importer-audit`(主 worktree)
-- **path**: `/Users/ichijouhotaru/Projects/Madini Archive`(リポジトリのルート)
+- **path**: `~/Projects/Madini Archive`(リポジトリのルート)
 - **HEAD**: `3e9fc36` Phase 9 hotfix
 - 主 worktree。`git status` 上で `docs/tasks/` 等の untracked と stash@{0} がある可能性
 - **削除しない**(リポジトリのルート worktree)
 - **注意**: thinking-preservation 一連の Swift commit は main ブランチに 159 個積まれているが、主 worktree は依然として `vault/phase-c-importer-audit` ブランチを指している。`git checkout main` する場合は untracked / stash の処理を先に行う必要あり
 - 主 worktree のブランチを main に切り替えたい場合の手順:
   ```sh
-  cd "/Users/ichijouhotaru/Projects/Madini Archive"
+  cd "~/Projects/Madini Archive"
   git status                    # untracked と stash を確認
   git stash list                # 残ってる stash を確認
   # 必要なものを処理してから:
@@ -177,7 +177,7 @@ vault/phase-c-importer-audit ブランチの累積 phase 系。Phase 0 で main 
 | Madini Archive (Swift) | 159 commits ahead of origin/main、未 push |
 | Madini_Dev (Python) | Phase 1+2+2b は `claude/phase-1-python-schema-migration` branch、Phase 5 は `claude/phase-5-backfill-content-json` branch、いずれも main 未マージ・未 push |
 
-ジェンナの判断で push 実施。Python 側は2ブランチを順次 main へマージしてから push する必要あり。
+オーナーの判断で push 実施。Python 側は2ブランチを順次 main へマージしてから push する必要あり。
 
 ---
 
@@ -194,7 +194,7 @@ git branch -D claude/<branch-name>
 
 ### 一括削除（"削除可" カテゴリ全部を処分する場合）
 ```sh
-cd /Users/ichijouhotaru/Projects/Madini\ Archive
+cd ~/Projects/Madini\ Archive
 
 # 削除前に main にマージ済みであることを確認
 git log --oneline -5

@@ -158,17 +158,17 @@ private struct TranslationControl: View {
             HStack(spacing: 4) {
                 ProgressView()
                     .controlSize(.small)
-                Text("翻訳中…")
+                Text("Translating…")
                     .font(.caption)
             }
             .foregroundStyle(.secondary)
         } else if translatedBlocks != nil {
-            Label(showingOriginal ? "翻訳を表示" : "原文を表示",
+            Label(showingOriginal ? "Show translation" : "Show original",
                   systemImage: showingOriginal ? "character.bubble" : "arrow.uturn.backward")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         } else {
-            Label("翻訳", systemImage: "character.bubble")
+            Label("Translate", systemImage: "character.bubble")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
