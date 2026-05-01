@@ -5,12 +5,56 @@ import AppKit
 
 #if os(macOS)
 final class MadiniAppDelegate: NSObject, NSApplicationDelegate {
+    /// Disable macOS-native window tabbing app-wide. We're a single-
+    /// window archive viewer — the system "Show Tab Bar" / "Merge All
+    /// Windows" / ⌘T flow doesn't compose with the three-pane
+    /// navigation model and merged tabs would hide the Library /
+    /// Archive / Settings menus behind a tab strip the user didn't ask
+    /// for.
+    ///
+    /// Two-pronged fix because the class-level default and the per-
+    /// window mode govern different things:
+    ///
+    ///   * `NSWindow.allowsAutomaticWindowTabbing = false` fires in
+    ///     `applicationWillFinishLaunching` — *before* SwiftUI builds
+    ///     the menu bar — and stops AppKit from auto-merging new
+    ///     windows into a tab group. Setting it later (in
+    ///     `applicationDidFinishLaunching`) doesn't take effect on the
+    ///     menu bar because by then SwiftUI has already wired up "Show
+    ///     Tab Bar" / "Show All Tabs" using the value it observed
+    ///     during scene construction.
+    ///   * `window.tabbingMode = .disallowed` runs per-window after the
+    ///     scene exists. This is what actually removes "Show Tab Bar"
+    ///     and "Show All Tabs" from the View menu and disables
+    ///     "Merge All Windows" / drag-to-merge for that specific
+    ///     window. We apply it to every window NSApp already knows
+    ///     about and observe `didBecomeKey` so any future scene
+    ///     (Settings, etc.) gets the same treatment.
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        NSWindow.allowsAutomaticWindowTabbing = false
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        for window in NSApp.windows {
+            window.tabbingMode = .disallowed
+        }
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(disableTabbingOnWindow(_:)),
+            name: NSWindow.didBecomeKeyNotification,
+            object: nil
+        )
+
         NSApp.setActivationPolicy(.regular)
         DispatchQueue.main.async {
             NSApp.activate(ignoringOtherApps: true)
             NSApp.windows.first?.makeKeyAndOrderFront(nil)
         }
+    }
+
+    @objc private func disableTabbingOnWindow(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow else { return }
+        window.tabbingMode = .disallowed
     }
 }
 #endif
