@@ -595,6 +595,14 @@ struct MessageBubbleView: View, Equatable {
                     renderBlock(block, blockAnchorID: blockAnchorID)
                 }
             }
+        case .thinkingGroup(let provider, let blocks):
+            // Phase 4 structural-thinking fold. The view owns its
+            // expand state internally; we just hand it the provider
+            // tag and the blocks. No anchor wiring at the inner-text
+            // level because thinking is not a search target — see
+            // `searchText(for:)` below, which stringifies thinking
+            // as empty so the find bar can't land inside a fold.
+            ThinkingGroupView(provider: provider, blocks: blocks)
         }
     }
 
@@ -1002,29 +1010,63 @@ struct MessageBubbleView: View, Equatable {
     }
 
     /// Same lifecycle as `contentBlocks`, but folded through
-    /// `ForeignLanguageGrouping` so consecutive foreign-language blocks
-    /// render as one de-emphasized box. Cached separately because the
-    /// grouping pass is itself non-trivial (NL detection per block) and
+    /// `StructuredBlockGrouper` (Phase 4 structural-thinking path) or
+    /// `ForeignLanguageGrouping` (legacy language-detection path).
+    /// Cached separately because the grouping pass is itself non-
+    /// trivial (NL detection per block, JSON-decoded blocks) and
     /// `body` is re-evaluated on parent updates.
+    ///
+    /// Dispatch:
+    /// - When `message.contentBlocks` is non-nil AND the profile has
+    ///   `collapsesThinking` on AND the structured blocks contain at
+    ///   least one `.thinking` entry → structural path. The thinking
+    ///   blocks lift to a `.thinkingGroup` at the top, the rest of
+    ///   the message renders from the flat `content` markdown
+    ///   parse as before.
+    /// - Otherwise → legacy language-fold path. Preserves today's
+    ///   behavior for un-backfilled archive.db rows (content_json
+    ///   IS NULL) and for messages that have no thinking content.
     private var renderItems: [MessageRenderItem] {
-        // Cache key folds in `collapseFlag` and the conversation's
-        // detected primary language: the same blocks rendered under
-        // a different "what counts as foreign?" baseline produce
-        // different grouping output, so a Japanese thread on an
-        // English-locale Mac mustn't return cached items computed
-        // before the primary-language signal arrived.
+        // Cache key folds in `collapseFlag`, the conversation's
+        // detected primary language, AND a marker for whether the
+        // structured-thinking path was taken. The cache lives across
+        // message ids, but a single id resolves to the same path
+        // every time (contentBlocks is set at fetch time and doesn't
+        // mutate), so the marker is conceptually redundant — it's
+        // there as defense in depth against future code that might
+        // mutate the message.
         let profile = renderProfile
         let collapse = profile.collapsesForeignLanguageRuns
         let nativeLang = conversationPrimaryLanguage?.rawValue ?? ""
-        let key = "\(message.id)#\(collapse ? 1 : 0)#\(nativeLang)" as NSString
+        let useStructured = profile.collapsesThinking
+            && (message.contentBlocks?.contains(where: {
+                if case .thinking = $0 { return true }
+                return false
+            }) ?? false)
+        let key = "\(message.id)#\(collapse ? 1 : 0)#\(nativeLang)#\(useStructured ? 1 : 0)" as NSString
         if let cached = Self.renderItemsCache.object(forKey: key) {
             return cached.items
         }
-        let items = ForeignLanguageGrouping.items(
-            from: contentBlocks,
-            collapseForeignRuns: collapse,
-            nativeLanguage: conversationPrimaryLanguage
-        )
+
+        let items: [MessageRenderItem]
+        if useStructured, let structured = message.contentBlocks {
+            // Phase 4 structural path. Uses Python-annotated thinking
+            // — no NLLanguageRecognizer involved, no false positives
+            // on math notation or short Japanese paragraphs.
+            items = StructuredBlockGrouper.group(
+                structured: structured,
+                flatContent: contentBlocks,
+                profile: profile
+            )
+        } else {
+            // Legacy language-fold path. Still needed for un-back-
+            // filled rows and for messages that don't carry thinking.
+            items = ForeignLanguageGrouping.items(
+                from: contentBlocks,
+                collapseForeignRuns: collapse,
+                nativeLanguage: conversationPrimaryLanguage
+            )
+        }
         Self.renderItemsCache.setObject(RenderItemsBox(items), forKey: key)
         return items
     }
@@ -1094,14 +1136,28 @@ struct MessageBubbleView: View, Equatable {
         // MUST mirror the grouping decision `renderItems` makes, or
         // the per-block occurrence indices produced here will not line
         // up with `applyingSearchHighlight`'s render-time scan. Take
-        // the same path by routing through the profile-gated helper —
-        // including the conversation-level native language so the two
-        // views agree on which runs are foreign.
-        let items = ForeignLanguageGrouping.items(
-            from: parsed,
-            collapseForeignRuns: profile.collapsesForeignLanguageRuns,
-            nativeLanguage: nativeLanguage
-        )
+        // the same dispatch path the instance method takes:
+        // structural when the message has thinking blocks and the
+        // profile asks for it, language-heuristic otherwise.
+        let useStructured = profile.collapsesThinking
+            && (message.contentBlocks?.contains(where: {
+                if case .thinking = $0 { return true }
+                return false
+            }) ?? false)
+        let items: [MessageRenderItem]
+        if useStructured, let structured = message.contentBlocks {
+            items = StructuredBlockGrouper.group(
+                structured: structured,
+                flatContent: parsed,
+                profile: profile
+            )
+        } else {
+            items = ForeignLanguageGrouping.items(
+                from: parsed,
+                collapseForeignRuns: profile.collapsesForeignLanguageRuns,
+                nativeLanguage: nativeLanguage
+            )
+        }
         return items.enumerated().map { offset, item in
             let anchorID = searchBlockAnchorID(
                 messageID: message.id,
@@ -1121,6 +1177,15 @@ struct MessageBubbleView: View, Equatable {
             return searchText(for: block)
         case .foreignLanguageGroup(_, let blocks):
             return blocks.map(searchText(for:)).joined(separator: "\n")
+        case .thinkingGroup:
+            // Thinking is hidden by default and considered model-
+            // internal scratch text rather than user-facing prose.
+            // Returning empty keeps the find bar from landing
+            // matches inside a fold the user would have to expand
+            // to see — frustrating UX. If we ever want "search
+            // including thinking", make it an opt-in toggle in the
+            // search bar rather than the default.
+            return ""
         }
     }
 
