@@ -119,6 +119,12 @@ WHERE-clause assembly is centralized in `Database/SearchFilterSQL.swift` so the 
 - Never call synchronous GRDB methods from the main thread. Always use `async` wrappers.
 - Show `ProgressView` during loading. Show `ContentUnavailableView` for empty or error states.
 
+## Window Model
+- **Madini is single-window by design.** The main conversation surface (`WindowGroup` in `MadiniArchiveApp.swift`) is intended to run as exactly one window at a time. File > "New Window" / ⌘N is explicitly disabled via `CommandGroup(replacing: .newItem) { }` so the user cannot spawn additional main scenes.
+- **Why single-window:** the per-window isolation that SwiftUI's `WindowGroup` provides today is incidental — `AppServices`, `ArchiveEvents`, `IntakeService`, `IdentityPreferencesStore`, and `BodyTextSizePreference` are all held at the App level (single instance shared across windows), while `DesignMockRootView`'s `@State` / `@StateObject` happen to be per-window. The arrangement works, but only because nobody's hit a case where the assumed sharing pattern (single DB queue, single intake watcher, app-wide preferences) collides with the assumed isolation pattern (per-window selection, layout, search). Rather than maintain that boundary by accident — and rather than commit to per-window-isolating those services — we narrow the surface to one main window. This also matches the SwiftUI-migration decision to drop browser-tab-style multiplicity, and it lines up with the convention for archive viewers on macOS (Console.app, Disk Utility).
+- **Allowed exceptions:** the `Settings` Scene (⌘,) is a separate, system-managed window and is preserved. Ad-hoc helper windows constructed directly via `NSWindow(contentViewController:)` for one-off previews — currently `RawTranscriptImageView` (image gallery) and `TextPreviewWindow` (head-truncated text preview) — are also allowed; they are short-lived, read-only, and do not host the main conversation surface.
+- **Changing this policy requires real work, not just unbinding ⌘N.** If a future change wants multiple main windows, `AppServices` / `ArchiveEvents` / `IntakeService` need an explicit per-window-vs-app-wide review (which DB queue does each window own? does the intake watcher run once or per-window? do bookmark notifications cross windows?). Add a follow-up section to this rule before re-enabling `.newItem`.
+
 ## Do
 - Preserve original metadata before adding convenience transforms.
 - Keep body data, view state, cache state, and UI state in separate layers.

@@ -94,6 +94,17 @@ struct MadiniArchiveApp: App {
         #if os(macOS)
         .defaultSize(width: 1200, height: 800)
         .commands {
+            // Madini is single-window by design (see AGENTS.md "Window
+            // model"). SwiftUI's `WindowGroup` would otherwise auto-publish
+            // a File > "New Window" item bound to ⌘N, which would let the
+            // user spawn additional main scenes whose per-window
+            // isolation is currently incidental rather than designed.
+            // Replacing the `.newItem` command group with empty content
+            // removes the menu item and unbinds ⌘N. Settings (⌘,) is a
+            // separate Scene and is unaffected; ad-hoc helper windows
+            // opened directly via `NSWindow(...)` (see
+            // `RawTranscriptImageView`, `TextPreviewWindow`) also remain.
+            CommandGroup(replacing: .newItem) { }
             AppCommands(bodyTextSize: bodyTextSize)
         }
         #endif
