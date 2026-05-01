@@ -14,8 +14,11 @@ Package.resolved
 # Madini の実データは ~/Library/Application Support/Madini Archive/ に
 # 置かれる設計で、リポジトリには入らない。デバッグ用に誤ってコピー
 # した場合の事故防止として、ここで明示除外する。
+# SECURITY.md の "What counts as personal data" を参照。
 *.db
+*.db-journal
 *.sqlite
+*.sqlite3
 *.sqlite-journal
 *.sqlite-wal
 *.sqlite-shm
@@ -24,12 +27,46 @@ history.json
 themes.json
 custom.css
 
+# --- Credentials / env files ---
+# どんな名前でも .env / *.local 系はコミットしない。tracked にしたい
+# サンプル設定があれば `.env.example` のような明示名で別途追加する。
+.env
+.env.*
+*.local
+credentials.json
+*.pem
+*.key
+
+# --- Personal / private workspace dumps ---
+# 改造作業中に "ちょっと置きたい" 一時ファイル（実会話のサンプル、
+# personal メモ、プロファイル抽出など）の専用ディレクトリ。SECURITY.md
+# の合成データ原則に従い、リポジトリ追跡しない。
+scratch/
+.scratch/
+private/
+samples/private/
+
+# --- Personal / real-data filename conventions ---
+# SECURITY.md の "Pre-Public-Push Checklist" に従い、ファイル名で
+# 個人データ由来であることを示すプレフィックス / サフィックスを
+# つけて作業しているとき、それらが accidental に commit されないよう
+# にする。
+*_personal.*
+*_real.*
+tests/fixtures/real_*
+tests/fixtures/personal_*
+Python/tests/fixtures/real_*
+Python/tests/fixtures/personal_*
+
 # --- Python importer artefacts ---
 # Python core lives under `Python/` but its compiled cache and
 # packaging build outputs are not part of the source tree.
 __pycache__/
 *.pyc
 *.pyo
+.venv/
+venv/
+dist/
 Python/build/
 Python/dist/
 Python/*.egg-info/
