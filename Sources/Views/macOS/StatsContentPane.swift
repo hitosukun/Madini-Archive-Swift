@@ -34,21 +34,21 @@ enum StatsChartKind: String, CaseIterable, Identifiable, Hashable {
 
     var title: String {
         switch self {
-        case .sourceBreakdown: return "ソース別"
-        case .modelBreakdown: return "モデル別"
-        case .monthly: return "月別"
-        case .dailyHeatmap: return "日付別ヒートマップ"
-        case .hourWeekday: return "時刻 × 曜日ヒートマップ"
+        case .sourceBreakdown: return String(localized: "By Source")
+        case .modelBreakdown: return String(localized: "By Model")
+        case .monthly: return String(localized: "Monthly")
+        case .dailyHeatmap: return String(localized: "Daily Heatmap")
+        case .hourWeekday: return String(localized: "Hour × Weekday Heatmap")
         }
     }
 
     var compactSubtitle: String {
         switch self {
-        case .sourceBreakdown: return "会話数 (Markdown は除外)"
-        case .modelBreakdown:  return "上位 10 件 (空欄は \"Unknown\" に集約)"
-        case .monthly:         return "過去 24 ヶ月"
-        case .dailyHeatmap:    return "過去 90 日 (詳細で 365 日表示)"
-        case .hourWeekday:     return "プロンプト数 (会話の代表時刻)"
+        case .sourceBreakdown: return String(localized: "Conversations (Markdown excluded)")
+        case .modelBreakdown:  return String(localized: "Top 10 (blanks rolled into \"Unknown\")")
+        case .monthly:         return String(localized: "Last 24 months")
+        case .dailyHeatmap:    return String(localized: "Last 90 days (detail shows 365 days)")
+        case .hourWeekday:     return String(localized: "Prompt count (representative time of conversation)")
         }
     }
 }
@@ -92,7 +92,7 @@ struct StatsContentPane: View {
     private var loadingState: some View {
         VStack(spacing: 12) {
             ProgressView()
-            Text("Stats を集計中…")
+            Text("Computing stats…")
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -100,7 +100,7 @@ struct StatsContentPane: View {
 
     private func errorState(message: String) -> some View {
         ContentUnavailableView(
-            "集計に失敗しました",
+            "Stats computation failed",
             systemImage: "exclamationmark.triangle",
             description: Text(message)
         )
@@ -108,9 +108,9 @@ struct StatsContentPane: View {
 
     private var emptyState: some View {
         ContentUnavailableView(
-            "集計対象がありません",
+            "No data to display",
             systemImage: "chart.bar.xaxis",
-            description: Text("現在のフィルタに該当する会話がありません。サイドバーや検索を変えて再度お試しください。")
+            description: Text("No conversations match the current filter. Adjust the sidebar or search and try again.")
         )
     }
 
@@ -151,7 +151,7 @@ struct StatsContentPane: View {
 
     private var monthlySeriesPicker: AnyView {
         AnyView(
-            Picker("系列", selection: $monthlySeriesMode) {
+            Picker("Series", selection: $monthlySeriesMode) {
                 ForEach(MonthlySeriesMode.allCases) { mode in
                     Text(mode.title).tag(mode)
                 }
@@ -222,9 +222,9 @@ struct StatsDetailPane: View {
 
     private var placeholder: some View {
         ContentUnavailableView(
-            "左のチャートを選択",
+            "Select a chart on the left",
             systemImage: "chart.bar.xaxis",
-            description: Text("中央のチャートをクリックすると、ここに拡大版が表示されます。")
+            description: Text("Click a chart in the middle pane to see an expanded version here.")
         )
     }
 
@@ -270,7 +270,7 @@ struct StatsDetailPane: View {
     }
 
     private var monthlySeriesPicker: some View {
-        Picker("系列", selection: $monthlySeriesMode) {
+        Picker("Series", selection: $monthlySeriesMode) {
             ForEach(MonthlySeriesMode.allCases) { mode in
                 Text(mode.title).tag(mode)
             }
@@ -306,8 +306,8 @@ private enum StatsCharts {
         let height = max(120, CGFloat(items.count) * rowHeight + 40)
         return Chart(items, id: \.label) { item in
             BarMark(
-                x: .value("件数", item.count),
-                y: .value("ソース", item.label)
+                x: .value(String(localized: "Count"), item.count),
+                y: .value(String(localized: "Source"), item.label)
             )
             .foregroundStyle(SourceAppearance.color(for: item.label))
             .annotation(position: .trailing) {
@@ -334,8 +334,8 @@ private enum StatsCharts {
         let height = max(120, CGFloat(items.count) * rowHeight + 40)
         return Chart(items, id: \.label) { item in
             BarMark(
-                x: .value("件数", item.count),
-                y: .value("モデル", item.label)
+                x: .value(String(localized: "Count"), item.count),
+                y: .value(String(localized: "Model"), item.label)
             )
             .foregroundStyle(SourceAppearance.color(forModel: item.label))
             .annotation(position: .trailing) {
@@ -355,7 +355,7 @@ private enum StatsCharts {
         let height: CGFloat = size == .compact ? 180 : 280
         return Chart(items, id: \.yearMonth) { item in
             BarMark(
-                x: .value("月", item.yearMonth),
+                x: .value(String(localized: "Month"), item.yearMonth),
                 y: .value(seriesMode.title, seriesMode.value(for: item))
             )
             .foregroundStyle(.tint)
@@ -373,10 +373,10 @@ private enum StatsCharts {
         let height: CGFloat = size == .compact ? 200 : 320
         return Chart(cells, id: \.self) { cell in
             RectangleMark(
-                x: .value("時刻", cell.hour),
-                y: .value("曜日", weekdayLabel(cell.weekday))
+                x: .value(String(localized: "Hour"), cell.hour),
+                y: .value(String(localized: "Weekday"), weekdayLabel(cell.weekday))
             )
-            .foregroundStyle(by: .value("件数", cell.count))
+            .foregroundStyle(by: .value(String(localized: "Count"), cell.count))
         }
         .chartXScale(domain: 0...23)
         .chartXAxis {
@@ -418,8 +418,8 @@ enum MonthlySeriesMode: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .conversations: return "会話数"
-        case .prompts: return "プロンプト数"
+        case .conversations: return String(localized: "Conversations")
+        case .prompts: return String(localized: "Prompts")
         }
     }
 
@@ -443,7 +443,7 @@ private struct DailyHeatmapView: View {
 
     var body: some View {
         if buckets.isEmpty {
-            Text("データなし")
+            Text("No data")
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
         } else {

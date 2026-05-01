@@ -9,7 +9,7 @@ struct SettingsRootView: View {
         TabView {
             IdentityPreferencesView()
                 .tabItem {
-                    Label("プロフィール", systemImage: "person.crop.circle")
+                    Label("Profile", systemImage: "person.crop.circle")
                 }
         }
         .frame(minWidth: 520, idealWidth: 560, minHeight: 420)
@@ -73,7 +73,7 @@ private struct IdentityProfileEditorSection: View {
                     Button {
                         isImportingImage = true
                     } label: {
-                        Label("画像を選択…", systemImage: "photo.on.rectangle.angled")
+                        Label("Choose image…", systemImage: "photo.on.rectangle.angled")
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
@@ -82,7 +82,7 @@ private struct IdentityProfileEditorSection: View {
                         Button(role: .destructive) {
                             identityPreferences.resetAvatar(for: role)
                         } label: {
-                            Label("デフォルトに戻す", systemImage: "arrow.uturn.backward")
+                            Label("Reset to default", systemImage: "arrow.uturn.backward")
                         }
                         .buttonStyle(.borderless)
                         .controlSize(.small)
@@ -106,7 +106,7 @@ private struct IdentityProfileEditorSection: View {
             }
         }
         .alert(
-            "画像を取り込めませんでした",
+            "Couldn’t import image",
             isPresented: Binding(
                 get: { importError != nil },
                 set: { if !$0 { importError = nil } }
@@ -139,7 +139,7 @@ private struct IdentityProfileEditorSection: View {
                 .font(.headline)
                 .contentShape(Rectangle())
                 .onTapGesture { beginNameEdit() }
-                .help("クリックして名前を変更")
+                .help("Click to rename")
         }
     }
 
@@ -193,12 +193,12 @@ private struct IdentityProfileEditorSection: View {
 
     private var avatarSubtitle: String {
         if isCustomAvatar {
-            return "カスタム画像"
+            return String(localized: "Custom image")
         }
         if let defaultAvatar = profile.avatar.defaultAvatar {
-            return "デフォルト (\(defaultAvatar.displayName))"
+            return String(localized: "Default (\(defaultAvatar.displayName))")
         }
-        return "デフォルト"
+        return String(localized: "Default")
     }
 
     private var previewPresentation: MessageIdentityPresentation {
@@ -262,7 +262,7 @@ private struct AvatarDropTarget: View {
         }
         .buttonStyle(.plain)
         .onHover { isHovering = $0 }
-        .help("クリックまたは画像をドロップしてアイコンを変更")
+        .help("Click or drop an image to change the icon")
         .dropDestination(for: URL.self) { urls, _ in
             guard let url = urls.first else { return false }
             onDropFile(url)

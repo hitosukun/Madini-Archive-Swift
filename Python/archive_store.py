@@ -426,7 +426,7 @@ def register_conversation(
     except sqlite3.IntegrityError:
         return False
     except sqlite3.DatabaseError as exc:
-        print(f"⚠️ DBエラー: {exc}")
+        print(f"⚠️ DB error: {exc}")
         return False
 
 
@@ -1230,7 +1230,7 @@ def _build_filter_history_label(filters):
     if models:
         parts.append(f"model={'+'.join(models)}")
     if filters.get("dateFrom") or filters.get("dateTo"):
-        parts.append(f"{filters.get('dateFrom') or '...'}〜{filters.get('dateTo') or '...'}")
+        parts.append(f"{filters.get('dateFrom') or '...'}–{filters.get('dateTo') or '...'}")
     if filters.get("titleContains"):
         parts.append(f"title={filters['titleContains']}")
     if filters.get("promptContains"):
@@ -1251,7 +1251,7 @@ def _build_filter_history_label(filters):
         parts.append("without starred prompt")
 
     if not parts:
-        return "すべての会話"
+        return "All conversations"
     if len(parts) > 4:
         return ", ".join(parts[:4]) + f" +{len(parts) - 4}"
     return ", ".join(parts)
@@ -2642,7 +2642,7 @@ def _build_virtual_thread_title(filters):
         parts.append(f"model={'+'.join(models)}")
     bookmark_tags = _normalize_filter_values(filters.get("bookmarkTags"))
     if date_from or date_to:
-        parts.append(f"{date_from or '...'}〜{date_to or '...'}")
+        parts.append(f"{date_from or '...'}–{date_to or '...'}")
     if title_contains:
         parts.append(f"title={title_contains}")
     if prompt_contains:
@@ -3188,7 +3188,7 @@ def build_virtual_thread(filters, db_file=DB_FILE):
         response = row["response"] or ""
         if prompt and response:
             role_label = "mixed"
-            body = f"【Prompt】\n{prompt}\n\n【Response】\n{response}"
+            body = f"[Prompt]\n{prompt}\n\n[Response]\n{response}"
         elif prompt:
             role_label = "user"
             body = prompt

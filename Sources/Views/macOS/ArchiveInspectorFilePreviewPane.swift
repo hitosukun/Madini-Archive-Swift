@@ -63,7 +63,7 @@ struct ArchiveInspectorFilePreviewPane: View {
             Image(systemName: "doc.text.magnifyingglass")
                 .font(.system(size: 28))
                 .foregroundStyle(.tertiary)
-            Text("ファイルを選択するとここに表示されます。")
+            Text("Select a file to preview it here.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
         }
@@ -94,7 +94,7 @@ private struct PreviewHost: View {
             case .failed(let message):
                 placeholder(
                     systemImage: "xmark.octagon",
-                    title: "読み込みに失敗しました",
+                    title: String(localized: "Failed to load"),
                     detail: message
                 )
             case .image(let image):
@@ -104,7 +104,7 @@ private struct PreviewHost: View {
             case .binary(let reason):
                 placeholder(
                     systemImage: "doc.badge.gearshape",
-                    title: "プレビュー非対応のファイル",
+                    title: String(localized: "File type not previewable"),
                     detail: reason
                 )
             }
@@ -156,7 +156,7 @@ private struct PreviewHost: View {
                     state = .image(image)
                     return
                 }
-                state = .failed("画像としてデコードできませんでした。")
+                state = .failed(String(localized: "Couldn’t decode as image."))
                 return
             }
             // Fall back: load the raw bytes directly through the
@@ -168,7 +168,7 @@ private struct PreviewHost: View {
             if let image = NSImage(data: bytes) {
                 state = .image(image)
             } else {
-                state = .failed("画像としてデコードできませんでした。")
+                state = .failed(String(localized: "Couldn’t decode as image."))
             }
         } catch {
             state = .failed(String(describing: error))
@@ -201,7 +201,7 @@ private struct PreviewHost: View {
                 )
             case .binary:
                 state = .binary(
-                    "UTF-8 として読めないバイト列です（\(formatBytes(fullByteCount))）。「外部で開く」から既定のアプリで開いてください。"
+                    String(localized: "Bytes don’t decode as UTF-8 (\(formatBytes(fullByteCount))). Use “Open Externally” to open it in the default app.")
                 )
             }
         } catch {
@@ -308,19 +308,19 @@ private struct ImagePreviewBody: View {
             Button {
                 copyImage()
             } label: {
-                Label("コピー", systemImage: "doc.on.doc")
+                Label("Copy", systemImage: "doc.on.doc")
             }
             .controlSize(.small)
             Button {
                 saveImage()
             } label: {
-                Label("保存", systemImage: "square.and.arrow.down")
+                Label("Save", systemImage: "square.and.arrow.down")
             }
             .controlSize(.small)
             Button {
                 openInWindow()
             } label: {
-                Label("別ウィンドウで開く", systemImage: "macwindow")
+                Label("Open in New Window", systemImage: "macwindow")
             }
             .controlSize(.small)
         }
@@ -412,25 +412,25 @@ private struct TextPreviewBody: View {
             Button {
                 copyText()
             } label: {
-                Label("テキストをコピー", systemImage: "doc.on.doc")
+                Label("Copy Text", systemImage: "doc.on.doc")
             }
             .controlSize(.small)
             Button {
                 saveFile()
             } label: {
-                Label("保存", systemImage: "square.and.arrow.down")
+                Label("Save", systemImage: "square.and.arrow.down")
             }
             .controlSize(.small)
             Button {
                 openExternally()
             } label: {
-                Label("外部で開く", systemImage: "arrow.up.forward.app")
+                Label("Open Externally", systemImage: "arrow.up.forward.app")
             }
             .controlSize(.small)
             Button {
                 openInWindow()
             } label: {
-                Label("別ウィンドウで開く", systemImage: "macwindow")
+                Label("Open in New Window", systemImage: "macwindow")
             }
             .controlSize(.small)
         }
@@ -443,7 +443,7 @@ private struct TextPreviewBody: View {
         HStack(spacing: 8) {
             Image(systemName: "scissors")
                 .foregroundStyle(.secondary)
-            Text("先頭 \(Self.formatBytes(TextPreviewWindow.previewByteCap)) のみ表示しています（全体 \(Self.formatBytes(loaded.fullByteCount))）。続きは「外部で開く」から。")
+            Text("Showing only the first \(Self.formatBytes(TextPreviewWindow.previewByteCap)) (total \(Self.formatBytes(loaded.fullByteCount))). Use “Open Externally” to see the rest.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Spacer(minLength: 0)

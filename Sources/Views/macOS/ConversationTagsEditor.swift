@@ -72,7 +72,7 @@ struct ConversationTagsEditor: View {
                 .foregroundStyle(.secondary)
 
             if attached.isEmpty {
-                Text("タグを追加")
+                Text("Add tags")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -183,10 +183,10 @@ private struct TagCheckboxList: View {
                     Image(systemName: "tag")
                         .font(.title3)
                         .foregroundStyle(.tertiary)
-                    Text("タグがありません")
+                    Text("No tags yet")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    Text("下の欄から新しいタグを追加できます")
+                    Text("Add a new tag in the field below")
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                         .multilineTextAlignment(.center)
@@ -221,7 +221,7 @@ private struct TagCheckboxList: View {
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.secondary)
 
-                    TextField("新しいタグ", text: $draftName)
+                    TextField("New tag", text: $draftName)
                         .textFieldStyle(.plain)
                         .font(.caption)
                         .onSubmit(submit)
@@ -239,7 +239,7 @@ private struct TagCheckboxList: View {
                 )
 
                 if !trimmedDraft.isEmpty {
-                    Button("追加", action: submit)
+                    Button("Add", action: submit)
                         .buttonStyle(.borderless)
                         .controlSize(.small)
                 }

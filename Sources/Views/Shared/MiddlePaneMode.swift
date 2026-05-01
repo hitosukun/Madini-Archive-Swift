@@ -53,14 +53,17 @@ enum MiddlePaneMode: String, CaseIterable, Identifiable, Hashable {
 
     var id: String { rawValue }
 
-    /// Japanese label shown as the tooltip on the toolbar picker.
+    /// Localized label shown as the tooltip on the toolbar picker.
+    /// Uses `String(localized:)` so the surrounding AppKit / SwiftUI
+    /// API call sites that expect a plain `String` (NSToolTip,
+    /// `accessibilityDescription`, etc.) get the right per-locale form.
     var displayName: String {
         switch self {
-        case .table: return "テーブル"
-        case .default: return "デフォルト"
-        case .viewer: return "ビューアー"
-        case .focus: return "フォーカス"
-        case .stats: return "ダッシュボード"
+        case .table: return String(localized: "Table")
+        case .default: return String(localized: "Default")
+        case .viewer: return String(localized: "Viewer")
+        case .focus: return String(localized: "Focus")
+        case .stats: return String(localized: "Dashboard")
         }
     }
 

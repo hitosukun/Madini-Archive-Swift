@@ -830,7 +830,7 @@ struct MessageBubbleView: View, Equatable {
         HStack(spacing: 8) {
             ProgressView()
                 .controlSize(.small)
-            Text("画像を読み込み中…")
+            Text("Loading image…")
                 .font(.system(size: Layout.bodyFontSize - 2))
                 .foregroundStyle(.secondary)
         }
@@ -865,16 +865,16 @@ struct MessageBubbleView: View, Equatable {
             switch reason {
             case .unfetchableScheme(let scheme):
                 if let scheme, scheme == "sandbox" {
-                    return "サンドボックス内の画像（生の書き出しビューでのみ表示）"
+                    return String(localized: "Sandboxed image (visible only in the raw export view)")
                 }
                 if let scheme {
-                    return "\(scheme): スキームの画像は表示できません"
+                    return String(localized: "Can’t display images with the \(scheme): scheme")
                 }
-                return "画像の場所を解決できません"
+                return String(localized: "Can’t resolve image location")
             case .loadFailed:
-                return "画像を読み込めませんでした"
+                return String(localized: "Couldn’t load image")
             case .unknown:
-                return "画像を表示できません"
+                return String(localized: "Can’t display image")
             }
         }()
 

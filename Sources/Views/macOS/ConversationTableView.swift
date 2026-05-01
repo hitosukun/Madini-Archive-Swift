@@ -129,7 +129,7 @@ struct ConversationTableView: View {
             // the workspace level is enough.
             .contextMenu(forSelectionType: String.self) { ids in
                 if let id = ids.first {
-                    Button("開く") { openConversation(id: id) }
+                    Button("Open") { openConversation(id: id) }
                 }
             } primaryAction: { ids in
                 // Double-click (or Enter) fires the primaryAction closure.
@@ -270,22 +270,22 @@ struct ConversationTableView: View {
 
     @TableColumnBuilder<Row, KeyPathComparator<Row>>
     private var tableColumns: some TableColumnContent<Row, KeyPathComparator<Row>> {
-        TableColumn("タイトル", value: \Row.title) { (row: Row) in
+        TableColumn("Title", value: \Row.title) { (row: Row) in
             TitleCell(row: row)
         }
         .width(min: 200, ideal: 360)
 
-        TableColumn("日付", value: \Row.dateSortKey) { (row: Row) in
+        TableColumn("Date", value: \Row.dateSortKey) { (row: Row) in
             DateCell(row: row)
         }
         .width(min: 110, ideal: 160, max: 220)
 
-        TableColumn("モデル", value: \Row.model) { (row: Row) in
+        TableColumn("Model", value: \Row.model) { (row: Row) in
             ModelCell(row: row)
         }
         .width(min: 80, ideal: 140, max: 220)
 
-        TableColumn("プロンプト数", value: \Row.promptCount) { (row: Row) in
+        TableColumn("Prompts", value: \Row.promptCount) { (row: Row) in
             PromptCountCell(row: row)
         }
         .width(min: 80, ideal: 100, max: 140)

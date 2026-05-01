@@ -726,7 +726,7 @@ def parse_gemini_export(data):
                 {
                     "conv_id": f"gemini_{date_key}",
                     "source": "gemini",
-                    "title": f"Geminiの記録 ({date_key})",
+                    "title": f"Gemini log ({date_key})",
                     "model": conversation_model,
                     "source_created_at": min(message_timestamps) if message_timestamps else None,
                     "messages": messages,
@@ -775,13 +775,13 @@ def import_files(paths):
         except Exception as exc:
             cursor.execute("ROLLBACK TO SAVEPOINT import_file")
             cursor.execute("RELEASE SAVEPOINT import_file")
-            print(f"⚠️ 解析失敗: {path.name} ({exc})")
+            print(f"⚠️ Parse failed: {path.name} ({exc})")
             continue
 
         if not conversations:
             cursor.execute("ROLLBACK TO SAVEPOINT import_file")
             cursor.execute("RELEASE SAVEPOINT import_file")
-            print(f"💡 取り込み対象が見つからなかったわ: {path.name}")
+            print(f"💡 Nothing to import in: {path.name}")
             continue
 
         try:
@@ -829,7 +829,7 @@ def import_files(paths):
         except Exception as exc:
             cursor.execute("ROLLBACK TO SAVEPOINT import_file")
             cursor.execute("RELEASE SAVEPOINT import_file")
-            print(f"⚠️ 保存失敗: {path.name} ({exc})")
+            print(f"⚠️ Save failed: {path.name} ({exc})")
             continue
 
         cursor.execute("RELEASE SAVEPOINT import_file")
@@ -839,12 +839,12 @@ def import_files(paths):
 
     if imported_count > 0:
         save_history(imported_paths)
-        print(f"✨ 新しく {imported_count} 個の物語を登録したわ！")
+        print(f"✨ Imported {imported_count} new conversation(s).")
     elif provenance_updated_count > 0:
         save_history(imported_paths)
-        print(f"✨ 新規登録はなかったけれど、{provenance_updated_count} 件の provenance を更新したわ。")
+        print(f"✨ No new conversations, but updated provenance for {provenance_updated_count} record(s).")
     else:
-        print("💡 登録できる新しい物語がなかったわ。（すでに登録済みのデータよ）")
+        print("💡 No new conversations to import (already vaulted).")
 
 
 def main(jpaths):
@@ -860,7 +860,7 @@ def backfill_models_from_paths(paths=None):
             merged_paths.append(path)
     existing_paths = [path for path in merged_paths if path.exists()]
     if not existing_paths:
-        print("💡 model を埋め直せる元ログが見つからなかったわ。")
+        print("💡 No source logs found to backfill model from.")
         return 0
 
     conn = init_db()
@@ -871,7 +871,7 @@ def backfill_models_from_paths(paths=None):
         try:
             conversations = parse_input_file(path)
         except Exception as exc:
-            print(f"⚠️ 再解析失敗: {path.name} ({exc})")
+            print(f"⚠️ Re-parse failed: {path.name} ({exc})")
             continue
 
         for conv in conversations:
@@ -890,7 +890,7 @@ def backfill_models_from_paths(paths=None):
 
     conn.commit()
     conn.close()
-    print(f"✨ model / source file を {updated_count} 件更新したわ。")
+    print(f"✨ Updated model / source file for {updated_count} record(s).")
     return updated_count
 
 

@@ -2401,7 +2401,7 @@ struct DesignMockRootView: View {
     /// the ⌘F floating bar in the reader), so this stays constant —
     /// no layout-mode flip back to "このスレッド内を検索" any more.
     private var searchPrompt: String {
-        return "ライブラリを検索"
+        return String(localized: "Search the library")
     }
 
     /// Free-text portion of the toolbar query (DSL directives like
@@ -2452,7 +2452,7 @@ struct DesignMockRootView: View {
             ContentUnavailableView(
                 "Wikis is coming soon",
                 systemImage: "books.vertical",
-                description: Text("M.Wiki 連携の入口になります。今は placeholder です。")
+                description: Text("This will be the entry point for M.Wiki integration. Placeholder for now.")
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
@@ -4528,7 +4528,7 @@ private struct FindInPageNavStrip: View {
                 .foregroundStyle(.secondary)
                 .font(.callout)
 
-            TextField("スレッド内を検索", text: $text)
+            TextField("Search within thread", text: $text)
                 .textFieldStyle(.plain)
                 .focused($fieldFocused)
                 .frame(minWidth: 180)
@@ -4543,7 +4543,7 @@ private struct FindInPageNavStrip: View {
                 if text.trimmingCharacters(in: .whitespaces).isEmpty {
                     EmptyView()
                 } else if matchCount == 0 {
-                    Text("一致なし")
+                    Text("No matches")
                 } else {
                     Text("\(currentIndex + 1) / \(matchCount)")
                         .monospacedDigit()
@@ -4558,7 +4558,7 @@ private struct FindInPageNavStrip: View {
             .buttonStyle(.borderless)
             .disabled(matchCount == 0)
             .keyboardShortcut("g", modifiers: [.command, .shift])
-            .help("前の一致（⇧⌘G）")
+            .help("Previous match (⇧⌘G)")
 
             Button(action: onNext) {
                 Image(systemName: "chevron.down")
@@ -4566,7 +4566,7 @@ private struct FindInPageNavStrip: View {
             .buttonStyle(.borderless)
             .disabled(matchCount == 0)
             .keyboardShortcut("g", modifiers: .command)
-            .help("次の一致（⌘G）")
+            .help("Next match (⌘G)")
 
             if let onClose {
                 Divider().frame(height: 14)
@@ -4576,7 +4576,7 @@ private struct FindInPageNavStrip: View {
                 }
                 .buttonStyle(.borderless)
                 .keyboardShortcut(.escape, modifiers: [])
-                .help("閉じる（Esc）")
+                .help("Close (Esc)")
             } else {
                 Divider().frame(height: 14)
                 Button {
@@ -4586,7 +4586,7 @@ private struct FindInPageNavStrip: View {
                         .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.borderless)
-                .help("検索文字列をクリア")
+                .help("Clear search text")
             }
         }
         .padding(.horizontal, 10)

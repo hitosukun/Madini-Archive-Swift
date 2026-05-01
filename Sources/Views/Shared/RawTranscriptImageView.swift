@@ -118,7 +118,7 @@ struct RawTranscriptImageView: View {
                             vault: vault
                         )
                     }
-                    .help("クリックで拡大表示")
+                    .help("Click to enlarge")
             }
         }
         .task(id: taskKey) {
@@ -590,19 +590,19 @@ private struct ImageActionButtons: View {
         Button {
             ImageActions.copyToPasteboard(image: resolved.image)
         } label: {
-            Label("画像をコピー", systemImage: "doc.on.doc")
+            Label("Copy Image", systemImage: "doc.on.doc")
         }
 
         Button {
             Task { await ImageActions.saveToFile(resolved: resolved, vault: vault) }
         } label: {
-            Label("画像を保存…", systemImage: "square.and.arrow.down")
+            Label("Save Image…", systemImage: "square.and.arrow.down")
         }
 
         Button {
             Task { await ImageActions.share(resolved: resolved, vault: vault) }
         } label: {
-            Label("共有…", systemImage: "square.and.arrow.up")
+            Label("Share…", systemImage: "square.and.arrow.up")
         }
     }
 }
@@ -652,7 +652,7 @@ enum ImageActions {
             let bytes = try await vault.loadBlob(hash: resolved.blobHash)
             try bytes.write(to: url, options: .atomic)
         } catch {
-            presentError(title: "保存に失敗しました", error: error)
+            presentError(title: String(localized: "Save failed"), error: error)
         }
         #endif
     }
@@ -679,7 +679,7 @@ enum ImageActions {
             )
             presentSharingPicker(url: url)
         } catch {
-            presentError(title: "共有に失敗しました", error: error)
+            presentError(title: String(localized: "Share failed"), error: error)
         }
         #endif
     }
@@ -920,7 +920,7 @@ enum ImagePreviewWindow {
         if let firstRef = references.first {
             window.title = (firstRef.reference as NSString).lastPathComponent
         } else {
-            window.title = "画像プレビュー"
+            window.title = String(localized: "Image Preview")
         }
 
         let observer = NotificationCenter.default.addObserver(
@@ -1013,7 +1013,7 @@ final class ImagePreviewToolbarCoordinator: NSObject, NSToolbarDelegate {
         case Self.copyID:
             return makeItem(
                 identifier: itemIdentifier,
-                label: "画像をコピー",
+                label: String(localized: "Copy Image"),
                 symbol: "doc.on.doc",
                 action: #selector(copyTapped),
                 buttonKey: \.copyButton
@@ -1021,7 +1021,7 @@ final class ImagePreviewToolbarCoordinator: NSObject, NSToolbarDelegate {
         case Self.saveID:
             return makeItem(
                 identifier: itemIdentifier,
-                label: "画像を保存",
+                label: String(localized: "Save Image"),
                 symbol: "square.and.arrow.down",
                 action: #selector(saveTapped),
                 buttonKey: \.saveButton
@@ -1029,7 +1029,7 @@ final class ImagePreviewToolbarCoordinator: NSObject, NSToolbarDelegate {
         case Self.shareID:
             return makeItem(
                 identifier: itemIdentifier,
-                label: "共有",
+                label: String(localized: "Share"),
                 symbol: "square.and.arrow.up",
                 action: #selector(shareTapped),
                 buttonKey: \.shareButton

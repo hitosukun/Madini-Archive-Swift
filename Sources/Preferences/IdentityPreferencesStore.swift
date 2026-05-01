@@ -111,12 +111,12 @@ enum IdentityPreferenceRole: String, CaseIterable, Identifiable, Sendable {
 
     var id: String { rawValue }
 
-    var sectionTitle: String {
+    var sectionTitle: LocalizedStringKey {
         switch self {
         case .user:
-            return "ユーザー"
+            return "User"
         case .assistant:
-            return "アシスタント"
+            return "Assistant"
         }
     }
 
