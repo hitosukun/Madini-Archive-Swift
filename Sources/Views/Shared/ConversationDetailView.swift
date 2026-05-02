@@ -1627,8 +1627,8 @@ enum LLMPromptClipboard {
 /// full-screen modal, not a submenu, so the nesting issue doesn't
 /// apply, and `NSSavePanel` doesn't exist.
 ///
-/// "LLM プロンプトとしてコピー" skips the file round-trip and writes
-/// the plain-text form straight to the pasteboard.
+/// "Copy" skips the file round-trip and writes the plain-text form
+/// straight to the pasteboard.
 @ViewBuilder
 func conversationShareMenuItems(
     detail: ConversationDetail?,
@@ -1687,8 +1687,14 @@ func conversationShareMenuItems(
         Button {
             LLMPromptClipboard.copy(detail)
         } label: {
-            Label("Copy as LLM prompt",
+            Label("Copy",
                   systemImage: "doc.on.clipboard")
+        }
+        Button {
+            PromptListClipboard.copy(detail)
+        } label: {
+            Label("Copy prompts only",
+                  systemImage: "list.number")
         }
     } else {
         // No conversation selected — show a single disabled row so

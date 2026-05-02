@@ -265,6 +265,17 @@
         }
       }
     },
+    "Copy prompts only": {
+      "extractionState": "manual",
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "プロンプトのみコピー"
+          }
+        }
+      }
+    },
     "Copy Image": {
       "extractionState": "manual",
       "localizations": {
@@ -283,17 +294,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "テキストをコピー"
-          }
-        }
-      }
-    },
-    "Copy as LLM prompt": {
-      "extractionState": "manual",
-      "localizations": {
-        "ja": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "LLM プロンプトとしてコピー"
           }
         }
       }
