@@ -70,6 +70,37 @@ diff /tmp/before.txt /tmp/after.txt && echo "vault unchanged"
 `testIndexingDoesNotModifyVault` および `testManualExternalVaultIsReadOnly`
 が同じ保証を XCTest 側で行っている。
 
+## Intake folder と TCC の干渉
+
+開発中に「"書類" フォルダ内のファイルへのアクセス権を求められています」
+ダイアログが起動毎に出る場合、原因は Wiki ではなく既存の **auto-intake watcher**
+が `~/Documents/Madini Archive Intake/` を監視していることが多い。
+
+切り分け: vault の場所を `/tmp/` に動かしても prompt が消えなければ intake が原因。
+
+### 開発時の対処
+
+Intake folder を TCC 監視外 (`/tmp/`) に向ける。Archive Inspector の
+"Drop folder" セクションで Change folder... ボタンから設定するか、CLI で:
+
+```bash
+mkdir -p /tmp/madini-intake
+defaults write com.madini.archive IntakeLocationStore.customDirectoryPath /tmp/madini-intake
+```
+
+戻す:
+
+```bash
+defaults delete com.madini.archive IntakeLocationStore.customDirectoryPath
+```
+
+### 配布時
+
+本番環境では intake folder は `~/Documents` のままが正解 (ユーザーに見える
+Finder のドロップゾーンとして機能させたいため、`IntakePaths.swift` のコメント
+参照)。配布版は ad-hoc 署名ではなく Developer ID で署名するため、TCC は
+1 度承認すれば永続する。
+
 ## URL scheme
 
 `madini-archive://` 受信ハンドラは Phase A で実装済み。Phase C (Obsidian
