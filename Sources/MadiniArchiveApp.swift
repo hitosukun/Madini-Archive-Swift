@@ -174,10 +174,18 @@ struct MadiniArchiveApp: App {
         #endif
 
         #if os(macOS)
+        Window("Wikis", id: "wiki-browser") {
+            WikiBrowserView()
+                .environmentObject(services)
+                .frame(minWidth: 720, minHeight: 480)
+        }
+        .defaultSize(width: 1100, height: 720)
+
         Settings {
             SettingsRootView()
                 .environment(identityPreferences)
                 .environment(archiveEvents)
+                .environmentObject(services)
         }
         // The standalone Vault Browser window scene and its ⌘⌥V menu
         // binding have been retired. Everything that surface used to
@@ -571,5 +579,26 @@ struct AppCommands: Commands {
             .keyboardShortcut(.delete, modifiers: .command)
             .disabled(shell?.deleteSelectedSnapshot == nil)
         }
+
+        // Wikis menu — open the dedicated browser window for registered
+        // Obsidian vaults. Vault registration itself lives in Settings →
+        // Wiki Vaults so it sits next to other persistent app config.
+        CommandMenu("Wikis") {
+            WikiBrowserMenuButton()
+        }
+    }
+}
+
+/// Tiny SwiftUI shim so we can call `openWindow` from inside a Commands
+/// builder. `Commands` is a result-builder context that doesn't see the
+/// `@Environment` keypath directly, so we wrap the button in a View.
+private struct WikiBrowserMenuButton: View {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Button("Open Wiki Browser") {
+            openWindow(id: "wiki-browser")
+        }
+        .keyboardShortcut("w", modifiers: [.command, .shift])
     }
 }

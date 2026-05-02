@@ -46,6 +46,9 @@ packages:
   SwiftMath:
     url: https://github.com/mgriebling/SwiftMath.git
     from: 1.7.0
+  MarkdownUI:
+    url: https://github.com/gonzalezreal/swift-markdown-ui
+    from: 2.4.0
 
 targets:
   Madini Archive:
@@ -80,6 +83,8 @@ targets:
         product: GRDB
       - package: SwiftMath
         product: SwiftMath
+      - package: MarkdownUI
+        product: MarkdownUI
     # Use the hand-authored Info.plist verbatim — DON'T let xcodegen
     # generate a fresh one (which `info.path` would do and overwrite
     # the authored version). `INFOPLIST_FILE` tells xcodebuild where

@@ -11,6 +11,10 @@ struct SettingsRootView: View {
                 .tabItem {
                     Label("Profile", systemImage: "person.crop.circle")
                 }
+            WikiVaultsSettingsView()
+                .tabItem {
+                    Label("Wiki Vaults", systemImage: "books.vertical")
+                }
         }
         .frame(minWidth: 520, idealWidth: 560, minHeight: 420)
     }
