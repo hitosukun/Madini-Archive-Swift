@@ -5,4 +5,5 @@ struct Wikilink: Hashable, Sendable {
     let display: String?
     let heading: String?
     let blockRef: String?
+    let isEmbed: Bool
 }
