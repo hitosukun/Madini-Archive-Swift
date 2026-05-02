@@ -287,17 +287,6 @@
         }
       }
     },
-    "Copy as LLM prompt": {
-      "extractionState": "manual",
-      "localizations": {
-        "ja": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "LLM プロンプトとしてコピー"
-          }
-        }
-      }
-    },
     "Couldn’t decode as image.": {
       "extractionState": "manual",
       "localizations": {
