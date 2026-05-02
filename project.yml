@@ -87,7 +87,25 @@ targets:
     settings:
       base:
         PRODUCT_NAME: Madini Archive
+        PRODUCT_MODULE_NAME: MadiniArchive
         PRODUCT_BUNDLE_IDENTIFIER: com.madini.archive
         INFOPLIST_FILE: App/Support/Info.plist
         GENERATE_INFOPLIST_FILE: NO
         MACOSX_DEPLOYMENT_TARGET: "14.0"
+
+  MadiniArchiveTests:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: Tests/MadiniArchiveTests
+    dependencies:
+      - target: Madini Archive
+      - package: GRDB
+        product: GRDB
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.madini.archive.tests
+        GENERATE_INFOPLIST_FILE: YES
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Madini Archive.app/Contents/MacOS/Madini Archive"
