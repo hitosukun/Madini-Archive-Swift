@@ -36,6 +36,25 @@ final class WikiBrowserViewModel {
         self.services = services
     }
 
+    /// Handle a `madini-archive://wiki/<vaultID>/<path>` deeplink. Loads
+    /// the requested vault if not already loaded, then selects the
+    /// page. Failures (vault missing, page missing) are surfaced via
+    /// `errorMessage`.
+    func handleDeeplink(vaultID: String, relativePath: String) async {
+        if vaults.isEmpty { await reloadVaults() }
+        guard vaults.contains(where: { $0.id == vaultID }) else {
+            errorMessage = "Vault \(vaultID) is not registered."
+            return
+        }
+        if selectedVaultID != vaultID {
+            await selectVault(id: vaultID)
+        }
+        await selectPage(path: relativePath)
+        if currentPage == nil {
+            errorMessage = "Page \(relativePath) not found in this vault."
+        }
+    }
+
     // MARK: - Vault list
 
     func reloadVaults() async {

@@ -58,5 +58,16 @@ struct WikiBrowserView: View {
             viewModel = vm
             await vm.reloadVaults()
         }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: MadiniURLHandler.didRequestWikiPage
+            )
+        ) { note in
+            guard let info = note.userInfo,
+                  let vaultID = info["vaultID"] as? String,
+                  let relativePath = info["relativePath"] as? String,
+                  let vm = viewModel else { return }
+            Task { await vm.handleDeeplink(vaultID: vaultID, relativePath: relativePath) }
+        }
     }
 }

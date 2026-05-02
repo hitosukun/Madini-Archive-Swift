@@ -121,6 +121,7 @@ struct MadiniArchiveApp: App {
                 .task {
                     services.startIntake()
                 }
+                .modifier(MadiniURLOpenHandler(services: services))
                 #endif
         }
         #if os(macOS)
@@ -602,3 +603,28 @@ private struct WikiBrowserMenuButton: View {
         .keyboardShortcut("w", modifiers: [.command, .shift])
     }
 }
+
+#if os(macOS)
+/// Wires `madini-archive://` URLs from `scene.onOpenURL` through to
+/// `MadiniURLHandler`. Lives as a `ViewModifier` so the handler can
+/// hold the SwiftUI `openWindow` action — handlers can't be vended
+/// from `App.body` directly because `@Environment` only resolves
+/// inside views.
+private struct MadiniURLOpenHandler: ViewModifier {
+    let services: AppServices
+    @Environment(\.openWindow) private var openWindow
+
+    func body(content: Content) -> some View {
+        content.onOpenURL { url in
+            // Build the handler lazily on first invocation; reusing
+            // it across calls is fine because it's stateless apart
+            // from references it captures.
+            let handler = MadiniURLHandler(
+                services: services,
+                openWindow: { id in openWindow(id: id) }
+            )
+            handler.handle(url)
+        }
+    }
+}
+#endif
