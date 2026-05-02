@@ -168,29 +168,34 @@ final class PromptListExporterTests: XCTestCase {
         XCTAssertFalse(out.contains("2."))
     }
 
-    // MARK: - Truncation
+    // MARK: - Full-line preservation
 
-    func testShortPromptNotTruncated() {
+    func testShortPromptPreserved() {
         let d = detail(messages: [msg(.user, String(repeating: "a", count: 80))])
         let out = PromptListExporter.export(d)
         XCTAssertTrue(out.contains("1. " + String(repeating: "a", count: 80) + "\n"))
         XCTAssertFalse(out.contains("…"))
     }
 
-    func testLongPromptTruncatedWithEllipsis() {
-        let long = String(repeating: "a", count: 100)
+    /// Long prompts are emitted in full — earlier revisions truncated
+    /// at 80 chars with `…`, but losing the tail discarded too much
+    /// context for prompts whose gist landed past the cutoff.
+    func testLongPromptIsNotTruncated() {
+        let long = String(repeating: "a", count: 200)
         let d = detail(messages: [msg(.user, long)])
         let out = PromptListExporter.export(d)
-        XCTAssertTrue(out.contains("1. " + String(repeating: "a", count: 80) + "…"))
+        XCTAssertTrue(out.contains("1. " + long + "\n"))
+        XCTAssertFalse(out.contains("…"))
     }
 
-    /// firstLineSummary applies the truncation to the *first line*, not
-    /// the joined multi-line content.
-    func testTruncationAppliesAfterLineSplit() {
-        let body = String(repeating: "x", count: 100) + "\nignored line"
+    /// The first-line cut still applies — only content before `\n`
+    /// is emitted, regardless of how long that first line is.
+    func testFirstLineCutAppliesRegardlessOfLength() {
+        let firstLine = String(repeating: "x", count: 200)
+        let body = firstLine + "\nignored line"
         let d = detail(messages: [msg(.user, body)])
         let out = PromptListExporter.export(d)
-        XCTAssertTrue(out.contains("1. " + String(repeating: "x", count: 80) + "…\n"))
+        XCTAssertTrue(out.contains("1. " + firstLine + "\n"))
         XCTAssertFalse(out.contains("ignored"))
     }
 
