@@ -21,6 +21,7 @@ final class AppServices: ObservableObject {
     let views: any ViewService
     let stats: any StatsRepository
     let wikiVaults: any WikiVaultRepository
+    let wikiIndexCoordinator: WikiIndexCoordinator
     let dataSource: DataSource
 
     enum DataSource {
@@ -98,6 +99,7 @@ final class AppServices: ObservableObject {
         views: any ViewService,
         stats: any StatsRepository,
         wikiVaults: any WikiVaultRepository,
+        wikiIndexCoordinator: WikiIndexCoordinator,
         dataSource: DataSource
     ) {
         self.conversations = conversations
@@ -114,6 +116,7 @@ final class AppServices: ObservableObject {
         self.views = views
         self.stats = stats
         self.wikiVaults = wikiVaults
+        self.wikiIndexCoordinator = wikiIndexCoordinator
         self.dataSource = dataSource
     }
 
@@ -150,6 +153,7 @@ final class AppServices: ObservableObject {
                     views: GRDBViewService(dbQueue: dbQueue),
                     stats: GRDBStatsRepository(dbQueue: dbQueue),
                     wikiVaults: GRDBWikiVaultRepository(dbQueue: dbQueue),
+                    wikiIndexCoordinator: WikiIndexCoordinator(),
                     dataSource: .database(path: dbPath)
                 )
                 return
@@ -176,6 +180,7 @@ final class AppServices: ObservableObject {
             views: MockViewService(),
             stats: MockStatsRepository(),
             wikiVaults: MockWikiVaultRepository(),
+            wikiIndexCoordinator: WikiIndexCoordinator(),
             dataSource: .mock
         )
     }
