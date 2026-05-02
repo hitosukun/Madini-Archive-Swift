@@ -6,24 +6,32 @@ import AppKit
 import UIKit
 #endif
 
-/// Renders a conversation as a numbered list of just its user prompts —
-/// one line per prompt, truncated to a single line so the user can scan
-/// what a thread is "about" without rereading the whole exchange.
+/// Renders a conversation as a numbered list of every user prompt's
+/// full text — one entry per prompt, multi-line content preserved so
+/// the user keeps the whole intent rather than just the opening
+/// sentence.
 ///
 /// Sibling to `MarkdownExporter` / `PlainTextExporter` (both defined in
 /// `ConversationDetailView.swift`). Lives in its own file because the
-/// share menu's two new exports — full thread vs prompts-only — have
-/// different audiences (humans skimming vs LLMs ingesting), and the
-/// implementations don't share enough to live in the same enum.
+/// share menu's two copy options have different audiences (full
+/// thread for LLMs ingesting, prompts-only for humans skimming what
+/// a thread "asked"), and the implementations don't share enough to
+/// live in the same enum.
 ///
 /// Output shape:
 ///
 ///     ## <title>
 ///     <date> / <source> / <model>
 ///
-///     1. <first user prompt's first line, ≤80 chars>
-///     2. <next prompt's first line>
+///     1. <first user prompt, full text including any line breaks>
+///
+///     2. <next prompt, full text>
+///
 ///     ...
+///
+/// Each numbered entry is followed by a blank line so adjacent
+/// multi-line prompts don't visually run into each other when pasted
+/// into a chat box or a markdown editor.
 ///
 /// Rules:
 /// - Title falls back to "(無題)" when `summary.title` is nil/empty.
@@ -31,13 +39,11 @@ import UIKit
 ///   so a row with only a date renders as `<date>` (no leading slash).
 /// - System / assistant / tool messages are skipped; only `role == .user`
 ///   contributes a numbered entry.
-/// - Each user message contributes its **first line** (anything before
-///   the first `\n`), trimmed of surrounding whitespace. The full
-///   first line is preserved — long prompts produce long lines, and
-///   the user can wrap the result in their pasting target as they
-///   see fit. Earlier revisions truncated to 80 characters; that
-///   discarded too much context for prompts where the gist landed
-///   past the cutoff.
+/// - Each user message contributes its **full content**, trimmed only
+///   of surrounding whitespace. Internal line breaks are preserved.
+///   Earlier revisions kept just the first line and (briefly) also
+///   truncated to 80 characters; both behaviors discarded too much
+///   prompt content.
 /// - Empty user messages (post-trim) are dropped — they'd otherwise
 ///   produce numbered rows with no content.
 enum PromptListExporter {
@@ -65,27 +71,24 @@ enum PromptListExporter {
 
         lines.append("") // blank line between header and prompt list
 
-        // Numbered user prompts
+        // Numbered user prompts (full content, blank-line separated)
         var index = 1
         for message in detail.messages where message.isUser {
-            let line = firstLineSummary(of: message.content)
-            guard !line.isEmpty else { continue }
-            lines.append("\(index). \(line)")
+            let content = message.content
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !content.isEmpty else { continue }
+            lines.append("\(index). \(content)")
+            lines.append("") // blank line between adjacent prompts
             index += 1
         }
 
-        return lines.joined(separator: "\n") + "\n"
-    }
+        // Drop the trailing blank line so the output ends with one
+        // newline, not two.
+        while lines.last == "" {
+            lines.removeLast()
+        }
 
-    /// Take the first line of a multi-line message and trim its
-    /// surrounding whitespace. Returns the empty string for content
-    /// that's all whitespace. The line is returned in full —
-    /// truncation is the caller's responsibility.
-    static func firstLineSummary(of content: String) -> String {
-        let firstLine = content
-            .split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
-            .first.map(String.init) ?? ""
-        return firstLine.trimmingCharacters(in: .whitespacesAndNewlines)
+        return lines.joined(separator: "\n") + "\n"
     }
 }
 
