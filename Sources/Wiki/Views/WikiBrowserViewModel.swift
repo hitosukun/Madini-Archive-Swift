@@ -153,27 +153,11 @@ final class WikiBrowserViewModel {
         }
     }
 
-    /// Resolve a `[[wikilink]]` target to a page in the current vault by
-    /// prefix-matching the path's filename portion (Obsidian semantics).
-    /// Returns the matched relative path if any.
+    /// Resolve a `[[wikilink]]` target to a page in the current vault.
+    /// See `WikilinkResolver.resolve` for the match precedence — exact
+    /// path → filename → title → suffix `_<target>` → token → prefix.
     func resolveWikilink(target: String) -> String? {
-        let lowered = target.lowercased()
-        // Exact path match first (e.g. `notes/sub/page` from a literal link).
-        if let direct = pages.first(where: {
-            $0.path.lowercased() == "\(lowered).md" ||
-            $0.path.lowercased() == lowered
-        }) {
-            return direct.path
-        }
-        // Otherwise prefix-match the filename without extension.
-        let match = pages.first { page in
-            let filename = (page.path as NSString).lastPathComponent
-            let stem = filename.hasSuffix(".md")
-                ? String(filename.dropLast(3))
-                : filename
-            return stem.lowercased().hasPrefix(lowered)
-        }
-        return match?.path
+        WikilinkResolver.resolve(target: target, in: pages)
     }
 
     /// Navigate to a wikilink target within the current vault. No-op if
