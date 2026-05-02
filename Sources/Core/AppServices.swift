@@ -180,7 +180,7 @@ final class AppServices: ObservableObject {
         )
     }
 
-    static func bootstrapViewLayerSchema(dbQueue: DatabaseQueue) throws {
+    nonisolated static func bootstrapViewLayerSchema(dbQueue: DatabaseQueue) throws {
         try dbQueue.write { db in
             try db.execute(sql: """
                 CREATE TABLE IF NOT EXISTS saved_filters (
@@ -643,7 +643,7 @@ final class AppServices: ObservableObject {
         }
     }
 
-    private static func schemaBootstrapTimestamp() -> String {
+    nonisolated private static func schemaBootstrapTimestamp() -> String {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"

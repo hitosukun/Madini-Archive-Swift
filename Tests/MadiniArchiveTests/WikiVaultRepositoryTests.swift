@@ -15,6 +15,25 @@ final class WikiVaultRepositoryTests: XCTestCase {
 
         let dbURL = base.appendingPathComponent("archive.db")
         dbQueue = try DatabaseQueue(path: dbURL.path)
+        // Stub the conversations table that the Python importer would
+        // normally create. Migration 3 creates indexes against it.
+        try dbQueue.write { db in
+            try db.execute(sql: """
+                CREATE TABLE IF NOT EXISTS conversations (
+                    id TEXT PRIMARY KEY,
+                    source TEXT,
+                    model TEXT,
+                    source_file TEXT,
+                    title TEXT,
+                    date_str TEXT,
+                    prompt_count INTEGER,
+                    hash TEXT UNIQUE,
+                    raw_source_id INTEGER,
+                    source_created_at TEXT,
+                    imported_at TEXT
+                )
+                """)
+        }
         try AppServices.bootstrapViewLayerSchema(dbQueue: dbQueue)
         repo = GRDBWikiVaultRepository(dbQueue: dbQueue)
     }

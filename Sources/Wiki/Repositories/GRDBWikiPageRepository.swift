@@ -76,9 +76,9 @@ final class GRDBWikiPageRepository: WikiPageRepository, @unchecked Sendable {
                 SELECT
                     p.id, p.vault_id, p.path, p.title, p.last_modified,
                     snippet(wiki_pages_fts, 1, '<b>', '</b>', '…', 32) AS snippet
-                FROM wiki_pages_fts fts
-                JOIN wiki_pages p ON p.id = fts.rowid
-                WHERE fts MATCH ?
+                FROM wiki_pages_fts
+                JOIN wiki_pages p ON p.id = wiki_pages_fts.rowid
+                WHERE wiki_pages_fts MATCH ?
                   AND p.vault_id = ?
                 ORDER BY rank
                 LIMIT ? OFFSET ?

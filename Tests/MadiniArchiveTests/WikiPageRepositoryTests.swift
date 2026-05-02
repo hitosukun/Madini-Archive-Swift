@@ -117,11 +117,13 @@ final class WikiPageRepositoryTests: XCTestCase {
     }
 
     func testCount() async throws {
-        XCTAssertEqual(try await repo.count(vaultID: vaultID), 0)
+        let initial = try await repo.count(vaultID: vaultID)
+        XCTAssertEqual(initial, 0)
 
         try await repo.upsertPage(makePage(path: "a.md"))
         try await repo.upsertPage(makePage(path: "b.md"))
-        XCTAssertEqual(try await repo.count(vaultID: vaultID), 2)
+        let final = try await repo.count(vaultID: vaultID)
+        XCTAssertEqual(final, 2)
     }
 
     // MARK: - Search (FTS5)
@@ -147,10 +149,12 @@ final class WikiPageRepositoryTests: XCTestCase {
 
     func testDeletePage() async throws {
         try await repo.upsertPage(makePage(path: "delete-me.md", body: "Temporary"))
-        XCTAssertEqual(try await repo.count(vaultID: vaultID), 1)
+        let beforeCount = try await repo.count(vaultID: vaultID)
+        XCTAssertEqual(beforeCount, 1)
 
         try await repo.deletePage(vaultID: vaultID, path: "delete-me.md")
-        XCTAssertEqual(try await repo.count(vaultID: vaultID), 0)
+        let afterCount = try await repo.count(vaultID: vaultID)
+        XCTAssertEqual(afterCount, 0)
 
         let fetched = try await repo.fetchPageByPath(vaultID: vaultID, path: "delete-me.md")
         XCTAssertNil(fetched)
@@ -160,10 +164,12 @@ final class WikiPageRepositoryTests: XCTestCase {
         try await repo.upsertPage(makePage(path: "a.md"))
         try await repo.upsertPage(makePage(path: "b.md"))
         try await repo.upsertPage(makePage(path: "c.md"))
-        XCTAssertEqual(try await repo.count(vaultID: vaultID), 3)
+        let beforeCount = try await repo.count(vaultID: vaultID)
+        XCTAssertEqual(beforeCount, 3)
 
         try await repo.deleteAllPages(vaultID: vaultID)
-        XCTAssertEqual(try await repo.count(vaultID: vaultID), 0)
+        let afterCount = try await repo.count(vaultID: vaultID)
+        XCTAssertEqual(afterCount, 0)
     }
 
     func testFTSSyncOnDelete() async throws {
