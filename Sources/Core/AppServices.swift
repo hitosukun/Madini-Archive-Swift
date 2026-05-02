@@ -22,6 +22,7 @@ final class AppServices: ObservableObject {
     let stats: any StatsRepository
     let wikiVaults: any WikiVaultRepository
     let wikiIndexCoordinator: WikiIndexCoordinator
+    let wikiVaultAccessor: WikiVaultAccessor
     let dataSource: DataSource
 
     enum DataSource {
@@ -100,6 +101,7 @@ final class AppServices: ObservableObject {
         stats: any StatsRepository,
         wikiVaults: any WikiVaultRepository,
         wikiIndexCoordinator: WikiIndexCoordinator,
+        wikiVaultAccessor: WikiVaultAccessor,
         dataSource: DataSource
     ) {
         self.conversations = conversations
@@ -117,6 +119,7 @@ final class AppServices: ObservableObject {
         self.stats = stats
         self.wikiVaults = wikiVaults
         self.wikiIndexCoordinator = wikiIndexCoordinator
+        self.wikiVaultAccessor = wikiVaultAccessor
         self.dataSource = dataSource
     }
 
@@ -133,6 +136,7 @@ final class AppServices: ObservableObject {
                 let projectMemberships = GRDBProjectMembershipRepository(dbQueue: dbQueue)
                 let projectSuggestions = GRDBProjectSuggestionRepository(dbQueue: dbQueue)
                 let vault = GRDBRawExportVault(dbQueue: dbQueue)
+                let wikiVaultRepo = GRDBWikiVaultRepository(dbQueue: dbQueue)
                 self.init(
                     conversations: conversations,
                     search: GRDBSearchRepository(dbQueue: dbQueue),
@@ -152,8 +156,9 @@ final class AppServices: ObservableObject {
                     tags: GRDBTagRepository(dbQueue: dbQueue),
                     views: GRDBViewService(dbQueue: dbQueue),
                     stats: GRDBStatsRepository(dbQueue: dbQueue),
-                    wikiVaults: GRDBWikiVaultRepository(dbQueue: dbQueue),
+                    wikiVaults: wikiVaultRepo,
                     wikiIndexCoordinator: WikiIndexCoordinator(),
+                    wikiVaultAccessor: WikiVaultAccessor(vaultRepository: wikiVaultRepo),
                     dataSource: .database(path: dbPath)
                 )
                 return
@@ -163,6 +168,7 @@ final class AppServices: ObservableObject {
         }
 
         let conversationRepository = MockConversationRepository()
+        let mockWikiVaults = MockWikiVaultRepository()
         self.init(
             conversations: conversationRepository,
             search: MockSearchRepository(
@@ -179,8 +185,9 @@ final class AppServices: ObservableObject {
             tags: MockTagRepository(),
             views: MockViewService(),
             stats: MockStatsRepository(),
-            wikiVaults: MockWikiVaultRepository(),
+            wikiVaults: mockWikiVaults,
             wikiIndexCoordinator: WikiIndexCoordinator(),
+            wikiVaultAccessor: WikiVaultAccessor(vaultRepository: mockWikiVaults),
             dataSource: .mock
         )
     }

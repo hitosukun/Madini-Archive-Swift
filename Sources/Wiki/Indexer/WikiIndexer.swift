@@ -21,15 +21,23 @@ struct WikiIndexer: Sendable {
 
     /// Scan the vault, parse every `.md` file, and reconcile the index.
     /// Pages that exist in the cache but not on disk are removed.
-    func indexVault(_ vault: WikiVault) async throws -> IndexStats {
-        let vaultURL = URL(fileURLWithPath: vault.path)
-        let mdFiles = try Self.listMarkdownFiles(in: vaultURL)
+    ///
+    /// `vaultURL` defaults to `vault.path`, which works fine when sandbox
+    /// is off. With a security-scoped bookmark it is the caller's job
+    /// (typically `WikiVaultAccessor`) to start scoped access first
+    /// and pass the resolved URL here, otherwise TCC will keep prompting
+    /// across launches.
+    func indexVault(
+        _ vault: WikiVault, vaultURL: URL? = nil
+    ) async throws -> IndexStats {
+        let resolvedURL = vaultURL ?? URL(fileURLWithPath: vault.path)
+        let mdFiles = try Self.listMarkdownFiles(in: resolvedURL)
 
         var stats = IndexStats()
         var seenRelativePaths = Set<String>()
 
         for fileURL in mdFiles {
-            let relativePath = Self.relativePath(of: fileURL, base: vaultURL)
+            let relativePath = Self.relativePath(of: fileURL, base: resolvedURL)
             seenRelativePaths.insert(relativePath)
             do {
                 try await indexFile(

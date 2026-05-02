@@ -39,5 +39,11 @@
     <string>NSApplication</string>
     <key>NSHumanReadableCopyright</key>
     <string>© 2026 Madini Archive</string>
+    <key>NSDocumentsFolderUsageDescription</key>
+    <string>Madini Archive reads Obsidian vaults you choose so you can browse them inside the app. Read-only — vault files are never modified.</string>
+    <key>NSDesktopFolderUsageDescription</key>
+    <string>Madini Archive reads Obsidian vaults you choose so you can browse them inside the app. Read-only — vault files are never modified.</string>
+    <key>NSDownloadsFolderUsageDescription</key>
+    <string>Madini Archive reads Obsidian vaults you choose so you can browse them inside the app. Read-only — vault files are never modified.</string>
 </dict>
 </plist>

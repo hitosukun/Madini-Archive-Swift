@@ -35,6 +35,14 @@ final class WikiBrowserViewModel {
     func reloadVaults() async {
         do {
             vaults = try await services.wikiVaults.listVaults(offset: 0, limit: 1000)
+            // Open security-scoped access for every registered vault on
+            // load so subsequent file reads (indexing, embed rendering)
+            // happen under the bookmark TCC has already approved.
+            // Without this the user sees a Documents-folder prompt on
+            // every launch.
+            for vault in vaults {
+                _ = await services.wikiVaultAccessor.openVault(vault)
+            }
         } catch {
             errorMessage = "Failed to load vaults: \(error.localizedDescription)"
         }
@@ -69,6 +77,7 @@ final class WikiBrowserViewModel {
         do {
             try await services.wikiVaults.unregisterVault(id: vault.id)
             services.wikiIndexCoordinator.forgetVault(id: vault.id)
+            services.wikiVaultAccessor.closeVault(id: vault.id)
             if selectedVaultID == vault.id {
                 selectedVaultID = nil
                 pages = []
@@ -84,8 +93,9 @@ final class WikiBrowserViewModel {
         indexingMessage = "Indexing \(vault.name)…"
         defer { indexingMessage = nil }
         do {
+            let vaultURL = await services.wikiVaultAccessor.openVault(vault)
             let indexer = try services.wikiIndexCoordinator.indexer(for: vault)
-            let stats = try await indexer.indexVault(vault)
+            let stats = try await indexer.indexVault(vault, vaultURL: vaultURL)
             try await services.wikiVaults.updateLastIndexedAt(
                 vaultID: vault.id,
                 timestamp: TimestampFormatter.now()
