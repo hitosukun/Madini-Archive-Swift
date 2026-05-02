@@ -2438,23 +2438,23 @@ struct DesignMockRootView: View {
         return false
     }
 
-    /// Two-pane layout for the Wikis placeholder. Sidebar stays
-    /// user-controllable so the user can return via any other row;
-    /// the detail pane shows a `ContentUnavailableView` summarising
-    /// what Wikis will become. No content middle pane — when there's
-    /// nothing to scroll through, the chrome reads cleaner without
-    /// the third column.
+    /// Wiki browser layout. Sidebar stays user-controllable so the user
+    /// can return via any other row; the detail pane embeds the full
+    /// `WikiBrowserView` so registered vaults, the file tree, and the
+    /// rendered page sit inside the main window.
+    ///
+    /// Phase A wired this up after replacing the original
+    /// `ContentUnavailableView("Wikis is coming soon")` placeholder.
+    /// The same `WikiBrowserView` is also reachable as a standalone
+    /// window (⇧⌘W); both surfaces share `WikiBrowserViewModel` state
+    /// instantiated per-view, so opening the dedicated window doesn't
+    /// fight the embedded one.
     @ViewBuilder
     private var wikisPlaceholderSplit: some View {
         NavigationSplitView {
             sidebar
         } detail: {
-            ContentUnavailableView(
-                "Wikis is coming soon",
-                systemImage: "books.vertical",
-                description: Text("This will be the entry point for M.Wiki integration. Placeholder for now.")
-            )
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            WikiBrowserView()
         }
     }
 

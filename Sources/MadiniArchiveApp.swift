@@ -121,6 +121,7 @@ struct MadiniArchiveApp: App {
                 .task {
                     services.startIntake()
                 }
+                .modifier(MadiniURLOpenHandler(services: services))
                 #endif
         }
         #if os(macOS)
@@ -174,10 +175,18 @@ struct MadiniArchiveApp: App {
         #endif
 
         #if os(macOS)
+        Window("Wikis", id: "wiki-browser") {
+            WikiBrowserView()
+                .environmentObject(services)
+                .frame(minWidth: 720, minHeight: 480)
+        }
+        .defaultSize(width: 1100, height: 720)
+
         Settings {
             SettingsRootView()
                 .environment(identityPreferences)
                 .environment(archiveEvents)
+                .environmentObject(services)
         }
         // The standalone Vault Browser window scene and its ⌘⌥V menu
         // binding have been retired. Everything that surface used to
@@ -571,5 +580,51 @@ struct AppCommands: Commands {
             .keyboardShortcut(.delete, modifiers: .command)
             .disabled(shell?.deleteSelectedSnapshot == nil)
         }
+
+        // Wikis menu — open the dedicated browser window for registered
+        // Obsidian vaults. Vault registration itself lives in Settings →
+        // Wiki Vaults so it sits next to other persistent app config.
+        CommandMenu("Wikis") {
+            WikiBrowserMenuButton()
+        }
     }
 }
+
+/// Tiny SwiftUI shim so we can call `openWindow` from inside a Commands
+/// builder. `Commands` is a result-builder context that doesn't see the
+/// `@Environment` keypath directly, so we wrap the button in a View.
+private struct WikiBrowserMenuButton: View {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Button("Open Wiki Browser") {
+            openWindow(id: "wiki-browser")
+        }
+        .keyboardShortcut("w", modifiers: [.command, .shift])
+    }
+}
+
+#if os(macOS)
+/// Wires `madini-archive://` URLs from `scene.onOpenURL` through to
+/// `MadiniURLHandler`. Lives as a `ViewModifier` so the handler can
+/// hold the SwiftUI `openWindow` action — handlers can't be vended
+/// from `App.body` directly because `@Environment` only resolves
+/// inside views.
+private struct MadiniURLOpenHandler: ViewModifier {
+    let services: AppServices
+    @Environment(\.openWindow) private var openWindow
+
+    func body(content: Content) -> some View {
+        content.onOpenURL { url in
+            // Build the handler lazily on first invocation; reusing
+            // it across calls is fine because it's stateless apart
+            // from references it captures.
+            let handler = MadiniURLHandler(
+                services: services,
+                openWindow: { id in openWindow(id: id) }
+            )
+            handler.handle(url)
+        }
+    }
+}
+#endif

@@ -20,6 +20,9 @@ final class AppServices: ObservableObject {
     let tags: any TagRepository
     let views: any ViewService
     let stats: any StatsRepository
+    let wikiVaults: any WikiVaultRepository
+    let wikiIndexCoordinator: WikiIndexCoordinator
+    let wikiVaultAccessor: WikiVaultAccessor
     let dataSource: DataSource
 
     enum DataSource {
@@ -96,6 +99,9 @@ final class AppServices: ObservableObject {
         tags: any TagRepository,
         views: any ViewService,
         stats: any StatsRepository,
+        wikiVaults: any WikiVaultRepository,
+        wikiIndexCoordinator: WikiIndexCoordinator,
+        wikiVaultAccessor: WikiVaultAccessor,
         dataSource: DataSource
     ) {
         self.conversations = conversations
@@ -111,6 +117,9 @@ final class AppServices: ObservableObject {
         self.tags = tags
         self.views = views
         self.stats = stats
+        self.wikiVaults = wikiVaults
+        self.wikiIndexCoordinator = wikiIndexCoordinator
+        self.wikiVaultAccessor = wikiVaultAccessor
         self.dataSource = dataSource
     }
 
@@ -127,6 +136,7 @@ final class AppServices: ObservableObject {
                 let projectMemberships = GRDBProjectMembershipRepository(dbQueue: dbQueue)
                 let projectSuggestions = GRDBProjectSuggestionRepository(dbQueue: dbQueue)
                 let vault = GRDBRawExportVault(dbQueue: dbQueue)
+                let wikiVaultRepo = GRDBWikiVaultRepository(dbQueue: dbQueue)
                 self.init(
                     conversations: conversations,
                     search: GRDBSearchRepository(dbQueue: dbQueue),
@@ -146,6 +156,9 @@ final class AppServices: ObservableObject {
                     tags: GRDBTagRepository(dbQueue: dbQueue),
                     views: GRDBViewService(dbQueue: dbQueue),
                     stats: GRDBStatsRepository(dbQueue: dbQueue),
+                    wikiVaults: wikiVaultRepo,
+                    wikiIndexCoordinator: WikiIndexCoordinator(),
+                    wikiVaultAccessor: WikiVaultAccessor(vaultRepository: wikiVaultRepo),
                     dataSource: .database(path: dbPath)
                 )
                 return
@@ -155,6 +168,7 @@ final class AppServices: ObservableObject {
         }
 
         let conversationRepository = MockConversationRepository()
+        let mockWikiVaults = MockWikiVaultRepository()
         self.init(
             conversations: conversationRepository,
             search: MockSearchRepository(
@@ -171,11 +185,14 @@ final class AppServices: ObservableObject {
             tags: MockTagRepository(),
             views: MockViewService(),
             stats: MockStatsRepository(),
+            wikiVaults: mockWikiVaults,
+            wikiIndexCoordinator: WikiIndexCoordinator(),
+            wikiVaultAccessor: WikiVaultAccessor(vaultRepository: mockWikiVaults),
             dataSource: .mock
         )
     }
 
-    private static func bootstrapViewLayerSchema(dbQueue: DatabaseQueue) throws {
+    nonisolated static func bootstrapViewLayerSchema(dbQueue: DatabaseQueue) throws {
         try dbQueue.write { db in
             try db.execute(sql: """
                 CREATE TABLE IF NOT EXISTS saved_filters (
@@ -621,10 +638,24 @@ final class AppServices: ObservableObject {
                     """)
                 try db.execute(sql: "PRAGMA user_version = 3")
             }
+
+            if userVersion < 4 {
+                try db.execute(sql: """
+                    CREATE TABLE IF NOT EXISTS wiki_vaults (
+                        id TEXT PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        path TEXT NOT NULL UNIQUE,
+                        bookmark_data BLOB,
+                        created_at TEXT NOT NULL,
+                        last_indexed_at TEXT
+                    )
+                    """)
+                try db.execute(sql: "PRAGMA user_version = 4")
+            }
         }
     }
 
-    private static func schemaBootstrapTimestamp() -> String {
+    nonisolated private static func schemaBootstrapTimestamp() -> String {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"

@@ -690,6 +690,10 @@ private struct UnifiedLibrarySidebar: View {
                     archiveDataSourceRow
                 }
 
+                section(title: "Wikis") {
+                    WikisSidebarSection()
+                }
+
                 section(title: "Sources") {
                     ForEach(viewModel.sourceFacets) { source in
                         VStack(alignment: .leading, spacing: 6) {

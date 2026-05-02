@@ -28,6 +28,7 @@ enum AppPaths {
     static var rawExportsDir: URL { userDataDir.appendingPathComponent("raw_exports", isDirectory: true) }
     static var rawExportBlobsDir: URL { rawExportsDir.appendingPathComponent("blobs", isDirectory: true) }
     static var rawExportSnapshotsDir: URL { rawExportsDir.appendingPathComponent("snapshots", isDirectory: true) }
+    static var wikiIndexesDir: URL { userDataDir.appendingPathComponent("wiki_indexes", isDirectory: true) }
 
     // MARK: - 初期化
 
