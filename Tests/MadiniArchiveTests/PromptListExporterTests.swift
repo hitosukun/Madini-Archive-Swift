@@ -136,15 +136,22 @@ final class PromptListExporterTests: XCTestCase {
         XCTAssertFalse(out.contains("tool result"))
     }
 
-    // MARK: - Content normalization
+    // MARK: - Full-content preservation
 
-    func testFirstLineOfMultilinePromptIsUsed() {
+    func testMultilinePromptPreservedInFull() {
         let d = detail(messages: [
-            msg(.user, "first line\nsecond line\nthird"),
+            msg(.user, "first line\nsecond line\nthird line"),
         ])
         let out = PromptListExporter.export(d)
-        XCTAssertTrue(out.contains("1. first line"))
-        XCTAssertFalse(out.contains("second"))
+        XCTAssertTrue(out.contains("1. first line\nsecond line\nthird line"))
+    }
+
+    func testLongSingleLinePromptPreservedInFull() {
+        let long = String(repeating: "a", count: 200)
+        let d = detail(messages: [msg(.user, long)])
+        let out = PromptListExporter.export(d)
+        XCTAssertTrue(out.contains("1. " + long))
+        XCTAssertFalse(out.contains("…"))
     }
 
     func testLeadingTrailingWhitespaceTrimmed() {
@@ -162,41 +169,33 @@ final class PromptListExporterTests: XCTestCase {
             msg(.user, "real"),
         ])
         let out = PromptListExporter.export(d)
-        // Only one numbered entry survives, and it gets index 1
-        // (the indexer increments per emitted line, not per source row).
+        // Only one numbered entry survives, and it gets index 1 — the
+        // counter only advances when a row is emitted.
         XCTAssertTrue(out.contains("1. real"))
         XCTAssertFalse(out.contains("2."))
     }
 
-    // MARK: - Full-line preservation
+    // MARK: - Spacing between prompts
 
-    func testShortPromptPreserved() {
-        let d = detail(messages: [msg(.user, String(repeating: "a", count: 80))])
+    /// Adjacent prompts get a blank line between them so multi-line
+    /// content from one prompt doesn't visually merge into the next.
+    func testBlankLineSeparatesAdjacentPrompts() {
+        let d = detail(messages: [
+            msg(.user, "First"),
+            msg(.user, "Second"),
+        ])
         let out = PromptListExporter.export(d)
-        XCTAssertTrue(out.contains("1. " + String(repeating: "a", count: 80) + "\n"))
-        XCTAssertFalse(out.contains("…"))
+        XCTAssertTrue(out.contains("1. First\n\n2. Second"))
     }
 
-    /// Long prompts are emitted in full — earlier revisions truncated
-    /// at 80 chars with `…`, but losing the tail discarded too much
-    /// context for prompts whose gist landed past the cutoff.
-    func testLongPromptIsNotTruncated() {
-        let long = String(repeating: "a", count: 200)
-        let d = detail(messages: [msg(.user, long)])
+    /// The output ends with exactly one trailing newline (not a blank
+    /// line followed by a newline) so paste targets don't show
+    /// dangling whitespace at the end.
+    func testNoDanglingBlankLineAtEnd() {
+        let d = detail(messages: [msg(.user, "Only")])
         let out = PromptListExporter.export(d)
-        XCTAssertTrue(out.contains("1. " + long + "\n"))
-        XCTAssertFalse(out.contains("…"))
-    }
-
-    /// The first-line cut still applies — only content before `\n`
-    /// is emitted, regardless of how long that first line is.
-    func testFirstLineCutAppliesRegardlessOfLength() {
-        let firstLine = String(repeating: "x", count: 200)
-        let body = firstLine + "\nignored line"
-        let d = detail(messages: [msg(.user, body)])
-        let out = PromptListExporter.export(d)
-        XCTAssertTrue(out.contains("1. " + firstLine + "\n"))
-        XCTAssertFalse(out.contains("ignored"))
+        XCTAssertTrue(out.hasSuffix("1. Only\n"))
+        XCTAssertFalse(out.hasSuffix("\n\n"))
     }
 
     // MARK: - End-to-end shape
@@ -221,25 +220,14 @@ final class PromptListExporterTests: XCTestCase {
         2026-04-28 / chatgpt / gpt-5
 
         1. 世界各地に、動物の頭と人間の胴体というパターンの神とか精霊がいるのはなぜ
+
         2. 言語や文字の発達との関係は?
+
         3. 音が人間で意味が動物に対応する傾向があるということ?
+
         4. 人間の体が OS で動物の頭がアプリみたいな対応?
 
         """
         XCTAssertEqual(out, expected)
-    }
-
-    // MARK: - firstLineSummary unit checks
-
-    func testFirstLineSummaryEmptyContent() {
-        XCTAssertEqual(PromptListExporter.firstLineSummary(of: ""), "")
-        XCTAssertEqual(PromptListExporter.firstLineSummary(of: "   \n  "), "")
-    }
-
-    func testFirstLineSummaryNoNewline() {
-        XCTAssertEqual(
-            PromptListExporter.firstLineSummary(of: "hello"),
-            "hello"
-        )
     }
 }
