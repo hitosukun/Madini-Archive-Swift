@@ -34,23 +34,136 @@ struct WikiFileTreeView: View {
     }
 
     var body: some View {
-        if viewModel.pages.isEmpty {
+        VStack(spacing: 0) {
+            searchBar
+                .padding(.horizontal, 8)
+                .padding(.top, 8)
+                .padding(.bottom, 4)
+            Divider()
+            if viewModel.searchIsActive {
+                searchResultsList
+            } else if viewModel.pages.isEmpty {
+                ContentUnavailableView(
+                    "No pages",
+                    systemImage: "doc.text",
+                    description: Text("This vault has no markdown files yet, or it hasn't been indexed.")
+                )
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(visibleRows, id: \.node.id) { row in
+                            rowButton(row.node, depth: row.depth)
+                        }
+                    }
+                    .padding(.vertical, 4)
+                    .padding(.horizontal, 4)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var searchBar: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+            TextField(
+                "Search this vault…",
+                text: Binding(
+                    get: { viewModel.searchQuery },
+                    set: { newValue in
+                        viewModel.searchQuery = newValue
+                        Task { await viewModel.runSearch() }
+                    }
+                )
+            )
+            .textFieldStyle(.plain)
+            .help("Search vault content. Use `key:value` to filter by frontmatter (e.g. `type:chr`).")
+            if !viewModel.searchQuery.isEmpty {
+                Button {
+                    viewModel.clearSearch()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(Color.secondary.opacity(0.1))
+        .cornerRadius(6)
+    }
+
+    @ViewBuilder
+    private var searchResultsList: some View {
+        if viewModel.searchResults.isEmpty {
             ContentUnavailableView(
-                "No pages",
-                systemImage: "doc.text",
-                description: Text("This vault has no markdown files yet, or it hasn't been indexed.")
+                "No matches",
+                systemImage: "magnifyingglass",
+                description: Text("Try a different query or filter (e.g. `type:chr`).")
             )
         } else {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    ForEach(visibleRows, id: \.node.id) { row in
-                        rowButton(row.node, depth: row.depth)
+                    Text("\(viewModel.searchResults.count) result(s)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 10)
+                        .padding(.top, 6)
+                    ForEach(viewModel.searchResults) { result in
+                        searchResultRow(result)
                     }
                 }
                 .padding(.vertical, 4)
-                .padding(.horizontal, 4)
             }
         }
+    }
+
+    @ViewBuilder
+    private func searchResultRow(_ result: WikiPageSearchResult) -> some View {
+        Button {
+            Task { await viewModel.selectPage(path: result.path) }
+        } label: {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Image(systemName: "doc.text")
+                        .foregroundStyle(.primary)
+                    Text(result.title ?? result.path)
+                        .font(.callout.weight(.medium))
+                        .lineLimit(1)
+                }
+                Text(strippedSnippet(result.snippet))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                Text(result.path)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+            .background(
+                viewModel.selectedPagePath == result.path
+                    ? Color.accentColor.opacity(0.25)
+                    : Color.clear
+            )
+            .cornerRadius(4)
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 4)
+    }
+
+    /// Strip the FTS5 `<b>...</b>` markers — MarkdownUI is overkill for
+    /// a 2-line snippet and we don't render highlights yet.
+    private func strippedSnippet(_ snippet: String) -> String {
+        snippet
+            .replacingOccurrences(of: "<b>", with: "")
+            .replacingOccurrences(of: "</b>", with: "")
     }
 
     @ViewBuilder

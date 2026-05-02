@@ -22,6 +22,12 @@ final class WikiBrowserViewModel {
     var indexingMessage: String?
     var errorMessage: String?
 
+    /// Free-text search query. UI binds to this; setter is sync-only —
+    /// `runSearch()` performs the actual lookup.
+    var searchQuery: String = ""
+    var searchResults: [WikiPageSearchResult] = []
+    var searchIsActive: Bool = false
+
     // MARK: - Dependencies
 
     private let services: AppServices
@@ -172,5 +178,82 @@ final class WikiBrowserViewModel {
 
     var currentVault: WikiVault? {
         selectedVaultID.flatMap { id in vaults.first { $0.id == id } }
+    }
+
+    // MARK: - Search
+
+    /// Run the search using the current `searchQuery`. Empty query
+    /// clears any active result set.
+    func runSearch() async {
+        let parsed = WikiSearchQueryParser.parse(searchQuery)
+        guard !parsed.isEmpty else {
+            searchResults = []
+            searchIsActive = false
+            return
+        }
+        searchIsActive = true
+        guard let vaultID = selectedVaultID,
+              let vault = currentVault else {
+            searchResults = []
+            return
+        }
+        do {
+            let repo = try services.wikiIndexCoordinator.pageRepository(for: vault)
+            // Path 1: only frontmatter filters → in-memory filter against
+            // the already-loaded page list (no FTS hop).
+            // Path 2: FTS query (with or without filters) → run FTS first,
+            // then filter the hits.
+            let candidates: [WikiPage]
+            if parsed.hasFTS {
+                let hits = try await repo.searchPages(
+                    vaultID: vaultID,
+                    query: parsed.ftsQuery,
+                    offset: 0,
+                    limit: 200
+                )
+                let hitPaths = Set(hits.map(\.path))
+                let pagesByPath = Dictionary(uniqueKeysWithValues: pages.map { ($0.path, $0) })
+                candidates = hits.compactMap { pagesByPath[$0.path] }
+                searchResults = hits
+                    .filter { hit in
+                        guard let page = pagesByPath[hit.path] else { return false }
+                        return WikiSearchQueryParser.passesFilters(
+                            page, filters: parsed.frontmatterFilters
+                        )
+                    }
+                _ = hitPaths
+                _ = candidates
+            } else {
+                // Filter-only query: walk the in-memory page list.
+                searchResults = pages
+                    .filter {
+                        WikiSearchQueryParser.passesFilters(
+                            $0, filters: parsed.frontmatterFilters
+                        )
+                    }
+                    .map { page in
+                        WikiPageSearchResult(
+                            pageID: page.id, vaultID: page.vaultID,
+                            path: page.path, title: page.title,
+                            snippet: snippetForFilterOnly(page),
+                            lastModified: page.lastModified
+                        )
+                    }
+            }
+        } catch {
+            errorMessage = "Search failed: \(error.localizedDescription)"
+        }
+    }
+
+    func clearSearch() {
+        searchQuery = ""
+        searchResults = []
+        searchIsActive = false
+    }
+
+    private func snippetForFilterOnly(_ page: WikiPage) -> String {
+        let body = page.body
+        let prefix = body.prefix(120)
+        return String(prefix)
     }
 }
