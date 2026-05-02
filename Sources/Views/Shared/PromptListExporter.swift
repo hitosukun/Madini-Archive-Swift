@@ -32,16 +32,15 @@ import UIKit
 /// - System / assistant / tool messages are skipped; only `role == .user`
 ///   contributes a numbered entry.
 /// - Each user message contributes its **first line** (anything before
-///   the first `\n`), trimmed of surrounding whitespace.
-/// - Lines longer than `lineLimit` (80) are truncated with `…`.
+///   the first `\n`), trimmed of surrounding whitespace. The full
+///   first line is preserved — long prompts produce long lines, and
+///   the user can wrap the result in their pasting target as they
+///   see fit. Earlier revisions truncated to 80 characters; that
+///   discarded too much context for prompts where the gist landed
+///   past the cutoff.
 /// - Empty user messages (post-trim) are dropped — they'd otherwise
 ///   produce numbered rows with no content.
 enum PromptListExporter {
-    /// Maximum length of each numbered line before truncation. Counted
-    /// in Swift Character units (grapheme clusters), so emoji and
-    /// combining marks consume one slot regardless of UTF-16 length.
-    static let lineLimit = 80
-
     static func export(_ detail: ConversationDetail) -> String {
         var lines: [String] = []
 
@@ -78,17 +77,15 @@ enum PromptListExporter {
         return lines.joined(separator: "\n") + "\n"
     }
 
-    /// Take the first line of a multi-line message, trim whitespace,
-    /// and truncate to `lineLimit` characters with a trailing `…` if
-    /// shortened. Returns the empty string for content that's all
-    /// whitespace.
+    /// Take the first line of a multi-line message and trim its
+    /// surrounding whitespace. Returns the empty string for content
+    /// that's all whitespace. The line is returned in full —
+    /// truncation is the caller's responsibility.
     static func firstLineSummary(of content: String) -> String {
         let firstLine = content
             .split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
             .first.map(String.init) ?? ""
-        let trimmed = firstLine.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.count > lineLimit else { return trimmed }
-        return String(trimmed.prefix(lineLimit)) + "…"
+        return firstLine.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 
