@@ -265,6 +265,17 @@
         }
       }
     },
+    "Copy prompts only": {
+      "extractionState": "manual",
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "プロンプトのみコピー"
+          }
+        }
+      }
+    },
     "Copy Image": {
       "extractionState": "manual",
       "localizations": {

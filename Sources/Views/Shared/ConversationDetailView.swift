@@ -1690,6 +1690,12 @@ func conversationShareMenuItems(
             Label("Copy",
                   systemImage: "doc.on.clipboard")
         }
+        Button {
+            PromptListClipboard.copy(detail)
+        } label: {
+            Label("Copy prompts only",
+                  systemImage: "list.number")
+        }
     } else {
         // No conversation selected — show a single disabled row so
         // the menu isn't empty when the user opens it by accident.
