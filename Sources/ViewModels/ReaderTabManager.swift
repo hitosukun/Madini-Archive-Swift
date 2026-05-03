@@ -67,6 +67,23 @@ final class ReaderTabManager {
     /// pane list doesn't, so the cascade is broken.
     var selectedPromptID: String?
 
+    /// Multi-select state for Viewer Mode's "Copy selected conversation"
+    /// action. Independent from `selectedPromptID` — that field tracks
+    /// the reader's current scroll position (driven by the scroll
+    /// observer), whereas this set tracks deliberate user picks
+    /// (Shift / ⌘ clicks on the prompt directory). A row is highlighted
+    /// as "multi-selected" when it is in this set, regardless of whether
+    /// the reader happens to be parked on it. Cleared on tab switch via
+    /// `openConversation`.
+    var multiSelectedPromptIDs: Set<String> = []
+
+    /// Anchor row for Shift-click range selection. Bare clicks and ⌘
+    /// clicks update this; Shift clicks read it without modifying it so
+    /// the user's range-extension stays rooted at a stable origin
+    /// (Finder-style). `nil` means "no anchor yet" — a Shift click in
+    /// that state degenerates into a single-row select.
+    var multiSelectAnchorID: String?
+
     /// The freshly loaded `ConversationDetail` for whatever tab is active.
     /// Written by `ReaderWorkspaceView`'s `onDetailChanged` callback and
     /// read by the root-level Viewer-Mode toolbar (which needs the title
@@ -114,6 +131,10 @@ final class ReaderTabManager {
         // it here so switching tabs always starts "no current prompt"
         // until the scroll observer picks a fresh one.
         selectedPromptID = nil
+        // Multi-select + anchor are tied to the previous conversation's
+        // prompt ids; they'd be nonsense applied to the new outline.
+        multiSelectedPromptIDs = []
+        multiSelectAnchorID = nil
         // Clear outline + detail too — stale values would let prev/next
         // operate on the previous conversation's prompts for the frame
         // or two it takes the new detail to load.

@@ -1,4 +1,7 @@
 import SwiftUI
+#if canImport(AppKit)
+import AppKit
+#endif
 
 /// Middle-pane view that replaces the scrolling card list while the user
 /// is in Viewer Mode (toggled from the right-pane toolbar — see
@@ -80,22 +83,17 @@ struct ViewerModePane: View {
                             ViewerPromptRow(
                                 prompt: prompt,
                                 isAlternate: offset.isMultiple(of: 2),
-                                isSelected: prompt.id == tabManager.selectedPromptID,
-                                onSelect: {
-                                    // Fire the one-shot signal the reader
-                                    // pane is observing. If the reader is
-                                    // currently showing a different
-                                    // conversation, also ensure the
-                                    // viewer-tracked one is active.
-                                    if let summary = viewerSummary {
-                                        tabManager.openConversation(
-                                            id: summary.id,
-                                            title: summary.displayTitle
-                                        )
-                                    }
-                                    tabManager.requestPromptSelection(prompt.id)
+                                isSelected: isRowSelected(prompt),
+                                onTap: { modifiers in
+                                    handleRowTap(
+                                        promptID: prompt.id,
+                                        modifiers: modifiers
+                                    )
                                 }
                             )
+                            .contextMenu {
+                                contextMenuItems(for: prompt)
+                            }
                             // Scroll target id so `proxy.scrollTo(id)`
                             // below can bring this row into view.
                             .id(prompt.id)
@@ -149,6 +147,131 @@ struct ViewerModePane: View {
         }
         return viewModel.summary(for: viewModel.viewerConversationID)
     }
+
+    // MARK: - Selection logic
+
+    /// A row is rendered as "selected" under one of two conditions:
+    ///   1. Multi-select is active (any rows in the set) → membership in
+    ///      that set drives the highlight, and the reader's current
+    ///      scroll position is intentionally ignored. The user has just
+    ///      told us which rows they care about.
+    ///   2. Multi-select is empty → fall back to the legacy single-row
+    ///      "where is the reader parked" highlight.
+    private func isRowSelected(_ prompt: ConversationPromptOutlineItem) -> Bool {
+        if !tabManager.multiSelectedPromptIDs.isEmpty {
+            return tabManager.multiSelectedPromptIDs.contains(prompt.id)
+        }
+        return prompt.id == tabManager.selectedPromptID
+    }
+
+    /// Dispatch a row tap to the appropriate selection mutation based on
+    /// the keyboard modifiers held at click time. macOS Finder rules:
+    ///
+    ///   - **bare**: single-row select; clear any prior multi-select;
+    ///     update the anchor; scroll the reader to that prompt.
+    ///   - **⌘**: toggle one row in/out of the set; update the anchor.
+    ///     The reader scroll *is* fired so prev/next chips and the
+    ///     scroll-position observer stay in sync with the active row.
+    ///   - **shift**: range from anchor → clicked row, replacing the set.
+    ///     Anchor is *not* updated — extending the shift range from a
+    ///     stable origin is the canonical Finder feel.
+    ///   - **shift + ⌘**: range from anchor → clicked row, *unioned*
+    ///     into the existing set. Useful for adding a contiguous block
+    ///     to a non-contiguous selection.
+    private func handleRowTap(
+        promptID: String,
+        modifiers: ViewerPromptRow.TapModifiers
+    ) {
+        let orderedIDs = viewModel.viewerPromptOutline.map(\.id)
+
+        if modifiers.contains(.shift) {
+            let anchor = tabManager.multiSelectAnchorID ?? promptID
+            let range = idsInRange(
+                anchor: anchor,
+                target: promptID,
+                in: orderedIDs
+            )
+            if modifiers.contains(.command) {
+                tabManager.multiSelectedPromptIDs.formUnion(range)
+            } else {
+                tabManager.multiSelectedPromptIDs = range
+            }
+            tabManager.selectedPromptID = promptID
+            // Anchor stays put — that's the point of shift-extension.
+        } else if modifiers.contains(.command) {
+            if tabManager.multiSelectedPromptIDs.contains(promptID) {
+                tabManager.multiSelectedPromptIDs.remove(promptID)
+            } else {
+                tabManager.multiSelectedPromptIDs.insert(promptID)
+            }
+            tabManager.multiSelectAnchorID = promptID
+            tabManager.selectedPromptID = promptID
+            tabManager.requestPromptSelection(promptID)
+        } else {
+            // Bare click — restore the legacy single-row select +
+            // reader-jump behaviour, plus clear any leftover multi-select.
+            tabManager.multiSelectedPromptIDs = [promptID]
+            tabManager.multiSelectAnchorID = promptID
+            tabManager.selectedPromptID = promptID
+            if let summary = viewerSummary {
+                tabManager.openConversation(
+                    id: summary.id,
+                    title: summary.displayTitle
+                )
+            }
+            tabManager.requestPromptSelection(promptID)
+        }
+    }
+
+    /// Inclusive id range between two ids, ordered by their position in
+    /// `ordered`. Falls back to `[target]` if either id is missing
+    /// (defensive — shouldn't normally happen, but a stale anchor from a
+    /// previous outline shouldn't crash the click).
+    private func idsInRange(
+        anchor: String,
+        target: String,
+        in ordered: [String]
+    ) -> Set<String> {
+        guard let i = ordered.firstIndex(of: anchor),
+              let j = ordered.firstIndex(of: target) else {
+            return [target]
+        }
+        let lo = min(i, j)
+        let hi = max(i, j)
+        return Set(ordered[lo...hi])
+    }
+
+    // MARK: - Context menu
+
+    /// Build the right-click menu for a given row. Finder rule: if the
+    /// right-clicked row is part of the active multi-selection, the
+    /// action runs over the whole set; otherwise it runs over just that
+    /// one row (without disturbing the existing set state).
+    @ViewBuilder
+    private func contextMenuItems(
+        for prompt: ConversationPromptOutlineItem
+    ) -> some View {
+        Button {
+            copySelectedConversation(rightClickedID: prompt.id)
+        } label: {
+            Text("Copy selected conversation")
+        }
+        .disabled(viewModel.viewerDetail == nil)
+    }
+
+    private func copySelectedConversation(rightClickedID: String) {
+        guard let detail = viewModel.viewerDetail else { return }
+        let ids: Set<String>
+        if tabManager.multiSelectedPromptIDs.contains(rightClickedID) {
+            ids = tabManager.multiSelectedPromptIDs
+        } else {
+            ids = [rightClickedID]
+        }
+        SelectedConversationClipboard.copy(
+            detail: detail,
+            selectedPromptIDs: ids
+        )
+    }
 }
 
 /// One entry in the viewer pane's prompt directory listing. The
@@ -157,19 +280,34 @@ struct ViewerModePane: View {
 /// see which prompt the reader is currently parked on. Outside
 /// selection the row shows only hover feedback + alternating stripes.
 private struct ViewerPromptRow: View {
+    /// Modifier flags read at click time so the caller can route the tap
+    /// to the right selection-mutation branch (bare / ⌘ / shift /
+    /// shift+⌘). Captured via `NSApp.currentEvent` inside the Button
+    /// action because SwiftUI's `Button(action:)` itself doesn't surface
+    /// the event modifiers — the action closure is `() -> Void`. iOS
+    /// always sees the empty set; multi-select keyboard shortcuts are a
+    /// macOS-only affordance for now (see Sub-B spec §G — keyboard
+    /// shortcuts out of scope).
+    struct TapModifiers: OptionSet {
+        let rawValue: Int
+        static let shift = TapModifiers(rawValue: 1 << 0)
+        static let command = TapModifiers(rawValue: 1 << 1)
+    }
+
     let prompt: ConversationPromptOutlineItem
     let isAlternate: Bool
-    /// `true` when this row corresponds to the prompt the reader is
-    /// currently scrolled to. Drives the accent highlight + the right-
-    /// aligned checkmark so the user can glance at the middle pane and
-    /// see "where am I" without tracking the scroll position themselves.
+    /// `true` when this row should render with the selection tint —
+    /// either it's the prompt the reader is currently parked on, or the
+    /// user has explicitly multi-selected it. Resolution lives in the
+    /// parent (`ViewerModePane.isRowSelected(_:)`) so this struct stays
+    /// agnostic of the two highlight sources.
     let isSelected: Bool
-    let onSelect: () -> Void
+    let onTap: (TapModifiers) -> Void
 
     @State private var isHovering = false
 
     var body: some View {
-        Button(action: onSelect) {
+        Button(action: handleTap) {
             HStack(alignment: .top, spacing: 10) {
                 Text("\(prompt.index)")
                     .font(.caption.monospacedDigit())
@@ -197,6 +335,25 @@ private struct ViewerPromptRow: View {
         }
         .buttonStyle(.plain)
         .onHover { isHovering = $0 }
+    }
+
+    /// Read modifier flags off the AppKit event currently being
+    /// processed and forward them to the parent. `NSApp.currentEvent` is
+    /// the SwiftUI-Button-friendly version of "what was the user doing
+    /// when they clicked?" — `.gesture(TapGesture().modifiers(...))`
+    /// stacks would have to coexist with the Button's own tap recognizer
+    /// and the priority ordering between them is fragile across OS
+    /// versions. Reading modifierFlags inside the `() -> Void` action
+    /// closure avoids that whole problem.
+    private func handleTap() {
+        var mods: TapModifiers = []
+        #if canImport(AppKit)
+        if let flags = NSApp.currentEvent?.modifierFlags {
+            if flags.contains(.shift) { mods.insert(.shift) }
+            if flags.contains(.command) { mods.insert(.command) }
+        }
+        #endif
+        onTap(mods)
     }
 
     /// Layering: selection tint > hover tint > zebra stripe > clear.
