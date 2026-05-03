@@ -159,7 +159,19 @@ struct MacOSRootView: View {
             await libraryViewModel.reload()
         }
         .onChange(of: libraryViewModel.selectedConversationId) { _, conversationID in
-            guard let summary = libraryViewModel.summary(for: conversationID) else {
+            // Only auto-open the reader when the user is in a single-row
+            // selection. The Cmd/Shift multi-select path that the
+            // "Copy selected conversation" context menu depends on
+            // would otherwise race here: every time the user added a
+            // row to the set, `.first` would shift, this handler would
+            // fire, the reader would jump to a new conversation, and
+            // the multi-selection would visually collapse back to that
+            // one row. Gating on `count == 1` lets multi-select grow
+            // freely; the reader stays parked on whatever was open
+            // when the user started the multi-pick. A bare click later
+            // brings the set back to 1 and re-engages the auto-open.
+            guard libraryViewModel.selectedConversationIDs.count == 1,
+                  let summary = libraryViewModel.summary(for: conversationID) else {
                 return
             }
 
