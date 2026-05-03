@@ -1,5 +1,11 @@
 import Observation
 import SwiftUI
+#if canImport(AppKit)
+import AppKit
+#endif
+#if canImport(UIKit)
+import UIKit
+#endif
 
 @MainActor
 @Observable
@@ -594,6 +600,78 @@ final class LibraryViewModel {
         viewerConversationID = nil
         viewerDetail = nil
         viewerPromptOutline = []
+    }
+
+    // MARK: - Copy selected conversation(s) as Markdown
+    //
+    // Right-click action on the middle-pane card list. For each selected
+    // conversation we fetch the full ConversationDetail, treat *every*
+    // user prompt as "selected", and run the result through
+    // SelectedConversationMarkdownExporter so thinking blocks and the
+    // shared header layout match the Viewer-Mode "Copy selected
+    // conversation" path. Multi-conversation outputs are joined with a
+    // double-newline gutter so the next thread's `# Title` reads as a
+    // top-level heading rather than glommed onto the previous segment's
+    // trailing `---`.
+    //
+    // Hard cap of 50 conversations per call: any larger picks would
+    // produce pasteboard output beyond what most chat-input boxes will
+    // accept, and the per-conversation fetch is sequential — we don't
+    // want a single right-click to fan out to hundreds of DB roundtrips.
+    // Picks above the cap are silently truncated (Finder feels: the
+    // user noticed they over-selected, the action still produces useful
+    // output).
+
+    /// Maximum number of conversations a single Copy call will fetch
+    /// and serialize. See the discussion above.
+    static let copyConversationsCap = 50
+
+    /// Right-click "Copy selected conversation" handler. Receives the
+    /// ids List/Table's `.contextMenu(forSelectionType:)` provides —
+    /// macOS already enforces the Finder rule there:
+    ///   - right-click on a selected row → ids == existing selection
+    ///   - right-click on a non-selected row → ids == that one row,
+    ///     and the visible selection is replaced by that one row too
+    /// Either way, this method's contract is "copy these ids in
+    /// list-display order". No further Finder logic needed inside.
+    func copyConversationsAsMarkdown(ids: Set<String>) async {
+        guard !ids.isEmpty else { return }
+        // Preserve the order conversations appear in the list — a Set
+        // has no order, but `conversations` is the user-facing sort.
+        // Helps the pasted markdown read top-to-bottom in the same
+        // order the user saw on screen.
+        let ordered = conversations
+            .map(\.id)
+            .filter { ids.contains($0) }
+
+        let capped = Array(ordered.prefix(Self.copyConversationsCap))
+        var outputs: [String] = []
+        for id in capped {
+            guard let detail = try? await conversationRepository.fetchDetail(id: id) else {
+                continue
+            }
+            let allUserPromptIDs = Set(
+                detail.messages
+                    .filter(\.isUser)
+                    .map(\.id)
+            )
+            guard !allUserPromptIDs.isEmpty else { continue }
+            let md = SelectedConversationMarkdownExporter.export(
+                detail: detail,
+                selectedPromptIDs: allUserPromptIDs
+            )
+            if !md.isEmpty {
+                outputs.append(md)
+            }
+        }
+        guard !outputs.isEmpty else { return }
+        let combined = outputs.joined(separator: "\n")
+        #if canImport(AppKit)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(combined, forType: .string)
+        #elseif canImport(UIKit)
+        UIPasteboard.general.string = combined
+        #endif
     }
 
     func setBookmarkState(for conversationID: String, isBookmarked: Bool) {

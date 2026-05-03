@@ -130,6 +130,11 @@ struct ConversationTableView: View {
             .contextMenu(forSelectionType: String.self) { ids in
                 if let id = ids.first {
                     Button("Open") { openConversation(id: id) }
+                    Button("Copy selected conversation") {
+                        Task {
+                            await viewModel.copyConversationsAsMarkdown(ids: ids)
+                        }
+                    }
                 }
             } primaryAction: { ids in
                 // Double-click (or Enter) fires the primaryAction closure.

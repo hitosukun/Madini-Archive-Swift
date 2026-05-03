@@ -159,7 +159,19 @@ struct MacOSRootView: View {
             await libraryViewModel.reload()
         }
         .onChange(of: libraryViewModel.selectedConversationId) { _, conversationID in
-            guard let summary = libraryViewModel.summary(for: conversationID) else {
+            // Only auto-open the reader when the user is in a single-row
+            // selection. The Cmd/Shift multi-select path that the
+            // "Copy selected conversation" context menu depends on
+            // would otherwise race here: every time the user added a
+            // row to the set, `.first` would shift, this handler would
+            // fire, the reader would jump to a new conversation, and
+            // the multi-selection would visually collapse back to that
+            // one row. Gating on `count == 1` lets multi-select grow
+            // freely; the reader stays parked on whatever was open
+            // when the user started the multi-pick. A bare click later
+            // brings the set back to 1 and re-engages the auto-open.
+            guard libraryViewModel.selectedConversationIDs.count == 1,
+                  let summary = libraryViewModel.summary(for: conversationID) else {
                 return
             }
 
@@ -1093,6 +1105,24 @@ private struct RoleGrid: View {
 private struct UnifiedConversationListView: View {
     @Bindable var viewModel: LibraryViewModel
 
+    /// Anchor id for Shift-click range selection on the card list. Held
+    /// view-local because it's a UI affordance, not data the rest of
+    /// the app needs to observe; bare and ⌘ clicks update it, Shift
+    /// clicks read it without modifying it (Finder-style range
+    /// extension from a stable origin).
+    @State private var anchorID: String?
+
+    /// Modifier flag set captured at click time so the row tap handler
+    /// can branch on Shift / ⌘ state. Uses the same OptionSet shape as
+    /// `ViewerPromptRow.TapModifiers` for consistency between the two
+    /// multi-select surfaces; the values aren't shared because each
+    /// view scopes them privately.
+    private struct TapModifiers: OptionSet {
+        let rawValue: Int
+        static let shift = TapModifiers(rawValue: 1 << 0)
+        static let command = TapModifiers(rawValue: 1 << 1)
+    }
+
     var body: some View {
         Group {
             if viewModel.isLoading && viewModel.conversations.isEmpty {
@@ -1128,18 +1158,59 @@ private struct UnifiedConversationListView: View {
                 // proxy drives `proxy.scrollTo(id, anchor: .top)` keyed
                 // on the `.tag(conversation.id)` assigned per row.
                 ScrollViewReader { proxy in
-                List(viewModel.conversations, selection: $viewModel.selectedConversationIDs) { conversation in
-                    ConversationRowView(conversation: conversation)
-                    // NOTE: `.equatable()` was tried here for tag-drop perf,
-                    // but it caused intermittent "card click doesn't open"
-                    // — `List` with a `selection:` binding does not play
-                    // well with `EquatableView` wrapping its rows. The
-                    // optimization isn't worth the broken primary action.
-                    .tag(conversation.id)
+                // We use a List with NO `selection:` binding — selection
+                // state lives entirely on the view model and the row
+                // itself is a Button. SwiftUI's `List(selection: Set<>)`
+                // multi-select reads inconsistently across macOS 14
+                // versions for non-sidebar columns: clicks that should
+                // toggle membership instead replaced the set with the
+                // single clicked id, and the user could never build up a
+                // multi-selection. The ViewerModePane in Phase A's
+                // Sub-B uses the same Button + NSApp.currentEvent
+                // modifier-flag pattern; we mirror it here so the
+                // default-mode card list behaves identically.
+                //
+                // The cost is losing List's built-in keyboard nav (↑/↓
+                // / ⌘A) on selection. The previous behaviour was for
+                // arrow keys to advance `selectedConversationId` (a
+                // single id), which is preserved by the existing
+                // `.onMoveCommand` handler hanging off the workspace
+                // split view — that path doesn't depend on List's own
+                // selection wiring.
+                List(viewModel.conversations) { conversation in
+                    Button {
+                        handleRowTap(
+                            conversationID: conversation.id,
+                            ordered: viewModel.conversations.map(\.id)
+                        )
+                    } label: {
+                        ConversationRowView(conversation: conversation)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, 4)
+                            .padding(.horizontal, 8)
+                            .background(rowBackground(for: conversation.id))
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .listRowSeparator(.hidden)
+                    .listRowInsets(EdgeInsets())
+                    .listRowBackground(Color.clear)
                     .id(conversation.id)
                     .onAppear {
                         Task {
                             await viewModel.loadMoreIfNeeded(currentItem: conversation)
+                        }
+                    }
+                    .contextMenu {
+                        Button {
+                            Task {
+                                let ids = idsForContextAction(
+                                    rightClickedID: conversation.id
+                                )
+                                await viewModel.copyConversationsAsMarkdown(ids: ids)
+                            }
+                        } label: {
+                            Text("Copy selected conversation")
                         }
                     }
                 }
@@ -1199,6 +1270,74 @@ private struct UnifiedConversationListView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    // MARK: - Selection logic (mirrored from ViewerPromptRow)
+
+    private func rowBackground(for conversationID: String) -> Color {
+        if viewModel.selectedConversationIDs.contains(conversationID) {
+            return Color.accentColor.opacity(0.20)
+        }
+        return Color.clear
+    }
+
+    private func handleRowTap(conversationID: String, ordered: [String]) {
+        var mods: TapModifiers = []
+        #if canImport(AppKit)
+        if let flags = NSApp.currentEvent?.modifierFlags {
+            if flags.contains(.shift) { mods.insert(.shift) }
+            if flags.contains(.command) { mods.insert(.command) }
+        }
+        #endif
+
+        if mods.contains(.shift) {
+            let anchor = anchorID ?? conversationID
+            let range = idsInRange(
+                anchor: anchor,
+                target: conversationID,
+                in: ordered
+            )
+            if mods.contains(.command) {
+                viewModel.selectedConversationIDs.formUnion(range)
+            } else {
+                viewModel.selectedConversationIDs = range
+            }
+            // Anchor stays for shift-extension chains.
+        } else if mods.contains(.command) {
+            if viewModel.selectedConversationIDs.contains(conversationID) {
+                viewModel.selectedConversationIDs.remove(conversationID)
+            } else {
+                viewModel.selectedConversationIDs.insert(conversationID)
+            }
+            anchorID = conversationID
+        } else {
+            // Bare click — single-select, anchor here, and let the
+            // existing `.onChange(of: selectedConversationId)` handler
+            // (gated on count == 1) auto-open the reader as before.
+            viewModel.selectedConversationIDs = [conversationID]
+            anchorID = conversationID
+        }
+    }
+
+    private func idsInRange(
+        anchor: String,
+        target: String,
+        in ordered: [String]
+    ) -> Set<String> {
+        guard let i = ordered.firstIndex(of: anchor),
+              let j = ordered.firstIndex(of: target) else {
+            return [target]
+        }
+        let lo = min(i, j)
+        let hi = max(i, j)
+        return Set(ordered[lo...hi])
+    }
+
+    private func idsForContextAction(rightClickedID: String) -> Set<String> {
+        if viewModel.selectedConversationIDs.contains(rightClickedID) {
+            return viewModel.selectedConversationIDs
+        }
+        return [rightClickedID]
     }
 }
 

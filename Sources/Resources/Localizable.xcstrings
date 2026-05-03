@@ -276,6 +276,17 @@
         }
       }
     },
+    "Copy selected conversation": {
+      "extractionState": "manual",
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "選択した会話をコピー"
+          }
+        }
+      }
+    },
     "Copy Image": {
       "extractionState": "manual",
       "localizations": {
