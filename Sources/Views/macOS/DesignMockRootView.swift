@@ -3792,6 +3792,18 @@ private struct DesignMockExpandedPromptList: View {
     /// highlight immediately if we reused it.
     @State private var selectedPromptID: String?
     @State private var hoveredPromptID: String?
+    /// Multi-select set for the "Copy selected conversation" right-
+    /// click action. Independent from `selectedPromptID` (which the
+    /// reader scroll-position observer also uses) — a row is rendered
+    /// as "selected" when it is in this set OR (when the set is
+    /// empty) when it matches `selectedPromptID`. Cleared on
+    /// conversation switch so the prior thread's prompt ids never
+    /// bleed into a new outline.
+    @State private var multiSelectedPromptIDs: Set<String> = []
+    /// Anchor for Shift-click range extension. Bare and ⌘ clicks
+    /// update it; Shift clicks read it without modifying it (Finder
+    /// rule).
+    @State private var anchorPromptID: String?
     /// Pending debounced "scroll the reader to this prompt" write. The
     /// outline's plain ↑/↓ updates `selectedPromptID` immediately for
     /// instant highlight feedback, but defers the cross-pane reader
@@ -3909,6 +3921,13 @@ private struct DesignMockExpandedPromptList: View {
             // otherwise a prompt from the previous card would stay tinted.
             selectedPromptID = nil
             hoveredPromptID = nil
+            // Multi-select state is tied to the previous conversation's
+            // prompt ids; carrying it across a thread switch would
+            // both leave stale highlights AND cause the next "Copy
+            // selected conversation" to operate on ids that don't
+            // exist in the new prompt outline.
+            multiSelectedPromptIDs = []
+            anchorPromptID = nil
         }
         } // ScrollViewReader
     }
@@ -4025,13 +4044,11 @@ private struct DesignMockExpandedPromptList: View {
         // and "molasses on every keystroke".
         DesignMockPromptRow(
             prompt: prompt,
-            isSelected: selectedPromptID == prompt.id,
+            isSelected: rowIsSelected(prompt),
             isHovered: hoveredPromptID == prompt.id,
             isPinned: store.isPromptBookmarked(prompt.id),
-            onSelect: {
-                onSelectPrompt(prompt.id)
-                selectedPromptID = prompt.id
-                isPromptListFocused = true
+            onSelect: { shift, command in
+                handlePromptTap(prompt: prompt, shift: shift, command: command)
             },
             onTogglePin: { [conversation] in
                 Task {
@@ -4058,6 +4075,118 @@ private struct DesignMockExpandedPromptList: View {
         // performance gain from short-circuiting unchanged rows
         // disappears.
         .equatable()
+        .contextMenu {
+            Button {
+                Task {
+                    await copySelectedPromptsAsMarkdown(
+                        rightClickedPromptID: prompt.id
+                    )
+                }
+            } label: {
+                Text("Copy selected conversation")
+            }
+        }
+    }
+
+    // MARK: - Multi-select helpers
+
+    /// A row is rendered as "selected" when it is in the multi-select
+    /// set. When the set is empty (= no Cmd/Shift activity yet) we
+    /// fall back to `selectedPromptID` (the reader scroll-position
+    /// echo) so single-row taps still highlight correctly.
+    private func rowIsSelected(_ prompt: DesignMockPrompt) -> Bool {
+        if !multiSelectedPromptIDs.isEmpty {
+            return multiSelectedPromptIDs.contains(prompt.id)
+        }
+        return selectedPromptID == prompt.id
+    }
+
+    /// Modifier-aware tap dispatcher.
+    ///   bare       → single-row select; reader scrolls to this prompt
+    ///   ⌘          → toggle membership in multi-select; reader scrolls
+    ///                so prev/next chips and the scroll observer stay
+    ///                in sync with the most recent click
+    ///   shift      → range from anchor → clicked, REPLACING the set
+    ///   shift + ⌘  → range from anchor → clicked, UNIONED into the set
+    private func handlePromptTap(
+        prompt: DesignMockPrompt,
+        shift: Bool,
+        command: Bool
+    ) {
+        let ordered = prompts.map(\.id)
+
+        if shift {
+            let anchor = anchorPromptID ?? prompt.id
+            let range = idsInRange(
+                anchor: anchor,
+                target: prompt.id,
+                in: ordered
+            )
+            if command {
+                multiSelectedPromptIDs.formUnion(range)
+            } else {
+                multiSelectedPromptIDs = range
+            }
+            // Anchor stays — that's the point of shift-extension.
+        } else if command {
+            if multiSelectedPromptIDs.contains(prompt.id) {
+                multiSelectedPromptIDs.remove(prompt.id)
+            } else {
+                multiSelectedPromptIDs.insert(prompt.id)
+            }
+            anchorPromptID = prompt.id
+            onSelectPrompt(prompt.id)
+            selectedPromptID = prompt.id
+        } else {
+            // Bare click — original behaviour. Multi-select set is
+            // collapsed to just this row so the highlight matches the
+            // single-row selection (rowIsSelected uses the set when
+            // it's non-empty).
+            multiSelectedPromptIDs = [prompt.id]
+            anchorPromptID = prompt.id
+            onSelectPrompt(prompt.id)
+            selectedPromptID = prompt.id
+        }
+        isPromptListFocused = true
+    }
+
+    private func idsInRange(
+        anchor: String,
+        target: String,
+        in ordered: [String]
+    ) -> Set<String> {
+        guard let i = ordered.firstIndex(of: anchor),
+              let j = ordered.firstIndex(of: target) else {
+            return [target]
+        }
+        let lo = min(i, j)
+        let hi = max(i, j)
+        return Set(ordered[lo...hi])
+    }
+
+    /// Right-click "Copy selected conversation" handler. Same Finder
+    /// rule as the card-list version: if the right-clicked prompt is
+    /// part of the active multi-selection, copy that whole set;
+    /// otherwise copy just that one prompt's segment.
+    private func copySelectedPromptsAsMarkdown(
+        rightClickedPromptID: String
+    ) async {
+        let ids: Set<String>
+        if multiSelectedPromptIDs.contains(rightClickedPromptID) {
+            ids = multiSelectedPromptIDs
+        } else {
+            ids = [rightClickedPromptID]
+        }
+        guard !ids.isEmpty,
+              let detail = try? await services.conversations
+                .fetchDetail(id: conversation.id) else { return }
+        let md = SelectedConversationMarkdownExporter.export(
+            detail: detail,
+            selectedPromptIDs: ids
+        )
+        guard !md.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(md, forType: .string)
     }
 }
 
@@ -4073,7 +4202,13 @@ private struct DesignMockPromptRow: View, Equatable {
     let isSelected: Bool
     let isHovered: Bool
     let isPinned: Bool
-    let onSelect: () -> Void
+    /// Callback fired on click. The Bool pair carries the modifier
+    /// state (`shift`, `command`) read from `NSApp.currentEvent` at
+    /// click time so the parent can route bare / ⌘ / shift / shift+⌘
+    /// clicks to different selection mutations. Single-tuple-of-Bools
+    /// rather than a custom OptionSet keeps `DesignMockPromptRow`
+    /// dependency-free at the file location boundary.
+    let onSelect: (_ shift: Bool, _ command: Bool) -> Void
     let onTogglePin: () -> Void
     let onHoverChanged: (Bool) -> Void
 
@@ -4107,8 +4242,17 @@ private struct DesignMockPromptRow: View, Equatable {
             // pane scrolls to the matching message. Kept as an
             // explicit Button (not a tap gesture) so the row
             // responds to keyboard focus and taps in the same
-            // standard way.
-            Button(action: onSelect) {
+            // standard way. The Button action reads
+            // `NSApp.currentEvent?.modifierFlags` so the parent's
+            // `onSelect` callback receives Shift/⌘ state — needed to
+            // distinguish single-row vs multi-select clicks.
+            Button {
+                let flags = NSApp.currentEvent?.modifierFlags
+                onSelect(
+                    flags?.contains(.shift) ?? false,
+                    flags?.contains(.command) ?? false
+                )
+            } label: {
                 // `lineLimit(2)` instead of 1: at narrow center-
                 // pane widths (drag-down to ~180pt) a single-line
                 // snippet truncates to one or two characters,
