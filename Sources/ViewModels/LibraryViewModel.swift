@@ -1,5 +1,11 @@
 import Observation
 import SwiftUI
+#if canImport(AppKit)
+import AppKit
+#endif
+#if canImport(UIKit)
+import UIKit
+#endif
 
 @MainActor
 @Observable
@@ -594,6 +600,80 @@ final class LibraryViewModel {
         viewerConversationID = nil
         viewerDetail = nil
         viewerPromptOutline = []
+    }
+
+    // MARK: - Copy selected conversation(s) as Markdown
+    //
+    // Right-click action on the middle-pane card list. For each selected
+    // conversation we fetch the full ConversationDetail, treat *every*
+    // user prompt as "selected", and run the result through
+    // SelectedConversationMarkdownExporter so thinking blocks and the
+    // shared header layout match the Viewer-Mode "Copy selected
+    // conversation" path. Multi-conversation outputs are joined with a
+    // double-newline gutter so the next thread's `# Title` reads as a
+    // top-level heading rather than glommed onto the previous segment's
+    // trailing `---`.
+    //
+    // Hard cap of 50 conversations per call: any larger picks would
+    // produce pasteboard output beyond what most chat-input boxes will
+    // accept, and the per-conversation fetch is sequential — we don't
+    // want a single right-click to fan out to hundreds of DB roundtrips.
+    // Picks above the cap are silently truncated (Finder feels: the
+    // user noticed they over-selected, the action still produces useful
+    // output).
+
+    /// Maximum number of conversations a single Copy call will fetch
+    /// and serialize. See the discussion above.
+    static let copyConversationsCap = 50
+
+    /// Right-click "Copy selected conversation" handler for the default
+    /// mode card list and the table mode table. `rightClickedID` is the
+    /// id of the row the user actually right-clicked. Finder rule: if
+    /// it's part of the active selection, the action runs over the full
+    /// selection; otherwise it runs over just that one row, leaving the
+    /// existing selection state alone.
+    func copySelectedConversationsAsMarkdown(rightClickedID: String) async {
+        let ids: [String]
+        if selectedConversationIDs.contains(rightClickedID) {
+            // Preserve the order conversations appear in the list — a
+            // Set has no order, but `conversations` is the user-facing
+            // sort. Helps the pasted markdown read top-to-bottom in the
+            // same order the user saw on screen.
+            ids = conversations
+                .map(\.id)
+                .filter { selectedConversationIDs.contains($0) }
+        } else {
+            ids = [rightClickedID]
+        }
+
+        let capped = Array(ids.prefix(Self.copyConversationsCap))
+        var outputs: [String] = []
+        for id in capped {
+            guard let detail = try? await conversationRepository.fetchDetail(id: id) else {
+                continue
+            }
+            let allUserPromptIDs = Set(
+                detail.messages
+                    .filter(\.isUser)
+                    .map(\.id)
+            )
+            guard !allUserPromptIDs.isEmpty else { continue }
+            let md = SelectedConversationMarkdownExporter.export(
+                detail: detail,
+                selectedPromptIDs: allUserPromptIDs
+            )
+            if !md.isEmpty {
+                outputs.append(md)
+            }
+        }
+        guard !outputs.isEmpty else { return }
+        let combined = outputs.joined(separator: "\n")
+        #if canImport(AppKit)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(combined, forType: .string)
+        #elseif canImport(UIKit)
+        UIPasteboard.general.string = combined
+        #endif
     }
 
     func setBookmarkState(for conversationID: String, isBookmarked: Bool) {

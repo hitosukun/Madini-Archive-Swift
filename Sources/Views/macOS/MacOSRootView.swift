@@ -1142,6 +1142,25 @@ private struct UnifiedConversationListView: View {
                             await viewModel.loadMoreIfNeeded(currentItem: conversation)
                         }
                     }
+                    // Per-row context menu so we know exactly which
+                    // conversation the user right-clicked on (the
+                    // selection-typed `.contextMenu(forSelectionType:)`
+                    // doesn't surface the right-clicked id when it lives
+                    // outside the active selection — that is the
+                    // information we need to honour the Finder rule
+                    // "right-clicking outside the selection acts on
+                    // the right-clicked row only").
+                    .contextMenu {
+                        Button {
+                            Task {
+                                await viewModel.copySelectedConversationsAsMarkdown(
+                                    rightClickedID: conversation.id
+                                )
+                            }
+                        } label: {
+                            Text("Copy selected conversation")
+                        }
+                    }
                 }
                 // Hide the List's built-in opaque backdrop so the pane
                 // window material shows through behind rows.
