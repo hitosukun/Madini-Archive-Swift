@@ -270,6 +270,22 @@ final class SelectedConversationMarkdownExporterTests: XCTestCase {
         XCTAssertFalse(out.contains("[thinking]"))
     }
 
+    func testMessageWithEmptyContentBlocksFallsBackToContent() {
+        // contentBlocks == [] should behave like nil — the Python
+        // importer shouldn't emit empty arrays, but if a hand-edited
+        // row ever lands one, emit Message.content instead of an
+        // empty rendered section.
+        let d = detail(messages: [
+            userMsg("u1", "q"),
+            assistantMsg("a1", content: "the flat content", contentBlocks: []),
+        ])
+        let out = SelectedConversationMarkdownExporter.export(
+            detail: d, selectedPromptIDs: ["u1"]
+        )
+        XCTAssertTrue(out.contains("the flat content"))
+        XCTAssertFalse(out.contains("[thinking]"))
+    }
+
     func testMessageWithOnlyTextBlockEmitsThatTextNotFlatContent() {
         let blocks: [MessageBlock] = [.text("structured text")]
         let d = detail(messages: [

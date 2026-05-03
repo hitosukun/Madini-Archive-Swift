@@ -263,7 +263,11 @@ enum SelectedConversationMarkdownExporter {
     /// Walk an assistant / tool / system message's contentBlocks,
     /// rendering text blocks verbatim and thinking blocks as
     /// `> [thinking]` blockquotes. Falls back to `Message.content` when:
-    /// - `contentBlocks` is nil (legacy / no-thinking messages), or
+    /// - `contentBlocks` is nil (legacy / no-thinking messages),
+    /// - `contentBlocks` is the empty array (the importer should not
+    ///   write this, but if it ever does, an empty rendered section
+    ///   is the worst possible default — emit the flat content
+    ///   instead so the user still sees the message), or
     /// - `contentBlocks` contains any block kind we don't render in
     ///   Phase 1 (tool_use, tool_result, artifact, unsupported).
     /// The fallback is conservative — losing the structured form is
@@ -272,7 +276,7 @@ enum SelectedConversationMarkdownExporter {
         _ message: Message,
         into lines: inout [String]
     ) {
-        guard let blocks = message.contentBlocks else {
+        guard let blocks = message.contentBlocks, !blocks.isEmpty else {
             lines.append(message.content)
             return
         }
