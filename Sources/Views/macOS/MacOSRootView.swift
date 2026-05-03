@@ -1142,25 +1142,26 @@ private struct UnifiedConversationListView: View {
                             await viewModel.loadMoreIfNeeded(currentItem: conversation)
                         }
                     }
-                    // Per-row context menu so we know exactly which
-                    // conversation the user right-clicked on (the
-                    // selection-typed `.contextMenu(forSelectionType:)`
-                    // doesn't surface the right-clicked id when it lives
-                    // outside the active selection — that is the
-                    // information we need to honour the Finder rule
-                    // "right-clicking outside the selection acts on
-                    // the right-clicked row only").
-                    .contextMenu {
-                        Button {
-                            Task {
-                                await viewModel.copySelectedConversationsAsMarkdown(
-                                    rightClickedID: conversation.id
-                                )
-                            }
-                        } label: {
-                            Text("Copy selected conversation")
+                }
+                // List-level selection-typed context menu. Per-row
+                // `.contextMenu { }` was tried first but it broke the
+                // `List(selection:)` Cmd/Shift multi-select gesture
+                // recognition — the per-row menu intercepts the click
+                // before the list's selection binding sees it.
+                // The selection-typed variant lets macOS apply its
+                // standard Finder rule on our behalf:
+                //   * right-click on a selected row → ids = current selection
+                //   * right-click on an unselected row → ids = that one row,
+                //     and the visible selection is replaced by it.
+                .contextMenu(forSelectionType: String.self) { ids in
+                    Button {
+                        Task {
+                            await viewModel.copyConversationsAsMarkdown(ids: ids)
                         }
+                    } label: {
+                        Text("Copy selected conversation")
                     }
+                    .disabled(ids.isEmpty)
                 }
                 // Hide the List's built-in opaque backdrop so the pane
                 // window material shows through behind rows.

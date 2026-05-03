@@ -626,27 +626,25 @@ final class LibraryViewModel {
     /// and serialize. See the discussion above.
     static let copyConversationsCap = 50
 
-    /// Right-click "Copy selected conversation" handler for the default
-    /// mode card list and the table mode table. `rightClickedID` is the
-    /// id of the row the user actually right-clicked. Finder rule: if
-    /// it's part of the active selection, the action runs over the full
-    /// selection; otherwise it runs over just that one row, leaving the
-    /// existing selection state alone.
-    func copySelectedConversationsAsMarkdown(rightClickedID: String) async {
-        let ids: [String]
-        if selectedConversationIDs.contains(rightClickedID) {
-            // Preserve the order conversations appear in the list — a
-            // Set has no order, but `conversations` is the user-facing
-            // sort. Helps the pasted markdown read top-to-bottom in the
-            // same order the user saw on screen.
-            ids = conversations
-                .map(\.id)
-                .filter { selectedConversationIDs.contains($0) }
-        } else {
-            ids = [rightClickedID]
-        }
+    /// Right-click "Copy selected conversation" handler. Receives the
+    /// ids List/Table's `.contextMenu(forSelectionType:)` provides —
+    /// macOS already enforces the Finder rule there:
+    ///   - right-click on a selected row → ids == existing selection
+    ///   - right-click on a non-selected row → ids == that one row,
+    ///     and the visible selection is replaced by that one row too
+    /// Either way, this method's contract is "copy these ids in
+    /// list-display order". No further Finder logic needed inside.
+    func copyConversationsAsMarkdown(ids: Set<String>) async {
+        guard !ids.isEmpty else { return }
+        // Preserve the order conversations appear in the list — a Set
+        // has no order, but `conversations` is the user-facing sort.
+        // Helps the pasted markdown read top-to-bottom in the same
+        // order the user saw on screen.
+        let ordered = conversations
+            .map(\.id)
+            .filter { ids.contains($0) }
 
-        let capped = Array(ids.prefix(Self.copyConversationsCap))
+        let capped = Array(ordered.prefix(Self.copyConversationsCap))
         var outputs: [String] = []
         for id in capped {
             guard let detail = try? await conversationRepository.fetchDetail(id: id) else {

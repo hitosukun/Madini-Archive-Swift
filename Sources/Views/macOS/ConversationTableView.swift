@@ -132,9 +132,7 @@ struct ConversationTableView: View {
                     Button("Open") { openConversation(id: id) }
                     Button("Copy selected conversation") {
                         Task {
-                            await viewModel.copySelectedConversationsAsMarkdown(
-                                rightClickedID: id
-                            )
+                            await viewModel.copyConversationsAsMarkdown(ids: ids)
                         }
                     }
                 }
