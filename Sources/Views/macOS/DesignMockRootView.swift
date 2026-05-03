@@ -4067,25 +4067,24 @@ private struct DesignMockExpandedPromptList: View {
                 } else if hoveredPromptID == prompt.id {
                     hoveredPromptID = nil
                 }
+            },
+            onContextCopy: {
+                Task {
+                    await copySelectedPromptsAsMarkdown(
+                        rightClickedPromptID: prompt.id
+                    )
+                }
             }
         )
         // `.equatable()` makes SwiftUI honour the row's `==`
         // implementation for diffing. Without it the framework
         // falls back to "always re-evaluate" for `View`s, and the
         // performance gain from short-circuiting unchanged rows
-        // disappears.
+        // disappears. The .contextMenu is now mounted INSIDE the
+        // row's body so it stays under the Equatable boundary —
+        // attaching it here would re-introduce the per-render diff
+        // that `.equatable()` is meant to skip.
         .equatable()
-        .contextMenu {
-            Button {
-                Task {
-                    await copySelectedPromptsAsMarkdown(
-                        rightClickedPromptID: prompt.id
-                    )
-                }
-            } label: {
-                Text("Copy selected conversation")
-            }
-        }
     }
 
     // MARK: - Multi-select helpers
@@ -4211,6 +4210,15 @@ private struct DesignMockPromptRow: View, Equatable {
     let onSelect: (_ shift: Bool, _ command: Bool) -> Void
     let onTogglePin: () -> Void
     let onHoverChanged: (Bool) -> Void
+    /// Right-click "Copy selected conversation" handler. Mounted on
+    /// the row's `.contextMenu` INSIDE the body — keeping the menu
+    /// inside the Equatable view boundary preserves the row-diff
+    /// short-circuit that `.equatable()` provides. An earlier
+    /// revision attached `.contextMenu` outside the `.equatable()`
+    /// modifier; that bypassed the equality check on every parent
+    /// re-render and reintroduced the per-row body re-evaluation
+    /// the Equatable conformance was added to avoid.
+    let onContextCopy: () -> Void
 
     static func == (lhs: DesignMockPromptRow, rhs: DesignMockPromptRow) -> Bool {
         // Closures are reference-comparable but unstable across
@@ -4293,6 +4301,15 @@ private struct DesignMockPromptRow: View, Equatable {
         )
         .contentShape(Rectangle())
         .onHover(perform: onHoverChanged)
+        // Right-click menu inside the Equatable view body so the row
+        // diff short-circuit still applies (see `onContextCopy` doc).
+        .contextMenu {
+            Button {
+                onContextCopy()
+            } label: {
+                Text("Copy selected conversation")
+            }
+        }
     }
 
     private var rowBackground: Color {
