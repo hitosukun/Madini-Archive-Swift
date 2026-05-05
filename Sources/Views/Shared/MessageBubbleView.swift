@@ -1009,18 +1009,30 @@ struct MessageBubbleView: View, Equatable {
         // changes, bookmark toggles, etc). Parsing markdown on every eval for
         // every visible bubble is measurable on long conversations — cache
         // the parsed blocks by message id so repeated renders are free.
-        let key = message.id as NSString
-        if let cached = Self.blocksCache.object(forKey: key) {
+        if let cached = Self.blocksCache.object(forKey: message.id) {
             return cached.blocks
         }
         let parsed = ContentBlock.parse(message.content)
-        Self.blocksCache.setObject(BlocksBox(parsed), forKey: key)
+        Self.blocksCache.setObject(
+            BlocksBox(parsed),
+            forKey: message.id,
+            cost: CacheCostEstimation.costForBlocks(parsed)
+        )
         return parsed
     }
 
-    private static let blocksCache: NSCache<NSString, BlocksBox> = {
-        let cache = NSCache<NSString, BlocksBox>()
-        cache.countLimit = 500
+    /// Phase 3a: byte-aware LRU cache. `totalCostLimit = 32 MB` per
+    /// the Phase 3 decision (A-3). Registers with
+    /// `CachePurgeCoordinator.shared` so memory-pressure warnings drop
+    /// the older half instead of triggering a full
+    /// `removeAllObjects()` re-parse storm.
+    private static let blocksCache: LRUTrackedCache<BlocksBox> = {
+        let cache = LRUTrackedCache<BlocksBox>(
+            name: "MessageBubbleView.blocks",
+            countLimit: 500,
+            totalCostLimit: 32 * 1024 * 1024
+        )
+        CachePurgeCoordinator.shared.register(cache)
         return cache
     }()
 
