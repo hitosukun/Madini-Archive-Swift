@@ -1743,14 +1743,23 @@ private final class InlineMathImageCache: @unchecked Sendable {
         init(_ rendered: Rendered) { self.rendered = rendered }
     }
 
-    private let cache: NSCache<NSString, Box> = {
-        let cache = NSCache<NSString, Box>()
-        cache.countLimit = 512
+    /// Phase 3a: byte-aware LRU cache. `totalCostLimit = 16 MB` per
+    /// the Phase 3 decision (A-3). Cost is `width * height * 4` for
+    /// the rendered raster (RGBA8 lower bound). Registers with
+    /// `CachePurgeCoordinator.shared` so memory-pressure warnings drop
+    /// the older half.
+    private let cache: LRUTrackedCache<Box> = {
+        let cache = LRUTrackedCache<Box>(
+            name: "InlineMathImageCache",
+            countLimit: 512,
+            totalCostLimit: 16 * 1024 * 1024
+        )
+        CachePurgeCoordinator.shared.register(cache)
         return cache
     }()
 
     func rendered(for latex: String, fontSize: CGFloat) -> Rendered? {
-        let key = "\(Int(fontSize * 100))|\(latex)" as NSString
+        let key = "\(Int(fontSize * 100))|\(latex)"
         if let hit = cache.object(forKey: key) {
             return hit.rendered
         }
@@ -1791,7 +1800,11 @@ private final class InlineMathImageCache: @unchecked Sendable {
             descent: layoutInfo.descent
         )
         #endif
-        cache.setObject(Box(rendered), forKey: key)
+        cache.setObject(
+            Box(rendered),
+            forKey: key,
+            cost: CacheCostEstimation.costForImage(image)
+        )
         return rendered
     }
 }
