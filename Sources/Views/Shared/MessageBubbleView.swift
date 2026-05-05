@@ -1075,7 +1075,7 @@ struct MessageBubbleView: View, Equatable {
                 if case .thinking = $0 { return true }
                 return false
             }) ?? false)
-        let key = "\(message.id)#\(collapse ? 1 : 0)#\(nativeLang)#\(useStructured ? 1 : 0)" as NSString
+        let key = "\(message.id)#\(collapse ? 1 : 0)#\(nativeLang)#\(useStructured ? 1 : 0)"
         if let cached = Self.renderItemsCache.object(forKey: key) {
             return cached.items
         }
@@ -1116,7 +1116,11 @@ struct MessageBubbleView: View, Equatable {
             // mechanism now.
             items = contentBlocks.map { .block($0) }
         }
-        Self.renderItemsCache.setObject(RenderItemsBox(items), forKey: key)
+        Self.renderItemsCache.setObject(
+            RenderItemsBox(items),
+            forKey: key,
+            cost: CacheCostEstimation.costForText(message.content)
+        )
         return items
     }
 
@@ -1176,9 +1180,19 @@ struct MessageBubbleView: View, Equatable {
         return ContentBlock.parse(collapsed)
     }
 
-    private static let renderItemsCache: NSCache<NSString, RenderItemsBox> = {
-        let cache = NSCache<NSString, RenderItemsBox>()
-        cache.countLimit = 500
+    /// Phase 3a: byte-aware LRU cache. `totalCostLimit = 16 MB` per
+    /// the Phase 3 decision (A-3). Cost is approximated against the
+    /// source `message.content` since render items are a regrouping
+    /// of the parsed blocks; the exact in-memory footprint includes
+    /// some fan-out for foreign / thinking groups but stays within
+    /// the same order of magnitude.
+    private static let renderItemsCache: LRUTrackedCache<RenderItemsBox> = {
+        let cache = LRUTrackedCache<RenderItemsBox>(
+            name: "MessageBubbleView.renderItems",
+            countLimit: 500,
+            totalCostLimit: 16 * 1024 * 1024
+        )
+        CachePurgeCoordinator.shared.register(cache)
         return cache
     }()
 
