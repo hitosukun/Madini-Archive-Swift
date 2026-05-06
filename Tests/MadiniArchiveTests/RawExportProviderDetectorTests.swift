@@ -40,7 +40,9 @@ final class RawExportProviderDetectorTests: XCTestCase {
         )
     }
 
-    func testDirectoryDetectionClaudeRequiresBothFiles() throws {
+    func testDirectoryDetectionClaudeLegacyShape() throws {
+        // Pre-2026-05 Claude exports paired conversations.json with a
+        // flat projects.json file at the root.
         let root = try directory("claude")
         try write("[]", to: root.appendingPathComponent("conversations.json"))
         try write("[]", to: root.appendingPathComponent("projects.json"))
@@ -50,10 +52,49 @@ final class RawExportProviderDetectorTests: XCTestCase {
         )
     }
 
+    func testDirectoryDetectionClaudeNewProjectsDirectory() throws {
+        // Post-2026-05 Claude exports replaced the flat projects.json
+        // with a projects/ directory of per-project <uuid>.json files.
+        let root = try directory("claude-new")
+        try write("[]", to: root.appendingPathComponent("conversations.json"))
+        let projectsDir = root.appendingPathComponent("projects", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectsDir, withIntermediateDirectories: true)
+        try write(#"{"uuid": "x"}"#, to: projectsDir.appendingPathComponent("019d8a09.json"))
+        XCTAssertEqual(
+            RawExportProviderDetector.detectFromDirectory(root),
+            .claude
+        )
+    }
+
+    func testDirectoryDetectionClaudeMemoriesSibling() throws {
+        // The post-2026-05 export also adds memories.json — accept that
+        // alone as a Claude-only secondary marker even when projects/
+        // is absent (defensive against future format trims).
+        let root = try directory("claude-memories")
+        try write("[]", to: root.appendingPathComponent("conversations.json"))
+        try write("{}", to: root.appendingPathComponent("memories.json"))
+        XCTAssertEqual(
+            RawExportProviderDetector.detectFromDirectory(root),
+            .claude
+        )
+    }
+
     func testDirectoryDetectionClaudeConversationsAloneIsNotClaimed() throws {
         let root = try directory("claude-partial")
         try write("[]", to: root.appendingPathComponent("conversations.json"))
-        // No projects.json — the strict directory signal shouldn't fire.
+        // No secondary marker (projects.json / projects/ / memories.json) —
+        // conversations.json alone is too ambiguous to claim Claude.
+        XCTAssertNil(RawExportProviderDetector.detectFromDirectory(root))
+    }
+
+    func testDirectoryDetectionClaudeProjectsAsFileNotDirectoryIsHandled() throws {
+        // Defensive: if a stray `projects` file (not directory) exists
+        // alongside conversations.json, the detector should NOT treat
+        // it as the new directory marker. (The legacy `projects.json`
+        // path still wins because it has the .json extension.)
+        let root = try directory("claude-stray-projects-file")
+        try write("[]", to: root.appendingPathComponent("conversations.json"))
+        try write("not a directory", to: root.appendingPathComponent("projects"))
         XCTAssertNil(RawExportProviderDetector.detectFromDirectory(root))
     }
 
