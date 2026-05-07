@@ -811,6 +811,20 @@ private struct LoadedConversationDetailView: View {
         if shouldSkipScrollForVisibleSearchAnchor(id) {
             return
         }
+        // Already-at-anchor shortcut: if the target's measured top-Y
+        // is already within the convergence tolerance of the .top
+        // anchor (i.e. the row sits at viewport top), don't fire a
+        // redundant scrollTo. SwiftUI's ScrollViewProxy.scrollTo on
+        // an already-aligned id can produce a brief drift-and-snap
+        // visual artifact even when the resting position matches —
+        // observed when re-clicking the currently-active prompt
+        // heading: "ちゃんと作動した後も、もう一度同じプロンプトを
+        // クリックすると無駄に動いてから戻ってくる". Reusing the
+        // convergence loop's `convergedPx` threshold (2pt) so the
+        // skip criterion matches the loop's own "we're done" rule.
+        if let currentY = latestPromptOffsets[id], abs(currentY) <= 2 {
+            return
+        }
         let token = UUID()
         programmaticScrollLock = token
         // Pre-materialization for distant block-anchor jumps.
