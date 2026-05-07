@@ -91,11 +91,56 @@ enum CacheCostEstimation {
     }
 
     #if os(macOS)
-    /// Convenience for `NSImage`. Falls back to a 1×1 estimate when the
-    /// size is unknown so the entry is never assigned zero cost.
+    /// Default backing scale assumed when an `NSImage` carries no
+    /// representation we can introspect for true pixel dimensions.
+    /// `2` matches every Apple-shipped Retina display since 2012; on
+    /// the rare 1× external monitor the cost ends up overestimated by
+    /// 4×, which is the safe direction for `totalCostLimit`.
+    static let assumedRetinaBackingScale: CGFloat = 2.0
+
+    /// Convenience for `NSImage`.
+    ///
+    /// `NSImage.size` returns **logical points**, not pixels. On
+    /// Retina (every Apple-shipped built-in display since 2012) the
+    /// true backing-store byte count is `points × points × scale² × 4`
+    /// rather than `points × points × 4` — a 4× under-estimate when
+    /// the cache uses the latter for `totalCostLimit` accounting.
+    /// The Phase 3a follow-up investigation
+    /// (`docs/investigations/phase3a-followup-investigation.md` §4.3)
+    /// identified this gap as the leading cause of post-Phase-3a
+    /// memory-pressure thrash on math-heavy threads where SwiftMath-
+    /// rendered glyphs accumulate in `InlineMathImageCache`.
+    ///
+    /// Strategy: prefer the representation's true `pixelsWide` /
+    /// `pixelsHigh` when any rep is loaded — those are pixel counts,
+    /// not points. Fall back to `points × assumedRetinaBackingScale`
+    /// when no rep is introspectable so the cost is at least
+    /// retina-aware. Falls back further to a 1×1 estimate when even
+    /// the size is unknown so the entry is never assigned zero cost.
     static func costForImage(_ image: NSImage) -> Int {
+        // Largest rep wins — some image pipelines attach multiple
+        // (e.g. an icon with 1×, 2×, 3× variants) and cost should
+        // reflect the heaviest one we'd actually keep in memory.
+        var bestPixels = 0
+        var bestWidth = 0
+        var bestHeight = 0
+        for rep in image.representations {
+            let pixels = rep.pixelsWide * rep.pixelsHigh
+            if pixels > bestPixels {
+                bestPixels = pixels
+                bestWidth = rep.pixelsWide
+                bestHeight = rep.pixelsHigh
+            }
+        }
+        if bestWidth > 0, bestHeight > 0 {
+            return costForImage(width: bestWidth, height: bestHeight)
+        }
+        // No introspectable rep — fall back to size × assumed scale.
         let s = image.size
-        return costForImage(width: Int(s.width.rounded()), height: Int(s.height.rounded()))
+        return costForImage(
+            width: Int((s.width * assumedRetinaBackingScale).rounded()),
+            height: Int((s.height * assumedRetinaBackingScale).rounded())
+        )
     }
     #else
     /// Convenience for `UIImage`. Same fallback rationale as macOS.
