@@ -48,14 +48,50 @@ enum RawExportProviderDetector {
             || fileManager.fileExists(atPath: root.appendingPathComponent("export_manifest.json").path) {
             return .chatGPT
         }
-        if fileManager.fileExists(atPath: root.appendingPathComponent("conversations.json").path)
-            && fileManager.fileExists(atPath: root.appendingPathComponent("projects.json").path) {
+        if isClaudeExportRoot(root, fileManager: fileManager) {
             return .claude
         }
         if !geminiActivityFiles(in: root, fileManager: fileManager).isEmpty {
             return .gemini
         }
         return nil
+    }
+
+    /// True when `root` looks like a Claude export. Accepts both the
+    /// pre-2026-05 layout (`conversations.json` + `projects.json` flat
+    /// file) and the post-2026-05 layout (`conversations.json` +
+    /// `projects/` directory or `memories.json`). The change in
+    /// Claude's exporter replaced the flat `projects.json` with a
+    /// per-project file under `projects/<uuid>.json` and added a
+    /// `memories.json` sibling — either of those, when paired with
+    /// the always-present `conversations.json`, is enough to claim
+    /// the snapshot. `conversations.json` alone stays ambiguous so
+    /// stray Anthropic-shaped JSON outside an export folder doesn't
+    /// get mis-tagged.
+    private static func isClaudeExportRoot(
+        _ root: URL,
+        fileManager: FileManager
+    ) -> Bool {
+        let conversations = root.appendingPathComponent("conversations.json").path
+        guard fileManager.fileExists(atPath: conversations) else { return false }
+
+        let projectsFile = root.appendingPathComponent("projects.json").path
+        if fileManager.fileExists(atPath: projectsFile) {
+            return true
+        }
+
+        var isDir: ObjCBool = false
+        let projectsDir = root.appendingPathComponent("projects").path
+        if fileManager.fileExists(atPath: projectsDir, isDirectory: &isDir), isDir.boolValue {
+            return true
+        }
+
+        let memories = root.appendingPathComponent("memories.json").path
+        if fileManager.fileExists(atPath: memories) {
+            return true
+        }
+
+        return false
     }
 
     /// Peek at the first element of a JSON array and decide which provider's
