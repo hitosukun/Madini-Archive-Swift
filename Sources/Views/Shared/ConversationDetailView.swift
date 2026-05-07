@@ -862,7 +862,24 @@ private struct LoadedConversationDetailView: View {
             let convergedPx: CGFloat = 2
             let stableDeltaPx: CGFloat = 0.5
             let frameNanos: UInt64 = 16_000_000
-            let maxIterations = 30
+            // Bumped 30 → 120 (~480ms → ~1920ms) to absorb LazyVStack
+            // materialization on long / math-heavy threads. Observed
+            // symptom (Phase 3a-followup investigation, May 2026):
+            // clicking a prompt heading after extended use left
+            // selectedPromptID set to the target row but the visible
+            // scroll position parked elsewhere — root cause was the
+            // convergence loop exhausting its budget before LazyVStack
+            // had materialized the destination bubble (each math-heavy
+            // bubble takes 5-10ms to first-render; on long threads the
+            // cumulative materialization cost easily exceeds 480ms).
+            // The expanded budget covers practical worst-case threads
+            // while still capping the lock so a pathological case
+            // cannot hang it forever. Early-exit on `convergedPx` /
+            // `stableDeltaPx` keeps fast-path jumps fast — this matters
+            // only when the slow path is needed. Long-term fix is the
+            // planned Phase 3b bulk pre-parse, which warms bubbles
+            // before LazyVStack first asks for them.
+            let maxIterations = 120
 
             var previousY: CGFloat? = nil
             for iteration in 0..<maxIterations {
