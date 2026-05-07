@@ -1009,18 +1009,30 @@ struct MessageBubbleView: View, Equatable {
         // changes, bookmark toggles, etc). Parsing markdown on every eval for
         // every visible bubble is measurable on long conversations — cache
         // the parsed blocks by message id so repeated renders are free.
-        let key = message.id as NSString
-        if let cached = Self.blocksCache.object(forKey: key) {
+        if let cached = Self.blocksCache.object(forKey: message.id) {
             return cached.blocks
         }
         let parsed = ContentBlock.parse(message.content)
-        Self.blocksCache.setObject(BlocksBox(parsed), forKey: key)
+        Self.blocksCache.setObject(
+            BlocksBox(parsed),
+            forKey: message.id,
+            cost: CacheCostEstimation.costForBlocks(parsed)
+        )
         return parsed
     }
 
-    private static let blocksCache: NSCache<NSString, BlocksBox> = {
-        let cache = NSCache<NSString, BlocksBox>()
-        cache.countLimit = 500
+    /// Phase 3a: byte-aware LRU cache. `totalCostLimit = 32 MB` per
+    /// the Phase 3 decision (A-3). Registers with
+    /// `CachePurgeCoordinator.shared` so memory-pressure warnings drop
+    /// the older half instead of triggering a full
+    /// `removeAllObjects()` re-parse storm.
+    private static let blocksCache: LRUTrackedCache<BlocksBox> = {
+        let cache = LRUTrackedCache<BlocksBox>(
+            name: "MessageBubbleView.blocks",
+            countLimit: 500,
+            totalCostLimit: 32 * 1024 * 1024
+        )
+        CachePurgeCoordinator.shared.register(cache)
         return cache
     }()
 
@@ -1063,7 +1075,7 @@ struct MessageBubbleView: View, Equatable {
                 if case .thinking = $0 { return true }
                 return false
             }) ?? false)
-        let key = "\(message.id)#\(collapse ? 1 : 0)#\(nativeLang)#\(useStructured ? 1 : 0)" as NSString
+        let key = "\(message.id)#\(collapse ? 1 : 0)#\(nativeLang)#\(useStructured ? 1 : 0)"
         if let cached = Self.renderItemsCache.object(forKey: key) {
             return cached.items
         }
@@ -1104,7 +1116,11 @@ struct MessageBubbleView: View, Equatable {
             // mechanism now.
             items = contentBlocks.map { .block($0) }
         }
-        Self.renderItemsCache.setObject(RenderItemsBox(items), forKey: key)
+        Self.renderItemsCache.setObject(
+            RenderItemsBox(items),
+            forKey: key,
+            cost: CacheCostEstimation.costForText(message.content)
+        )
         return items
     }
 
@@ -1164,9 +1180,19 @@ struct MessageBubbleView: View, Equatable {
         return ContentBlock.parse(collapsed)
     }
 
-    private static let renderItemsCache: NSCache<NSString, RenderItemsBox> = {
-        let cache = NSCache<NSString, RenderItemsBox>()
-        cache.countLimit = 500
+    /// Phase 3a: byte-aware LRU cache. `totalCostLimit = 16 MB` per
+    /// the Phase 3 decision (A-3). Cost is approximated against the
+    /// source `message.content` since render items are a regrouping
+    /// of the parsed blocks; the exact in-memory footprint includes
+    /// some fan-out for foreign / thinking groups but stays within
+    /// the same order of magnitude.
+    private static let renderItemsCache: LRUTrackedCache<RenderItemsBox> = {
+        let cache = LRUTrackedCache<RenderItemsBox>(
+            name: "MessageBubbleView.renderItems",
+            countLimit: 500,
+            totalCostLimit: 16 * 1024 * 1024
+        )
+        CachePurgeCoordinator.shared.register(cache)
         return cache
     }()
 
@@ -1717,14 +1743,23 @@ private final class InlineMathImageCache: @unchecked Sendable {
         init(_ rendered: Rendered) { self.rendered = rendered }
     }
 
-    private let cache: NSCache<NSString, Box> = {
-        let cache = NSCache<NSString, Box>()
-        cache.countLimit = 512
+    /// Phase 3a: byte-aware LRU cache. `totalCostLimit = 16 MB` per
+    /// the Phase 3 decision (A-3). Cost is `width * height * 4` for
+    /// the rendered raster (RGBA8 lower bound). Registers with
+    /// `CachePurgeCoordinator.shared` so memory-pressure warnings drop
+    /// the older half.
+    private let cache: LRUTrackedCache<Box> = {
+        let cache = LRUTrackedCache<Box>(
+            name: "InlineMathImageCache",
+            countLimit: 512,
+            totalCostLimit: 16 * 1024 * 1024
+        )
+        CachePurgeCoordinator.shared.register(cache)
         return cache
     }()
 
     func rendered(for latex: String, fontSize: CGFloat) -> Rendered? {
-        let key = "\(Int(fontSize * 100))|\(latex)" as NSString
+        let key = "\(Int(fontSize * 100))|\(latex)"
         if let hit = cache.object(forKey: key) {
             return hit.rendered
         }
@@ -1765,7 +1800,11 @@ private final class InlineMathImageCache: @unchecked Sendable {
             descent: layoutInfo.descent
         )
         #endif
-        cache.setObject(Box(rendered), forKey: key)
+        cache.setObject(
+            Box(rendered),
+            forKey: key,
+            cost: CacheCostEstimation.costForImage(image)
+        )
         return rendered
     }
 }
@@ -2917,11 +2956,18 @@ private final class InlineMarkdownCache: @unchecked Sendable {
         init(_ value: AttributedString) { self.value = value }
     }
 
-    private let cache: NSCache<NSString, Box> = {
-        let cache = NSCache<NSString, Box>()
-        // Bound entries so the cache can't grow unboundedly on very long
-        // sessions; individual renders are small so this is generous.
-        cache.countLimit = 2048
+    /// Phase 3a: byte-aware LRU cache. `totalCostLimit = 64 MB` per
+    /// the Phase 3 decision (A-3) — this is the largest of the four
+    /// MessageBubbleView caches because cached AttributedStrings
+    /// dominate hit rate. Registers with `CachePurgeCoordinator.shared`
+    /// so memory-pressure warnings drop the older half.
+    private let cache: LRUTrackedCache<Box> = {
+        let cache = LRUTrackedCache<Box>(
+            name: "InlineMarkdownCache",
+            countLimit: 2048,
+            totalCostLimit: 64 * 1024 * 1024
+        )
+        CachePurgeCoordinator.shared.register(cache)
         return cache
     }()
 
@@ -2946,12 +2992,15 @@ private final class InlineMarkdownCache: @unchecked Sendable {
         guard text.count > 16 else {
             return (try? AttributedString(markdown: text, options: Self.options)) ?? AttributedString(text)
         }
-        let key = text as NSString
-        if let hit = cache.object(forKey: key) {
+        if let hit = cache.object(forKey: text) {
             return hit.value
         }
         let parsed = (try? AttributedString(markdown: text, options: Self.options)) ?? AttributedString(text)
-        cache.setObject(Box(parsed), forKey: key)
+        cache.setObject(
+            Box(parsed),
+            forKey: text,
+            cost: CacheCostEstimation.costForText(text)
+        )
         return parsed
     }
 

@@ -25,6 +25,14 @@ final class AppServices: ObservableObject {
     let wikiVaultAccessor: WikiVaultAccessor
     let dataSource: DataSource
 
+    /// Activates kernel memory-pressure → cache half-purge wiring for
+    /// the app session (Phase 3a). The four MessageBubbleView caches
+    /// register themselves with `CachePurgeCoordinator.shared` on
+    /// first use; this monitor fans `.warning` events out to that
+    /// coordinator. Held as a stored property so the underlying
+    /// DispatchSource stays alive for the lifetime of `AppServices`.
+    private let memoryPressureMonitor = MemoryPressureMonitor()
+
     enum DataSource {
         case database(path: String)
         case mock
