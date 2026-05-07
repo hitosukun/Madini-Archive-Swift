@@ -3205,11 +3205,18 @@ private struct DesignMockThreadListPane: View {
                         // exactly on the matching card.
                         .id(conversation.id)
                         .onTapGesture {
+                            // `NSEvent.modifierFlags` (live global state)
+                            // rather than `NSApp.currentEvent?.modifierFlags`:
+                            // by the time SwiftUI runs this gesture closure,
+                            // `NSApp.currentEvent` already points at the
+                            // mouse-up that follows the click and reports
+                            // empty modifier flags. Same regression fix as
+                            // `DesignMockPromptRow`'s Button action — see
+                            // its `onSelect` doc-comment.
                             var mods: TapModifiers = []
-                            if let flags = NSApp.currentEvent?.modifierFlags {
-                                if flags.contains(.shift) { mods.insert(.shift) }
-                                if flags.contains(.command) { mods.insert(.command) }
-                            }
+                            let flags = NSEvent.modifierFlags
+                            if flags.contains(.shift) { mods.insert(.shift) }
+                            if flags.contains(.command) { mods.insert(.command) }
                             withAnimation(.easeOut(duration: 0.16)) {
                                 handleRowTap(conversation, modifiers: mods)
                             }
@@ -4202,11 +4209,26 @@ private struct DesignMockPromptRow: View, Equatable {
     let isHovered: Bool
     let isPinned: Bool
     /// Callback fired on click. The Bool pair carries the modifier
-    /// state (`shift`, `command`) read from `NSApp.currentEvent` at
-    /// click time so the parent can route bare / ⌘ / shift / shift+⌘
-    /// clicks to different selection mutations. Single-tuple-of-Bools
-    /// rather than a custom OptionSet keeps `DesignMockPromptRow`
-    /// dependency-free at the file location boundary.
+    /// state (`shift`, `command`) read from `NSEvent.modifierFlags`
+    /// (the live global modifier state) so the parent can route
+    /// bare / ⌘ / shift / shift+⌘ clicks to different selection
+    /// mutations. Single-tuple-of-Bools rather than a custom
+    /// OptionSet keeps `DesignMockPromptRow` dependency-free at the
+    /// file location boundary.
+    ///
+    /// Why `NSEvent.modifierFlags` and not `NSApp.currentEvent`:
+    /// SwiftUI's `Button` action runs after the click event has
+    /// been dispatched and the runtime has moved on to the next
+    /// event in the queue (typically the matching mouse-up). On
+    /// macOS 26 / SwiftUI 7.4 `NSApp.currentEvent` at action time
+    /// reliably points at that NEXT event — which carries no
+    /// modifier flags from the original click — so every ⌘+click
+    /// was being interpreted as a bare click and multi-select
+    /// silently degraded to single-select. `NSEvent.modifierFlags`
+    /// is a live global property that reports whatever the user is
+    /// currently holding, which (assuming the user is still
+    /// holding ⌘ when the action runs, microseconds after the
+    /// click) gives the correct answer.
     let onSelect: (_ shift: Bool, _ command: Bool) -> Void
     let onTogglePin: () -> Void
     let onHoverChanged: (Bool) -> Void
@@ -4250,15 +4272,17 @@ private struct DesignMockPromptRow: View, Equatable {
             // pane scrolls to the matching message. Kept as an
             // explicit Button (not a tap gesture) so the row
             // responds to keyboard focus and taps in the same
-            // standard way. The Button action reads
-            // `NSApp.currentEvent?.modifierFlags` so the parent's
-            // `onSelect` callback receives Shift/⌘ state — needed to
-            // distinguish single-row vs multi-select clicks.
+            // standard way. The Button action reads the live
+            // `NSEvent.modifierFlags` so the parent's `onSelect`
+            // callback receives Shift/⌘ state — needed to
+            // distinguish single-row vs multi-select clicks. See
+            // `onSelect`'s doc-comment for why we don't read
+            // `NSApp.currentEvent` here.
             Button {
-                let flags = NSApp.currentEvent?.modifierFlags
+                let flags = NSEvent.modifierFlags
                 onSelect(
-                    flags?.contains(.shift) ?? false,
-                    flags?.contains(.command) ?? false
+                    flags.contains(.shift),
+                    flags.contains(.command)
                 )
             } label: {
                 // `lineLimit(2)` instead of 1: at narrow center-
