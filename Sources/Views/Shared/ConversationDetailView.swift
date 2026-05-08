@@ -540,20 +540,22 @@ private struct LoadedConversationDetailView: View {
                     // Capture the ScrollView's visible height so the
                     // find-bar step logic can tell whether a block
                     // anchor's top-Y (read from `latestPromptOffsets`)
-                    // falls inside the viewport. The GeometryReader
-                    // sits in the background so it doesn't interfere
-                    // with layout; its size mirrors the ScrollView's
-                    // own frame.
-                    .background(
-                        GeometryReader { geo in
-                            Color.clear.preference(
-                                key: ReaderViewportSizePreferenceKey.self,
-                                value: geo.size.height
-                            )
-                        }
-                    )
-                    .onPreferenceChange(ReaderViewportSizePreferenceKey.self) { h in
-                        readerViewportHeight = h
+                    // falls inside the viewport.
+                    //
+                    // Migrated from a `GeometryReader` + Color.clear +
+                    // PreferenceKey + .onPreferenceChange chain to
+                    // SwiftUI 5.9's `.onGeometryChange(for:of:action:)`
+                    // (macOS 14+). The new modifier is a direct
+                    // child→parent callback that doesn't introduce a
+                    // wrapped Color.clear or merge through the
+                    // preference plumbing, so it adds noticeably fewer
+                    // AttributeGraph nodes per frame. See
+                    // docs/investigations/swiftui-viewgraph-accumulation.md
+                    // for the broader migration rationale.
+                    .onGeometryChange(for: CGFloat.self) { proxy in
+                        proxy.size.height
+                    } action: { newHeight in
+                        readerViewportHeight = newHeight
                     }
                     // Phase 6 retired the conversation-level
                     // language detection (and the Bug B v1/v2/v3
@@ -1159,22 +1161,6 @@ internal struct PromptTopYPreferenceKey: PreferenceKey {
 /// the outline cursor slot).
 internal enum SearchBlockAnchor {
     static let idPrefix: String = "__mb-search-"
-}
-
-/// Published by a background `GeometryReader` on the reader ScrollView
-/// so the detail view can cache the current viewport height. Used by
-/// `performProgrammaticScroll` to decide whether a find-bar block
-/// anchor is already on-screen (and therefore the step can skip its
-/// scroll, leaving the viewport alone and letting the orange cursor
-/// repaint in place).
-private struct ReaderViewportSizePreferenceKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        // Last emission wins — the ScrollView only publishes one value
-        // at a time, so the "newer" reading is always authoritative.
-        value = nextValue()
-    }
 }
 
 private struct DocumentConversationView: View {
