@@ -1635,23 +1635,44 @@ private enum InlineMathSplitter {
         let runs: [InlineTextRun]
         init(_ runs: [InlineTextRun]) { self.runs = runs }
     }
-    private static let cache: NSCache<NSString, RunsBox> = {
-        let c = NSCache<NSString, RunsBox>()
-        c.countLimit = 4096
-        return c
+
+    /// Phase 3a-followup: this was the 5th cache that Phase 3a's
+    /// migration deliberately scoped out (the planning doc only
+    /// enumerated the four caches inside `MessageBubbleView`'s
+    /// instance scope; this one sits on a sibling private enum).
+    /// Migrated post-Phase-3a so the same byte-aware eviction +
+    /// memory-pressure half-purge applies here too.
+    ///
+    /// `totalCostLimit = 8 MB`: the entries are small (each is a
+    /// flat `[InlineTextRun]` over a single paragraph, typically a
+    /// few hundred bytes after the 4× expansion factor), so 8 MB
+    /// generously covers the practical 4096-entry ceiling without
+    /// nudging the process-wide budget past its rough 128 MB design
+    /// target. countLimit (4096) preserved as belt-and-suspenders.
+    private static let cache: LRUTrackedCache<RunsBox> = {
+        let cache = LRUTrackedCache<RunsBox>(
+            name: "InlineMathSplitter",
+            countLimit: 4096,
+            totalCostLimit: 8 * 1024 * 1024
+        )
+        CachePurgeCoordinator.shared.register(cache)
+        return cache
     }()
 
     static func split(_ text: String) -> [InlineTextRun] {
-        // Skip the cache for tiny inputs — the NSString bridge + NSCache
-        // lookup overhead is comparable to the split itself for short
+        // Skip the cache for tiny inputs — the NSCache lookup
+        // overhead is comparable to the split itself for short
         // strings, and they're cheap to redo.
         if text.count > 24 {
-            let key = text as NSString
-            if let hit = cache.object(forKey: key) {
+            if let hit = cache.object(forKey: text) {
                 return hit.runs
             }
             let computed = computeSplit(text)
-            cache.setObject(RunsBox(computed), forKey: key)
+            cache.setObject(
+                RunsBox(computed),
+                forKey: text,
+                cost: CacheCostEstimation.costForText(text)
+            )
             return computed
         }
         return computeSplit(text)
