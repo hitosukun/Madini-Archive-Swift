@@ -411,37 +411,22 @@ private struct LoadedConversationDetailView: View {
                                         .padding(.vertical, 12)
                                 }
 
-                                MessageBubbleView(
-                                    message: message,
-                                    displayMode: messageDisplayMode,
-                                    identityContext: MessageIdentityContext(
-                                        source: detail.summary.source,
-                                        model: detail.summary.model
-                                    ),
-                                    conversationPrimaryLanguage: conversationPrimaryLanguage
-                                )
-                                .equatable()
-                                .id(message.id)
-                                .background(
-                                    // User messages publish their top-edge y
-                                    // coordinate into the ScrollView's named
-                                    // coordinate space. Non-user messages
-                                    // publish nothing, so the preference
-                                    // dictionary stays user-only.
-                                    Group {
-                                        if message.isUser {
-                                            GeometryReader { proxyGeo in
-                                                Color.clear.preference(
-                                                    key: PromptTopYPreferenceKey.self,
-                                                    value: [
-                                                        message.id: proxyGeo.frame(
-                                                            in: .named(ReaderScrollCoordinateSpace.name)
-                                                        ).minY
-                                                    ]
-                                                )
-                                            }
+                                userMessageAnchorWrapped(
+                                    bubble: MessageBubbleView(
+                                        message: message,
+                                        displayMode: messageDisplayMode,
+                                        identityContext: MessageIdentityContext(
+                                            source: detail.summary.source,
+                                            model: detail.summary.model
+                                        ),
+                                        conversationPrimaryLanguage: conversationPrimaryLanguage,
+                                        onAnchorPositionChange: { anchorID, newY in
+                                            recordAnchorPosition(anchorID, newY)
                                         }
-                                    }
+                                    )
+                                    .equatable()
+                                    .id(message.id),
+                                    message: message
                                 )
                                 // Sync the outline cursor to a clicked
                                 // user message — but only via a
@@ -583,25 +568,18 @@ private struct LoadedConversationDetailView: View {
                         WorkspaceLayoutMetrics.bottomFadeHeight,
                         for: .scrollContent
                     )
-                    .onPreferenceChange(PromptTopYPreferenceKey.self) { offsets in
-                        // Defer the state write off the current layout pass.
-                        // Writing `selectedPromptID` synchronously here would
-                        // update the reader-pane outline pulldown in the
-                        // same frame, which can shift `contentMargins` via
-                        // the header-bar height preference and force the
-                        // GeometryReaders below to re-publish — SwiftUI
-                        // flags this as "preference updated multiple times
-                        // per frame". `Task { @MainActor in … }` hops to
-                        // the next runloop iteration, breaking the cycle.
-                        Task { @MainActor in
-                            // Always keep the cache fresh, even while
-                            // programmaticScrollLock is held — the
-                            // convergence loop reads it to decide when the
-                            // target row has actually landed on the anchor.
-                            latestPromptOffsets = offsets
-                            handlePromptOffsetChange(offsets)
-                        }
-                    }
+                    // The preference-aggregator that used to live here is
+                    // gone — per-anchor onGeometryChange callbacks
+                    // (recordPromptAnchorPosition / recordAnchorPosition)
+                    // update `latestPromptOffsets` directly and dispatch
+                    // `handlePromptOffsetChange` for prompt-level
+                    // entries. The migration eliminates the SwiftUI
+                    // PreferenceKey merge that ran on every layout pass
+                    // for every anchor in the visible window — the
+                    // primary contributor to the AttributeGraph node
+                    // growth identified in
+                    // docs/investigations/swiftui-viewgraph-accumulation.md
+                    // (Tier S-1).
                     .onAppear {
                         // Only scroll on appear if the selection was set
                         // EXTERNALLY before mount (e.g. the pin pane
@@ -1054,6 +1032,54 @@ private struct LoadedConversationDetailView: View {
         }
     }
 
+    /// Conditionally attaches the prompt-anchor `onGeometryChange`
+    /// observer to user-message bubbles. Non-user bubbles pass
+    /// through unmodified ── only user messages publish prompt
+    /// anchors to `latestPromptOffsets`. Inline `if message.isUser`
+    /// at the ForEach call site would force the closure to compile
+    /// against an `_ConditionalContent` shape with both arms typed,
+    /// which is awkward inside a `LazyVStack` row builder; pulling
+    /// the dispatch into a helper keeps the ForEach body shallow.
+    @ViewBuilder
+    private func userMessageAnchorWrapped<Bubble: View>(
+        bubble: Bubble,
+        message: Message
+    ) -> some View {
+        if message.isUser {
+            bubble.onGeometryChange(for: CGFloat.self) { proxy in
+                proxy.frame(in: .named(ReaderScrollCoordinateSpace.name)).minY
+            } action: { newY in
+                recordPromptAnchorPosition(message.id, newY)
+            }
+        } else {
+            bubble
+        }
+    }
+
+    /// Phase 3a-followup Tier S-1: per-block anchor position update,
+    /// fired by `MessageBubbleView`'s `onAnchorPositionChange` for each
+    /// scroll-block anchor inside an assistant message. We just stash
+    /// the value into `latestPromptOffsets` — block anchors never feed
+    /// `handlePromptOffsetChange` because they aren't prompt boundaries
+    /// (the handler filters them out via `SearchBlockAnchor.idPrefix`).
+    /// Their consumer is `performProgrammaticScroll`'s convergence
+    /// loop, which reads the dict on each iteration.
+    private func recordAnchorPosition(_ id: String, _ y: CGFloat) {
+        latestPromptOffsets[id] = y
+    }
+
+    /// Phase 3a-followup Tier S-1: per-prompt (user-message) anchor
+    /// update. Updates the dict AND triggers the outline-cursor
+    /// reassignment logic that the old `.onPreferenceChange` handler
+    /// used to run. The handler's existing internal guards
+    /// (`programmaticScrollLock` non-nil, `candidate ==
+    /// scrollDrivenSelection`) keep it cheap when nothing material
+    /// changed — calling it on every prompt anchor update is fine.
+    private func recordPromptAnchorPosition(_ id: String, _ y: CGFloat) {
+        latestPromptOffsets[id] = y
+        handlePromptOffsetChange(latestPromptOffsets)
+    }
+
     /// Given each user-message's top-edge y coordinate inside the
     /// ScrollView, pick the one currently occupying the "current prompt"
     /// slot and, if different from the current selection, propagate it
@@ -1121,36 +1147,6 @@ private struct LoadedConversationDetailView: View {
 
         scrollDrivenSelection = candidate
         selectedPromptID = candidate
-    }
-}
-
-/// Per-anchor top-edge y coordinate in the ScrollView's coordinate
-/// space. Two kinds of keys live in this dictionary:
-///
-/// - **User-message ids** (e.g. `"msg-123"`): published by the
-///   observers in `LoadedConversationDetailView` and consumed by the
-///   outline cursor in `handlePromptOffsetChange`. The outline logic
-///   filters block-level ids out so a per-block offset can't be
-///   mistaken for a prompt boundary.
-///
-/// - **Block-level search anchors** (prefixed with
-///   `"__mb-search-"`, see
-///   `MessageBubbleView.searchBlockAnchorID(messageID:blockIndex:)`):
-///   published by `MessageBubbleView` for every rendered block inside
-///   an assistant reply, so `performProgrammaticScroll` can measure
-///   whether an in-thread-search block jump has actually landed on
-///   target, instead of burning its whole timeout on a distant one-
-///   shot `proxy.scrollTo` that an under-materialised LazyVStack
-///   answered with a stale estimate.
-///
-/// Merge is a plain dictionary overwrite because anchor ids are unique
-/// across the reader body — the last emission from a GeometryReader is
-/// always the authoritative current position.
-internal struct PromptTopYPreferenceKey: PreferenceKey {
-    static var defaultValue: [String: CGFloat] = [:]
-
-    static func reduce(value: inout [String: CGFloat], nextValue: () -> [String: CGFloat]) {
-        value.merge(nextValue()) { _, new in new }
     }
 }
 

@@ -184,6 +184,27 @@ struct MessageBubbleView: View, Equatable {
     /// rendered on an English-locale Mac were getting their
     /// Japanese answers folded into a "translate" disclosure.
     let conversationPrimaryLanguage: NLLanguage?
+    /// Direct callback fired when a per-block scroll anchor inside an
+    /// assistant message reports a new top-Y in the reader's coordinate
+    /// space. The pair `(anchorID, minY)` is what
+    /// `ConversationDetailView.performProgrammaticScroll`'s convergence
+    /// loop reads through `latestPromptOffsets[anchorID]`.
+    ///
+    /// Migrated from a `GeometryReader` + Color.clear +
+    /// `PromptTopYPreferenceKey` + `.onPreferenceChange` chain to
+    /// SwiftUI 5.9's `.onGeometryChange(for:of:action:)` (macOS 14+) ──
+    /// the new path is a direct child→parent callback that doesn't
+    /// introduce a wrapped Color.clear or merge through preference
+    /// plumbing, so it adds noticeably fewer AttributeGraph nodes per
+    /// frame on math-heavy / long-thread surfaces. See
+    /// `docs/investigations/swiftui-viewgraph-accumulation.md` Tier S-1
+    /// for the broader rollout.
+    ///
+    /// `nil` is allowed for callers that don't need block-level scroll
+    /// targeting (preview / fixture mounts, design-mock thumbnails);
+    /// the callback is wired in production by
+    /// `ConversationDetailView.scrollContent`.
+    var onAnchorPositionChange: ((String, CGFloat) -> Void)? = nil
     @Environment(IdentityPreferencesStore.self) private var identityPreferences
     /// Optional find-in-page spec. SwiftUI tracks this as an environment
     /// dependency of `body`, so even though `.equatable()` short-circuits
@@ -547,22 +568,22 @@ struct MessageBubbleView: View, Equatable {
                             // Publish this block's top-Y so the
                             // convergence loop in
                             // `performProgrammaticScroll` can tell when
-                            // a block-level jump has actually landed,
-                            // instead of always eating its full
-                            // 480ms timeout because the target id
-                            // never shows up in the offset cache.
-                            .background(
-                                GeometryReader { proxyGeo in
-                                    Color.clear.preference(
-                                        key: PromptTopYPreferenceKey.self,
-                                        value: [
-                                            anchorID: proxyGeo.frame(
-                                                in: .named(ReaderScrollCoordinateSpace.name)
-                                            ).minY
-                                        ]
-                                    )
-                                }
-                            )
+                            // a block-level jump has actually landed.
+                            // Direct callback via onAnchorPositionChange
+                            // ── the previous PromptTopYPreferenceKey +
+                            // GeometryReader chain merged through
+                            // SwiftUI's preference plumbing for every
+                            // block on every layout pass and was a
+                            // primary contributor to the AttributeGraph
+                            // node growth measured in Phase 3a-followup
+                            // (1.3M nodes after 23 min of usage).
+                            .onGeometryChange(for: CGFloat.self) { proxy in
+                                proxy.frame(
+                                    in: .named(ReaderScrollCoordinateSpace.name)
+                                ).minY
+                            } action: { newY in
+                                onAnchorPositionChange?(anchorID, newY)
+                            }
                     }
                 }
             }
