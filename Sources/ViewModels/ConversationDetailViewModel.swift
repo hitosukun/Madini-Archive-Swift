@@ -23,9 +23,40 @@ final class ConversationDetailViewModel {
     private let repository: any ConversationRepository
     let conversationId: String
 
+    /// Phase 3b: deferred-batch prewarm task. Holds the Task that
+    /// streams `MessageBubbleView.prewarmCache(for:)` against
+    /// messages outside the immediate-render window so a fast
+    /// conversation switch can cancel the previous batch before
+    /// it finishes warming entries the user no longer cares about.
+    /// `@ObservationIgnored` because @Observable's synthesized
+    /// tracking has no UI to notify here — this is pure
+    /// housekeeping state.
+    @ObservationIgnored
+    private var prewarmTask: Task<Void, Never>?
+
+    /// First-N messages get their parse warmed synchronously on
+    /// `load()` before the view evaluates body for the first time;
+    /// the rest stream through `Task.detached` at `.userInitiated`.
+    /// Phase 3 decision B-2-β: 20 sync + rest deferred. The 20 lines
+    /// up roughly with the LazyVStack's initial materialize budget on
+    /// the reader pane — beyond that, the user has to scroll before
+    /// the bubble is asked for, by which time the deferred batch has
+    /// usually warmed it. Tunable here without changing the call
+    /// shape; tests rely on the constant being readable rather than
+    /// hard-coded so a future bump doesn't silently break them.
+    static let immediatePrewarmCount = 20
+
     init(conversationId: String, repository: any ConversationRepository) {
         self.conversationId = conversationId
         self.repository = repository
+    }
+
+    deinit {
+        // The Task captures `[deferred]` by value, not `self`, so it
+        // doesn't keep the view-model alive on its own — but cancelling
+        // here means a torn-down view-model stops further pre-parse
+        // work that the user can no longer benefit from.
+        prewarmTask?.cancel()
     }
 
     func load() async {
@@ -40,11 +71,61 @@ final class ConversationDetailViewModel {
 
         do {
             detail = try await repository.fetchDetail(id: conversationId)
+            scheduleBulkPrewarm()
         } catch {
             detail = nil
             errorText = error.localizedDescription
             print("Failed to load detail: \(error)")
         }
+    }
+
+    /// Phase 3b: kick off bulk pre-parse against the just-loaded
+    /// detail.
+    ///
+    /// Cancels any previous deferred batch — calling `load()` for a
+    /// new conversation should not keep warming the old one's
+    /// messages. The first `immediatePrewarmCount` messages are
+    /// parsed synchronously on the @MainActor (Phase 2 measurement:
+    /// ≈ 1ms each on median-size Japanese messages, so 20 messages
+    /// ≈ 20ms total — well inside one frame). The remainder fan out
+    /// to `Task.detached(priority: .userInitiated)` and yield between
+    /// each so other userInitiated work isn't starved.
+    ///
+    /// The `[deferred]` capture list pulls the slice into the closure
+    /// by value (Message is `Sendable`), so the task doesn't reach
+    /// back to `self.detail` after the conversation may have been
+    /// swapped out. Yielding between iterations gives the @MainActor
+    /// a chance to run UI work even though the body is `Task.detached`.
+    private func scheduleBulkPrewarm() {
+        guard let detail else { return }
+        prewarmTask?.cancel()
+        prewarmTask = nil
+
+        let messages = detail.messages
+        let cutoff = min(Self.immediatePrewarmCount, messages.count)
+        // Sync pass — we're already on @MainActor.
+        for i in 0..<cutoff {
+            MessageBubbleView.prewarmCache(for: messages[i])
+        }
+        // Deferred pass.
+        guard cutoff < messages.count else { return }
+        let deferred = Array(messages.dropFirst(cutoff))
+        prewarmTask = Task.detached(priority: .userInitiated) { [deferred] in
+            for msg in deferred {
+                if Task.isCancelled { return }
+                MessageBubbleView.prewarmCache(for: msg)
+                await Task.yield()
+            }
+        }
+    }
+
+    /// Test-only: await the deferred batch's completion (or
+    /// cancellation). XCTest call sites use this to check post-
+    /// detached-batch cache state without polling. Production code
+    /// has no reason to wait — the whole point of the deferred batch
+    /// is that the view doesn't block on it.
+    func _awaitPrewarm() async {
+        await prewarmTask?.value
     }
 
     /// Best-effort second-stage load: pull the raw export JSON for
