@@ -1041,6 +1041,55 @@ struct MessageBubbleView: View, Equatable {
         init(_ blocks: [ContentBlock]) { self.blocks = blocks }
     }
 
+    // MARK: - Phase 3b: Bulk Pre-parse public API
+
+    /// Precompute and cache the markdown parse for `message` so the
+    /// first body evaluation that asks for `contentBlocks` finds the
+    /// result already in `blocksCache`. Skips work when the cache is
+    /// already warm (Phase 3 decision B-4) and when the message is
+    /// over the render-cap (the cached entry would never be consulted
+    /// because `canRenderMessage` short-circuits to a single
+    /// `.paragraph(message.content)` placeholder).
+    ///
+    /// **Threading**: safe to call from any thread. The static cache
+    /// uses `LRUTrackedCache` (NSLock-protected, `@unchecked Sendable`)
+    /// and `ContentBlock.parse` is pure with no shared state. Phase
+    /// 3 decision B-1 picks `Task.detached(priority: .userInitiated)`
+    /// in `ConversationDetailViewModel.load()` as the canonical caller
+    /// for the deferred batch; tests call directly from XCTest's main
+    /// thread which is also fine.
+    ///
+    /// **Idempotent**: re-calling for an already-cached message is a
+    /// constant-time NSCache hit + early return. Cheap enough that
+    /// callers don't need to dedupe themselves.
+    static func prewarmCache(for message: Message) {
+        // Skip messages too long to render — `canRenderMessage` would
+        // short-circuit and never consult `blocksCache`, so caching
+        // a parse here would be wasted work AND wasted bytes against
+        // the cache budget.
+        guard message.content.count <= Layout.maxRenderedMessageLength else {
+            return
+        }
+        // Cache hit: nothing to do.
+        if blocksCache.object(forKey: message.id) != nil {
+            return
+        }
+        let parsed = ContentBlock.parse(message.content)
+        blocksCache.setObject(
+            BlocksBox(parsed),
+            forKey: message.id,
+            cost: CacheCostEstimation.costForBlocks(parsed)
+        )
+    }
+
+    /// Test-only inspection hook. `internal` (default) so XCTest can
+    /// see it via `@testable import MadiniArchive`; nothing in the
+    /// production view tree calls it. Returns `true` when the message
+    /// id has a live entry in `blocksCache`.
+    static func _hasCachedBlocks(messageID: String) -> Bool {
+        return blocksCache.object(forKey: messageID) != nil
+    }
+
     /// Same lifecycle as `contentBlocks`, but folded through
     /// `StructuredBlockGrouper` (Phase 4 structural-thinking path) or
     /// `ForeignLanguageGrouping` (legacy language-detection path).
